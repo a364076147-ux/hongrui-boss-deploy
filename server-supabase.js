@@ -490,20 +490,49 @@ app.post('/api/finance/accounts', authMiddleware, adminOnly, async (req, res) =>
 });
 app.post('/api/finance/transactions/income', authMiddleware, hasPerm('income'), async (req, res) => {
     await initDB();
-    const { account_id, amount, category, description } = req.body;
-    run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name) VALUES ('income', ?, ?, ?, ?, ?, ?)", [account_id, amount, category, description, req.user.id, req.user.real_name]);
+    const { account_id, amount, category, description, customer_id, customer_name } = req.body;
+    // 客户收款：记录往来对象，冲减该客户欠款
+    let pid = customer_id || null, pname = customer_name || null, ptype = null;
+    if (!pid && pname) {
+        const r = await safeExec("SELECT id FROM customers WHERE name = ? ORDER BY id LIMIT 1", [pname]);
+        if (r.values?.[0]?.[0]) pid = r.values[0][0];
+    }
+    if (pid) { ptype = 'customer'; }
+    else if (pname) { ptype = 'customer'; }
+    const cat = category || (pname ? '收欠款' : '直接收款');
+    run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name) VALUES ('income', ?, ?, ?, ?, ?, ?, ?, ?, ?)", [account_id, amount, cat, description, req.user.id, req.user.real_name, ptype, pid, pname]);
     run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [amount, account_id]);
-    saveDB();
-    saveDB();
+    // 冲减该客户欠款：若指定客户，将其最早未结清销售单标记已结清（按金额抵扣）
+    if (pid && category !== '直接收款') {
+        const unpaid = (await safeExec("SELECT id FROM sales_orders WHERE customer_id = ? AND payment_status != '已结清' ORDER BY id LIMIT 20", [pid])).values || [];
+        // 简化：全额冲抵该客户的未结清订单（按顺序）
+        for (const row of unpaid) {
+            await run("UPDATE sales_orders SET payment_status = '已结清' WHERE id = ?", [row[0]]);
+        }
+    }
+    saveDB(); saveDB();
     res.json({ ok: true });
 });
 app.post('/api/finance/transactions/expense', authMiddleware, hasPerm('expense'), async (req, res) => {
     await initDB();
-    const { account_id, amount, category, description } = req.body;
-    run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name) VALUES ('expense', ?, ?, ?, ?, ?, ?)", [account_id, amount, category, description, req.user.id, req.user.real_name]);
+    const { account_id, amount, category, description, supplier_id, supplier_name } = req.body;
+    let pid = supplier_id || null, pname = supplier_name || null, ptype = null;
+    if (!pid && pname) {
+        const r = await safeExec("SELECT id FROM suppliers WHERE name = ? ORDER BY id LIMIT 1", [pname]);
+        if (r.values?.[0]?.[0]) pid = r.values[0][0];
+    }
+    if (pid) { ptype = 'supplier'; }
+    else if (pname) { ptype = 'supplier'; }
+    const cat = category || (pname ? '付欠款' : '直接付款');
+    run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name) VALUES ('expense', ?, ?, ?, ?, ?, ?, ?, ?, ?)", [account_id, amount, cat, description, req.user.id, req.user.real_name, ptype, pid, pname]);
     run("UPDATE accounts SET balance = balance - ? WHERE id = ?", [amount, account_id]);
-    saveDB();
-    saveDB();
+    if (pid && category !== '直接付款') {
+        const unpaid = (await safeExec("SELECT id FROM purchase_orders WHERE supplier_id = ? AND payment_status != '已结清' ORDER BY id LIMIT 20", [pid])).values || [];
+        for (const row of unpaid) {
+            await run("UPDATE purchase_orders SET payment_status = '已结清' WHERE id = ?", [row[0]]);
+        }
+    }
+    saveDB(); saveDB();
     res.json({ ok: true });
 });
 app.post('/api/finance/transactions/transfer', authMiddleware, adminOnly, async (req, res) => {
@@ -967,7 +996,9 @@ app.post('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), asyn
     }
     const orderNumber = generateOrderNumber('JH');
     const totalAmount = final_amount || req.body.total_amount || 0;
-    await run("INSERT INTO purchase_orders (order_number, supplier_id, supplier_name, total_amount, operator_id, operator_name) VALUES (?, ?, ?, ?, ?, ?)", [orderNumber, supplier_id, supplier_name, totalAmount, req.user.id, req.user.real_name]);
+    // 进货同样支持赊账：未传支付信息视为未结清（计入供应商欠款）
+    const paymentStatus = req.body.payment_status || (req.body.settled ? '已结清' : '未结清');
+    await run("INSERT INTO purchase_orders (order_number, supplier_id, supplier_name, total_amount, operator_id, operator_name, payment_status) VALUES (?, ?, ?, ?, ?, ?, ?)", [orderNumber, supplier_id, supplier_name, totalAmount, req.user.id, req.user.real_name, paymentStatus]);
     if (items) {
         const orderIdResult = await safeExec("SELECT last_insert_rowid()");
         const orderId = orderIdResult.values?.[0]?.[0];
@@ -1029,7 +1060,9 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
         const cr = (await safeExec("SELECT COALESCE(commission_rate,0) FROM users WHERE id = ?", [req.user.id])).values?.[0]?.[0];
         commissionAmount = Math.round((Number(cr) || 0) * finalAmount) / 100;
     } catch (e) { commissionAmount = 0; }
-    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, commission_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [orderNumber, customer_id || null, customer_name || null, finalAmount, discount || 0, finalAmount, payment_method || null, req.user.id, req.user.real_name, commissionAmount]);
+    // 收款状态：选了支付方式视为已结清；不选（赊账）为未结清 → 计入客户欠款
+    const paymentStatus = payment_method ? '已结清' : '未结清';
+    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, commission_amount, payment_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [orderNumber, customer_id || null, customer_name || null, finalAmount, discount || 0, finalAmount, payment_method || null, req.user.id, req.user.real_name, commissionAmount, paymentStatus]);
     saveDB();
     // Get the inserted order ID by finding the max id
     const orderIdResult = await safeExec("SELECT MAX(id) FROM sales_orders WHERE order_number = ?", [orderNumber]);
@@ -1285,24 +1318,84 @@ app.get('/api/finance/supplier-reconciliation', authMiddleware, hasPerm('reconci
     }));
     res.json(list);
 });
-// ==================== 应收应付汇总（全量，不依赖销售/采购权限） ====================
+// ==================== 应收应付对账（智慧记模型：期初欠款 + 未结清销售/进货 - 已收/已付 = 期末欠款） ====================
 app.get('/api/finance/arap', authMiddleware, hasPerm('finance_view'), async (_req, res) => {
     await initDB();
-    const recv = (await safeExec(`SELECT customer_id, customer_name, COUNT(*), COALESCE(SUM(final_amount),0) FROM sales_orders WHERE final_amount > 0 GROUP BY customer_id, customer_name ORDER BY 4 DESC`)).values || [];
-    const pay = (await safeExec(`SELECT supplier_id, supplier_name, COUNT(*), COALESCE(SUM(total_amount),0) FROM purchase_orders WHERE status NOT IN ('cancelled','void') GROUP BY supplier_id, supplier_name ORDER BY 4 DESC`)).values || [];
-    const receivables = recv.map((r) => ({
-        party_id: Number(r[0]) || null, name: r[1] || '未知客户', order_count: Number(r[2]), total: Math.round(Number(r[3]) * 100) / 100
-    }));
-    const payables = pay.map((r) => ({
-        party_id: Number(r[0]) || null, name: r[1] || '未知供应商', order_count: Number(r[2]), total: Math.round(Number(r[3]) * 100) / 100
-    }));
+    // 客户：期初欠款 + 未结清销售单 - 客户收款流水（批量聚合）
+    const custRows = (await safeExec(`SELECT c.id, c.name, COALESCE(c.initial_balance,0) ib,
+        COALESCE(u.cnt,0) uc, COALESCE(u.amt,0) ua, COALESCE(p.amt,0) pa
+        FROM customers c
+        LEFT JOIN (SELECT customer_id, COUNT(*) cnt, SUM(final_amount) amt FROM sales_orders WHERE payment_status != '已结清' GROUP BY customer_id) u ON u.customer_id = c.id
+        LEFT JOIN (SELECT party_id, SUM(amount) amt FROM transactions WHERE type='income' AND party_type='customer' GROUP BY party_id) p ON p.party_id = c.id
+        WHERE c.status=1`)).values || [];
+    const receivables = custRows.map((r) => {
+        const initial = Number(r[2]) || 0;
+        const unpaidAmt = Number(r[4]) || 0;
+        const received = Number(r[5]) || 0;
+        const balance = Math.round((initial + unpaidAmt - received) * 100) / 100;
+        return {
+            party_id: Number(r[0]), name: String(r[1] || ''),
+            initial_balance: Math.round(initial * 100) / 100,
+            unpaid_orders: Number(r[3]) || 0, unpaid_amount: Math.round(unpaidAmt * 100) / 100,
+            received: Math.round(received * 100) / 100, balance,
+        };
+    }).filter((x) => Math.abs(x.balance) > 0.001 || x.unpaid_orders > 0)
+      .sort((a, b) => b.balance - a.balance);
+    // 供应商：期初欠款 + 未结清进货单 - 供应商付款流水
+    const supRows = (await safeExec(`SELECT s.id, s.name, COALESCE(s.initial_balance,0) ib,
+        COALESCE(u.cnt,0) uc, COALESCE(u.amt,0) ua, COALESCE(p.amt,0) pa
+        FROM suppliers s
+        LEFT JOIN (SELECT supplier_id, COUNT(*) cnt, SUM(total_amount) amt FROM purchase_orders WHERE payment_status != '已结清' GROUP BY supplier_id) u ON u.supplier_id = s.id
+        LEFT JOIN (SELECT party_id, SUM(amount) amt FROM transactions WHERE type='expense' AND party_type='supplier' GROUP BY party_id) p ON p.party_id = s.id
+        WHERE s.status=1`)).values || [];
+    const payables = supRows.map((r) => {
+        const initial = Number(r[2]) || 0;
+        const unpaidAmt = Number(r[4]) || 0;
+        const paid = Number(r[5]) || 0;
+        const balance = Math.round((initial + unpaidAmt - paid) * 100) / 100;
+        return {
+            party_id: Number(r[0]), name: String(r[1] || ''),
+            initial_balance: Math.round(initial * 100) / 100,
+            unpaid_orders: Number(r[3]) || 0, unpaid_amount: Math.round(unpaidAmt * 100) / 100,
+            paid: Math.round(paid * 100) / 100, balance,
+        };
+    }).filter((x) => Math.abs(x.balance) > 0.001 || x.unpaid_orders > 0)
+      .sort((a, b) => b.balance - a.balance);
     res.json({
         receivables,
         payables,
         summary: {
-            total_receivable: Math.round(receivables.reduce((s, r) => s + r.total, 0) * 100) / 100,
-            total_payable: Math.round(payables.reduce((s, r) => s + r.total, 0) * 100) / 100,
+            total_receivable: Math.round(receivables.reduce((s, r) => s + r.balance, 0) * 100) / 100,
+            total_payable: Math.round(payables.reduce((s, r) => s + r.balance, 0) * 100) / 100,
         },
+    });
+});
+// 客户对账单：期初 + 销售单 + 收款流水明细
+app.get('/api/finance/customer-statement/:id', authMiddleware, hasPerm('finance_view'), async (req, res) => {
+    await initDB();
+    const cid = Number(req.params.id);
+    const cust = (await safeExec("SELECT id, name, COALESCE(initial_balance,0) FROM customers WHERE id = ?", [cid])).values?.[0];
+    if (!cust) return res.status(404).json({ error: '客户不存在' });
+    const orders = (await safeExec("SELECT order_number, created_at, final_amount, payment_status FROM sales_orders WHERE customer_id = ? ORDER BY id", [cid])).values || [];
+    const payments = (await safeExec("SELECT created_at, amount, description FROM transactions WHERE type='income' AND party_type='customer' AND party_id = ? ORDER BY id", [cid])).values || [];
+    res.json({
+        name: cust[1], initial_balance: Number(cust[2]) || 0,
+        orders: orders.map((o) => ({ order_number: o[0], created_at: o[1], amount: Number(o[2]), status: o[3] })),
+        payments: payments.map((p) => ({ created_at: p[0], amount: Number(p[1]), description: p[2] })),
+    });
+});
+// 供应商对账单：期初 + 进货单 + 付款流水明细
+app.get('/api/finance/supplier-statement/:id', authMiddleware, hasPerm('finance_view'), async (req, res) => {
+    await initDB();
+    const sid = Number(req.params.id);
+    const sup = (await safeExec("SELECT id, name, COALESCE(initial_balance,0) FROM suppliers WHERE id = ?", [sid])).values?.[0];
+    if (!sup) return res.status(404).json({ error: '供应商不存在' });
+    const orders = (await safeExec("SELECT order_number, created_at, total_amount, payment_status FROM purchase_orders WHERE supplier_id = ? ORDER BY id", [sid])).values || [];
+    const payments = (await safeExec("SELECT created_at, amount, description FROM transactions WHERE type='expense' AND party_type='supplier' AND party_id = ? ORDER BY id", [sid])).values || [];
+    res.json({
+        name: sup[1], initial_balance: Number(sup[2]) || 0,
+        orders: orders.map((o) => ({ order_number: o[0], created_at: o[1], amount: Number(o[2]), status: o[3] })),
+        payments: payments.map((p) => ({ created_at: p[0], amount: Number(p[1]), description: p[2] })),
     });
 });
 // ==================== 销售预订 ====================
