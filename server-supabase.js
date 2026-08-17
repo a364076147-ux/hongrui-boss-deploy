@@ -913,7 +913,12 @@ app.get('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), async
 });
 app.post('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), async (req, res) => {
     await initDB();
-    const { supplier_id, supplier_name, items, discount, final_amount } = req.body;
+    let { supplier_id, supplier_name, items, discount, final_amount } = req.body;
+    // 兜底：未传 supplier_id 时按名称自动解析
+    if (!supplier_id && supplier_name) {
+        const sidRes = await safeExec("SELECT id FROM suppliers WHERE name = ? ORDER BY id LIMIT 1", [supplier_name]);
+        if (sidRes.values?.[0]?.[0]) supplier_id = sidRes.values[0][0];
+    }
     const orderNumber = generateOrderNumber('JH');
     const totalAmount = final_amount || req.body.total_amount || 0;
     await run("INSERT INTO purchase_orders (order_number, supplier_id, supplier_name, total_amount, operator_id, operator_name) VALUES (?, ?, ?, ?, ?, ?)", [orderNumber, supplier_id, supplier_name, totalAmount, req.user.id, req.user.real_name]);
@@ -958,7 +963,12 @@ app.get('/api/store/sales-orders/:id', authMiddleware, async (req, res) => {
 });
 app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req, res) => {
     await initDB();
-    const { order_number: customOrderNumber, customer_id, customer_name, items, payment_method, discount, payment_status } = req.body;
+    let { order_number: customOrderNumber, customer_id, customer_name, items, payment_method, discount, payment_status } = req.body;
+    // 兜底：未传 customer_id 时按名称自动解析
+    if (!customer_id && customer_name) {
+        const cidRes = await safeExec("SELECT id FROM customers WHERE name = ? ORDER BY id LIMIT 1", [customer_name]);
+        if (cidRes.values?.[0]?.[0]) customer_id = cidRes.values[0][0];
+    }
     const orderNumber = customOrderNumber || generateOrderNumber('XS');
     let totalAmount = 0;
     if (items) {
