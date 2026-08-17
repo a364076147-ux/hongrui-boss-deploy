@@ -871,7 +871,10 @@ app.get('/api/store/roles', authMiddleware, hasPerm('employees'), async (_req, r
 app.get('/api/store/suppliers', authMiddleware, hasPerm('suppliers'), async (_req, res) => {
     await initDB();
     const result = await safeExec("SELECT * FROM suppliers ORDER BY id");
-    res.json(result.values || []);
+    const list = (result.values || []).map((s) => ({
+        id: Number(s[0]), name: s[1], contact: s[2], phone: s[3], address: s[4], remark: s[5]
+    }));
+    res.json(list);
 });
 app.post('/api/store/suppliers', authMiddleware, hasPerm('suppliers'), async (req, res) => {
     await initDB();
@@ -901,7 +904,7 @@ app.get('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), async
     await initDB();
     const result = await safeExec("SELECT * FROM purchase_orders ORDER BY created_at DESC, id DESC LIMIT 50");
     const orders = (result.values || []).map((o) => ({
-        id: o[0], order_number: o[1], supplier_id: o[2], supplier_name: o[3], total_amount: Number(o[4]), status: o[5], operator_id: o[6], operator_name: o[7], created_at: o[8]
+        id: o[0], order_number: o[1], supplier_id: Number(o[2]) || null, supplier_name: o[3], total_amount: Number(o[4]), status: o[5], operator_id: o[6], operator_name: o[7], created_at: o[8]
     }));
     res.json(orders);
 });
@@ -930,7 +933,7 @@ app.get('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req,
     const { pageSize = 200 } = req.query;
     const result = await safeExec("SELECT * FROM sales_orders ORDER BY created_at DESC, id DESC LIMIT ?", [Number(pageSize)]);
     const orders = (result.values || []).map((o) => ({
-        id: o[0], order_number: o[1], customer_id: o[2], customer_name: o[3], total_amount: Number(o[4]), discount: Number(o[5]), final_amount: Number(o[6]), payment_method: o[7], operator_id: o[8], operator_name: o[9], created_at: o[10]
+        id: o[0], order_number: o[1], customer_id: Number(o[2]) || null, customer_name: o[3], total_amount: Number(o[4]), discount: Number(o[5]), final_amount: Number(o[6]), payment_method: o[7], operator_id: o[8], operator_name: o[9], created_at: o[10]
     }));
     res.json(orders);
 });
