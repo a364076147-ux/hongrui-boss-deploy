@@ -90,6 +90,8 @@ async function initDB() {
     const client = await getPool().connect();
     try {
         await client.query('SELECT 1');
+        // 迁移：users 表增加 permissions 列（幂等）
+        try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions TEXT DEFAULT '[]'"); } catch (e) { /* 已存在或不可用则忽略 */ }
         console.log('Database connected (Supabase)');
     }
     finally {
@@ -109,13 +111,49 @@ app.use(helmet());
 app.use(cors());
 app.use(morgan('dev'));
 app.use(express.json());
-function authMiddleware(req, res, next) {
+// ==================== 权限体系 ====================
+// 细粒度功能权限：管理员/店长默认拥有全部；店员按 permissions 数组控制
+const ALL_PERMS = [
+    'sales', 'return', 'recycle', 'purchase', 'orders', 'customers', 'suppliers',
+    'inventory_view', 'inventory_full', 'income', 'expense', 'finance_view',
+    'reconciliation', 'performance', 'sales_stats', 'employees', 'settings',
+];
+// 新店员默认权限（开单必需的基础功能）
+const DEFAULT_EMPLOYEE_PERMS = ['sales', 'return', 'customers', 'income', 'expense', 'performance'];
+function parsePerms(user) {
+    if (!user) return [];
+    if (user.role === 'admin' || user.role === 'manager') return ALL_PERMS;
+    const p = user.permissions;
+    if (Array.isArray(p)) return p;
+    try { const arr = JSON.parse(p || '[]'); return Array.isArray(arr) ? arr : []; }
+    catch { return []; }
+}
+function hasPerm(perm) {
+    return (req, res, next) => {
+        if (!req.user) return res.status(401).json({ error: '未授权' });
+        if (parsePerms(req.user).includes(perm)) return next();
+        return res.status(403).json({ error: '无权限：该功能未开放给当前账号' });
+    };
+}
+async function authMiddleware(req, res, next) {
     const auth = req.headers.authorization;
     if (!auth?.startsWith('Bearer '))
         return res.status(401).json({ error: '未授权' });
     const token = auth.slice(7);
     try {
         req.user = jwt.verify(token, JWT_SECRET);
+        // 每次请求从数据库刷新角色/权限/状态：管理员修改权限或停用后即时生效（无需重新登录）
+        try {
+            await initDB();
+            const r = await safeExec("SELECT role, status, permissions FROM users WHERE id = ?", [req.user.id]);
+            const row = r.values?.[0];
+            if (!row)
+                return res.status(401).json({ error: '账号不存在' });
+            if (parseInt(row[1]) !== 1)
+                return res.status(403).json({ error: '账户已被禁用' });
+            req.user.role = row[0];
+            req.user.permissions = row[2];
+        } catch (e) { /* 数据库不可用时降级使用 token 内的数据 */ }
         next();
     }
     catch {
@@ -158,7 +196,8 @@ app.post('/api/auth/login', async (req, res) => {
             return res.status(401).json({ error: '用户名或密码错误' });
         await run("UPDATE users SET last_login = datetime('now','localtime') WHERE id = ?", [id]);
         saveDB();
-        const payload = { id, username, real_name: realName, role };
+        const permissions = user[10] || '[]';
+        const payload = { id, username, real_name: realName, role, permissions };
         const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '365d' });
         res.json({ token, user: { ...payload, status } });
     }
@@ -167,21 +206,22 @@ app.post('/api/auth/login', async (req, res) => {
         res.status(500).json({ error: '服务器错误' });
     }
 });
-app.get('/api/auth/me', authMiddleware, (req, res) => res.json(req.user));
+app.get('/api/auth/me', authMiddleware, (req, res) => res.json({ ...req.user, permissions: parsePerms(req.user) }));
 // Users management
 app.get('/api/auth/users', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
-    const result = await safeExec("SELECT id, username, real_name, role, phone, email, status, created_at, last_login FROM users ORDER BY id");
+    const result = await safeExec("SELECT id, username, real_name, role, phone, email, status, created_at, last_login, permissions FROM users ORDER BY id");
     const users = (result.values || []).map((u) => ({
-        id: u[0], username: u[1], real_name: u[2], role: u[3], phone: u[4], email: u[5], status: u[6], created_at: u[7], last_login: u[8]
+        id: u[0], username: u[1], real_name: u[2], role: u[3], phone: u[4], email: u[5], status: parseInt(u[6]) || 0, created_at: u[7], last_login: u[8], permissions: parsePerms({ role: u[3], permissions: u[9] })
     }));
     res.json(users);
 });
 app.post('/api/auth/users', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
-    const { username, password, real_name, role, phone, email } = req.body;
+    const { username, password, real_name, role, phone, email, permissions } = req.body;
     const hashedPassword = await bcrypt.hash(password || 'admin123', 10);
-    await run("INSERT INTO users (username, password, real_name, role, phone, email) VALUES (?, ?, ?, ?, ?, ?)", [username, hashedPassword, real_name, role || 'employee', phone, email]);
+    const perms = JSON.stringify(Array.isArray(permissions) ? permissions : (role === 'employee' ? DEFAULT_EMPLOYEE_PERMS : ALL_PERMS));
+    await run("INSERT INTO users (username, password, real_name, role, phone, email, permissions) VALUES (?, ?, ?, ?, ?, ?, ?)", [username, hashedPassword, real_name, role || 'employee', phone, email, perms]);
     saveDB();
     saveDB();
     res.json({ ok: true });
@@ -189,8 +229,32 @@ app.post('/api/auth/users', authMiddleware, adminOnly, async (req, res) => {
 app.put('/api/auth/users/:id', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
     const { id } = req.params;
-    const { status } = req.body;
-    await run("UPDATE users SET status = ? WHERE id = ?", [status, id]);
+    const { status, permissions } = req.body;
+    if (status !== undefined) {
+        await run("UPDATE users SET status = ? WHERE id = ?", [status, id]);
+    }
+    if (Array.isArray(permissions)) {
+        await run("UPDATE users SET permissions = ? WHERE id = ?", [JSON.stringify(permissions), id]);
+    }
+    saveDB();
+    saveDB();
+    res.json({ ok: true });
+});
+// 删除员工账号（不能删自己、不能删 admin 主账号）
+app.delete('/api/auth/users/:id', authMiddleware, adminOnly, async (req, res) => {
+    await initDB();
+    const id = Number(req.params.id);
+    if (id === Number(req.user.id))
+        return res.status(400).json({ error: '不能删除当前登录账号' });
+    const target = (await safeExec("SELECT username, role FROM users WHERE id = ?", [id])).values?.[0];
+    if (!target)
+        return res.status(404).json({ error: '用户不存在' });
+    if (String(target[0]) === 'admin')
+        return res.status(400).json({ error: '不能删除主管理员账号' });
+    await run("UPDATE sales_orders SET operator_id = NULL, operator_name = NULL WHERE operator_id = ?", [id]);
+    await run("UPDATE purchase_orders SET operator_id = NULL, operator_name = NULL WHERE operator_id = ?", [id]);
+    await run("UPDATE transactions SET operator_id = NULL, operator_name = NULL WHERE operator_id = ?", [id]);
+    await run("DELETE FROM users WHERE id = ?", [id]);
     saveDB();
     saveDB();
     res.json({ ok: true });
@@ -212,7 +276,7 @@ app.put('/api/auth/password', authMiddleware, async (req, res) => {
     res.json({ ok: true });
 });
 // ==================== INVENTORY ====================
-app.get('/api/inventory/products', authMiddleware, async (req, res) => {
+app.get('/api/inventory/products', authMiddleware, hasPerm('inventory_view'), async (req, res) => {
     await initDB();
     const { category, keyword, page = 1, pageSize = 50 } = req.query;
     let sql = "SELECT * FROM products WHERE status = 1";
@@ -235,7 +299,7 @@ app.get('/api/inventory/products', authMiddleware, async (req, res) => {
     }));
     res.json(products);
 });
-app.get('/api/inventory/products/warning', authMiddleware, async (_req, res) => {
+app.get('/api/inventory/products/warning', authMiddleware, hasPerm('inventory_view'), async (_req, res) => {
     await initDB();
     const result = await safeExec("SELECT * FROM products WHERE stock_quantity <= warning_quantity AND status = 1 ORDER BY stock_quantity ASC");
     const products = (result.values || []).map((p) => ({
@@ -246,7 +310,7 @@ app.get('/api/inventory/products/warning', authMiddleware, async (_req, res) => 
     }));
     res.json(products);
 });
-app.get('/api/inventory/products/batch', authMiddleware, async (req, res) => {
+app.get('/api/inventory/products/batch', authMiddleware, hasPerm('inventory_view'), async (req, res) => {
     await initDB();
     const { keyword } = req.query;
     let sql = "SELECT * FROM products WHERE status = 1 AND batch_number IS NOT NULL";
@@ -264,7 +328,7 @@ app.get('/api/inventory/products/batch', authMiddleware, async (req, res) => {
     }));
     res.json(products);
 });
-app.get('/api/inventory/products/expiry', authMiddleware, async (req, res) => {
+app.get('/api/inventory/products/expiry', authMiddleware, hasPerm('inventory_view'), async (req, res) => {
     await initDB();
     const { days = 30 } = req.query;
     const result = await safeExec("SELECT * FROM products WHERE status = 1 AND expiry_date IS NOT NULL AND expiry_date <= date('now', '+' + ? + ' days') ORDER BY expiry_date ASC", [String(days)]);
@@ -276,7 +340,7 @@ app.get('/api/inventory/products/expiry', authMiddleware, async (req, res) => {
     }));
     res.json(products);
 });
-app.post('/api/inventory/products', authMiddleware, adminOnly, async (req, res) => {
+app.post('/api/inventory/products', authMiddleware, hasPerm('inventory_full'), async (req, res) => {
     await initDB();
     const { sku, name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity, batch_number, production_date, expiry_date, supplier_id } = req.body;
     run("INSERT INTO products (sku, name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity, batch_number, production_date, expiry_date, supplier_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [sku, name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity, batch_number, production_date, expiry_date, supplier_id]);
@@ -284,11 +348,23 @@ app.post('/api/inventory/products', authMiddleware, adminOnly, async (req, res) 
     saveDB();
     res.json({ ok: true });
 });
-app.put('/api/inventory/products/:id', authMiddleware, adminOnly, async (req, res) => {
+app.put('/api/inventory/products/:id', authMiddleware, hasPerm('inventory_full'), async (req, res) => {
     await initDB();
     const { id } = req.params;
     const { sku, name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity, batch_number, production_date, expiry_date, supplier_id } = req.body;
     run("UPDATE products SET sku=?, name=?, category=?, spec=?, unit=?, cost_price=?, sell_price=?, stock_quantity=?, warning_quantity=?, batch_number=?, production_date=?, expiry_date=?, supplier_id=?, updated_at=datetime('now','localtime') WHERE id=?", [sku, name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity, batch_number, production_date, expiry_date, supplier_id, id]);
+    saveDB();
+    saveDB();
+    res.json({ ok: true });
+});
+// 删除商品（软删除：status=0，保留历史订单引用）
+app.delete('/api/inventory/products/:id', authMiddleware, hasPerm('inventory_full'), async (req, res) => {
+    await initDB();
+    const { id } = req.params;
+    const target = (await safeExec("SELECT id FROM products WHERE id = ? AND status = 1", [id])).values?.[0];
+    if (!target)
+        return res.status(404).json({ error: '商品不存在' });
+    await run("UPDATE products SET status = 0, updated_at = datetime('now','localtime') WHERE id = ?", [id]);
     saveDB();
     saveDB();
     res.json({ ok: true });
@@ -384,7 +460,7 @@ app.post('/api/finance/accounts', authMiddleware, adminOnly, async (req, res) =>
     saveDB();
     res.json({ ok: true });
 });
-app.post('/api/finance/transactions/income', authMiddleware, async (req, res) => {
+app.post('/api/finance/transactions/income', authMiddleware, hasPerm('income'), async (req, res) => {
     await initDB();
     const { account_id, amount, category, description } = req.body;
     run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name) VALUES ('income', ?, ?, ?, ?, ?, ?)", [account_id, amount, category, description, req.user.id, req.user.real_name]);
@@ -393,7 +469,7 @@ app.post('/api/finance/transactions/income', authMiddleware, async (req, res) =>
     saveDB();
     res.json({ ok: true });
 });
-app.post('/api/finance/transactions/expense', authMiddleware, async (req, res) => {
+app.post('/api/finance/transactions/expense', authMiddleware, hasPerm('expense'), async (req, res) => {
     await initDB();
     const { account_id, amount, category, description } = req.body;
     run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name) VALUES ('expense', ?, ?, ?, ?, ?, ?)", [account_id, amount, category, description, req.user.id, req.user.real_name]);
@@ -413,7 +489,7 @@ app.post('/api/finance/transactions/transfer', authMiddleware, adminOnly, async 
     saveDB();
     res.json({ ok: true });
 });
-app.get('/api/finance/transactions', authMiddleware, async (req, res) => {
+app.get('/api/finance/transactions', authMiddleware, hasPerm('finance_view'), async (req, res) => {
     await initDB();
     const { type, account_id, page = 1, pageSize = 50 } = req.query;
     let sql = "SELECT * FROM transactions WHERE 1=1";
@@ -434,7 +510,7 @@ app.get('/api/finance/transactions', authMiddleware, async (req, res) => {
     }));
     res.json(transactions);
 });
-app.get('/api/finance/overview', authMiddleware, async (_req, res) => {
+app.get('/api/finance/overview', authMiddleware, hasPerm('finance_view'), async (_req, res) => {
     await initDB();
     const today = new Date().toISOString().slice(0, 10);
     const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10);
@@ -447,7 +523,7 @@ app.get('/api/finance/overview', authMiddleware, async (_req, res) => {
     const totalBalance = accountList.reduce((sum, a) => sum + a.balance, 0);
     res.json({ today_income: todayIncome, today_expense: todayExpense, month_income: monthIncome, month_expense: monthExpense, accounts: accountList, total_balance: totalBalance });
 });
-app.get('/api/finance/reconciliation', authMiddleware, adminOnly, async (req, res) => {
+app.get('/api/finance/reconciliation', authMiddleware, hasPerm('reconciliation'), async (req, res) => {
     await initDB();
     const { account_id, start_date, end_date } = req.query;
     let sql = "SELECT * FROM transactions WHERE 1=1";
@@ -503,7 +579,7 @@ app.get('/api/analysis/dashboard', authMiddleware, async (_req, res) => {
     const monthSales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at) >= '${monthStart}'`)).values?.[0]?.[0] || 0);
     res.json({ todaySales, todayExpense, warningCount, monthSales });
 });
-app.get('/api/analysis/sales', authMiddleware, adminOnly, async (req, res) => {
+app.get('/api/analysis/sales', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
     await initDB();
     const { start_date, end_date } = req.query;
     let sql = "SELECT date(created_at) as date, SUM(final_amount) as actual_sales, COUNT(*) as order_count FROM sales_orders WHERE 1=1";
@@ -521,7 +597,7 @@ app.get('/api/analysis/sales', authMiddleware, adminOnly, async (req, res) => {
         date: r[0], actual_sales: Number(r[1]), order_count: Number(r[2])
     })));
 });
-app.get('/api/analysis/sales/top-products', authMiddleware, adminOnly, async (req, res) => {
+app.get('/api/analysis/sales/top-products', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
     await initDB();
     const { days = 30 } = req.query;
     const result = (await safeExec(`
@@ -537,7 +613,7 @@ app.get('/api/analysis/sales/top-products', authMiddleware, adminOnly, async (re
     }));
     res.json(products);
 });
-app.get('/api/analysis/purchase', authMiddleware, adminOnly, async (req, res) => {
+app.get('/api/analysis/purchase', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
     await initDB();
     const { start_date, end_date } = req.query;
     let sql = "SELECT date(created_at) as date, SUM(total_amount) as total, COUNT(*) as order_count FROM purchase_orders WHERE 1=1";
@@ -552,7 +628,7 @@ app.get('/api/analysis/purchase', authMiddleware, adminOnly, async (req, res) =>
     const rows = result.values || [];
     res.json(rows.map((r) => ({ date: r[0], total: Number(r[1]), order_count: Number(r[2]) })));
 });
-app.get('/api/analysis/inventory', authMiddleware, adminOnly, async (_req, res) => {
+app.get('/api/analysis/inventory', authMiddleware, hasPerm('sales_stats'), async (_req, res) => {
     await initDB();
     const categories = (await safeExec("SELECT category, COUNT(*), SUM(stock_quantity) FROM products WHERE status=1 AND category IS NOT NULL GROUP BY category")).values;
     const totalProducts = Number((await safeExec("SELECT COUNT(*) FROM products WHERE status=1")).values?.[0]?.[0] || 0);
@@ -560,7 +636,7 @@ app.get('/api/analysis/inventory', authMiddleware, adminOnly, async (_req, res) 
     const warningCount = Number((await safeExec("SELECT COUNT(*) FROM products WHERE stock_quantity <= warning_quantity AND status=1")).values?.[0]?.[0] || 0);
     res.json({ categories: categories || [], total_products: totalProducts, total_stock: totalStock, warning_count: warningCount });
 });
-app.get('/api/analysis/profit', authMiddleware, adminOnly, async (req, res) => {
+app.get('/api/analysis/profit', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
     await initDB();
     const today = new Date().toISOString().slice(0, 10);
     const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10);
@@ -607,8 +683,9 @@ app.get('/api/analysis/performance', authMiddleware, async (req, res) => {
         });
     }
     rows.sort((a, b) => b.sales - a.sales);
-    // 全店汇总
-    const totalStat = (await safeExec("SELECT COUNT(*), COALESCE(SUM(final_amount),0) FROM sales_orders WHERE final_amount > 0 AND created_at >= ? AND created_at <= ?", [defStart, defEnd + ' 23:59:59'])).values?.[0] || [0, 0];
+    // 全店汇总（店员只统计自己的；管理员/店长统计全店）
+    const totalWhere = isAdmin ? "" : " AND operator_id = " + Number(req.user.id);
+    const totalStat = (await safeExec("SELECT COUNT(*), COALESCE(SUM(final_amount),0) FROM sales_orders WHERE final_amount > 0 AND created_at >= ? AND created_at <= ?" + totalWhere, [defStart, defEnd + ' 23:59:59'])).values?.[0] || [0, 0];
     res.json({
         list: rows,
         summary: {
@@ -619,7 +696,7 @@ app.get('/api/analysis/performance', authMiddleware, async (req, res) => {
     });
 });
 // ==================== 生产需求分析（按厂/客户的需求情况与月度经营建议） ====================
-app.get('/api/analysis/demand', authMiddleware, adminOnly, async (_req, res) => {
+app.get('/api/analysis/demand', authMiddleware, hasPerm('sales_stats'), async (_req, res) => {
     await initDB();
     const now = new Date();
     // 本地时间 YYYY-MM（不能用 toISOString，UTC 会偏移月份）
@@ -770,7 +847,7 @@ app.get('/api/store/info', authMiddleware, async (_req, res) => {
         return res.json({});
     res.json({ id: info[0], name: info[1], address: info[2], phone: info[3], contact_person: info[4] });
 });
-app.put('/api/store/info', authMiddleware, async (req, res) => {
+app.put('/api/store/info', authMiddleware, hasPerm('settings'), async (req, res) => {
     await initDB();
     const { name, address, phone, contact_person } = req.body;
     await run("UPDATE store_info SET name=?, address=?, phone=?, contact_person=?, updated_at=datetime('now','localtime') WHERE id=1", [name, address, phone, contact_person]);
@@ -778,7 +855,7 @@ app.put('/api/store/info', authMiddleware, async (req, res) => {
     saveDB();
     res.json({ ok: true });
 });
-app.get('/api/store/employees', authMiddleware, adminOnly, async (_req, res) => {
+app.get('/api/store/employees', authMiddleware, hasPerm('employees'), async (_req, res) => {
     await initDB();
     const result = await safeExec("SELECT id, username, real_name, role, phone, status, created_at, last_login FROM users WHERE role != 'admin' ORDER BY id");
     const employees = (result.values || []).map((e) => ({
@@ -786,17 +863,17 @@ app.get('/api/store/employees', authMiddleware, adminOnly, async (_req, res) => 
     }));
     res.json(employees);
 });
-app.get('/api/store/roles', authMiddleware, adminOnly, async (_req, res) => {
+app.get('/api/store/roles', authMiddleware, hasPerm('employees'), async (_req, res) => {
     await initDB();
     const result = await safeExec("SELECT * FROM roles ORDER BY id");
     res.json(result.values || []);
 });
-app.get('/api/store/suppliers', authMiddleware, async (_req, res) => {
+app.get('/api/store/suppliers', authMiddleware, hasPerm('suppliers'), async (_req, res) => {
     await initDB();
-    const result = await safeExec("SELECT * FROM suppliers WHERE status=1 ORDER BY id");
+    const result = await safeExec("SELECT * FROM suppliers ORDER BY id");
     res.json(result.values || []);
 });
-app.post('/api/store/suppliers', authMiddleware, adminOnly, async (req, res) => {
+app.post('/api/store/suppliers', authMiddleware, hasPerm('suppliers'), async (req, res) => {
     await initDB();
     const { name, contact, phone, address, remark } = req.body;
     await run("INSERT INTO suppliers (name, contact, phone, address, remark) VALUES (?, ?, ?, ?, ?)", [name, contact, phone, address, remark]);
@@ -804,12 +881,15 @@ app.post('/api/store/suppliers', authMiddleware, adminOnly, async (req, res) => 
     saveDB();
     res.json({ ok: true });
 });
-app.get('/api/store/customers', authMiddleware, async (_req, res) => {
+app.get('/api/store/customers', authMiddleware, hasPerm('customers'), async (_req, res) => {
     await initDB();
     const result = await safeExec("SELECT * FROM customers WHERE status=1 ORDER BY id");
-    res.json(result.values || []);
+    const list = (result.values || []).map((c) => ({
+        id: Number(c[0]), name: c[1], phone: c[2], address: c[3], contact: c[4], remark: c[5], status: c[6], created_at: c[7]
+    }));
+    res.json(list);
 });
-app.post('/api/store/customers', authMiddleware, async (req, res) => {
+app.post('/api/store/customers', authMiddleware, hasPerm('customers'), async (req, res) => {
     await initDB();
     const { name, phone, address, contact, remark } = req.body;
     await run("INSERT INTO customers (name, phone, address, contact, remark) VALUES (?, ?, ?, ?, ?)", [name, phone, address, contact, remark]);
@@ -817,7 +897,7 @@ app.post('/api/store/customers', authMiddleware, async (req, res) => {
     saveDB();
     res.json({ ok: true });
 });
-app.get('/api/store/purchase-orders', authMiddleware, async (_req, res) => {
+app.get('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), async (_req, res) => {
     await initDB();
     const result = await safeExec("SELECT * FROM purchase_orders ORDER BY created_at DESC, id DESC LIMIT 50");
     const orders = (result.values || []).map((o) => ({
@@ -825,7 +905,7 @@ app.get('/api/store/purchase-orders', authMiddleware, async (_req, res) => {
     }));
     res.json(orders);
 });
-app.post('/api/store/purchase-orders', authMiddleware, async (req, res) => {
+app.post('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), async (req, res) => {
     await initDB();
     const { supplier_id, supplier_name, items, discount, final_amount } = req.body;
     const orderNumber = generateOrderNumber('JH');
@@ -845,7 +925,7 @@ app.post('/api/store/purchase-orders', authMiddleware, async (req, res) => {
     saveDB();
     res.json({ ok: true, order_number: orderNumber });
 });
-app.get('/api/store/sales-orders', authMiddleware, async (req, res) => {
+app.get('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req, res) => {
     await initDB();
     const { pageSize = 200 } = req.query;
     const result = await safeExec("SELECT * FROM sales_orders ORDER BY created_at DESC, id DESC LIMIT ?", [Number(pageSize)]);
@@ -870,7 +950,7 @@ app.get('/api/store/sales-orders/:id', authMiddleware, async (req, res) => {
         payment_method: o[7], operator_id: o[8], operator_name: o[9], created_at: o[10], items
     });
 });
-app.post('/api/store/sales-orders', authMiddleware, async (req, res) => {
+app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req, res) => {
     await initDB();
     const { order_number: customOrderNumber, customer_id, customer_name, items, payment_method, discount, payment_status } = req.body;
     const orderNumber = customOrderNumber || generateOrderNumber('XS');
@@ -906,7 +986,7 @@ app.post('/api/store/sales-orders', authMiddleware, async (req, res) => {
     res.json({ ok: true, order_number: orderNumber });
 });
 // Sales Return APIs
-app.get('/api/store/sales-returns', authMiddleware, async (_req, res) => {
+app.get('/api/store/sales-returns', authMiddleware, hasPerm('return'), async (_req, res) => {
     await initDB();
     const result = await safeExec("SELECT * FROM sales_returns ORDER BY id DESC LIMIT 50");
     const returns = (result.values || []).map((r) => ({
@@ -915,7 +995,7 @@ app.get('/api/store/sales-returns', authMiddleware, async (_req, res) => {
     }));
     res.json(returns);
 });
-app.post('/api/store/sales-returns', authMiddleware, async (req, res) => {
+app.post('/api/store/sales-returns', authMiddleware, hasPerm('return'), async (req, res) => {
     await initDB();
     const { sales_order_id, items, reason } = req.body;
     const returnNumber = generateOrderNumber('TH');
@@ -941,7 +1021,7 @@ app.post('/api/store/sales-returns', authMiddleware, async (req, res) => {
     res.json({ ok: true, return_number: returnNumber });
 });
 // ==================== 回收单（旧件回收：回收入库 + 成本=回收价 + 记回收支出） ====================
-app.get('/api/store/recycles', authMiddleware, async (_req, res) => {
+app.get('/api/store/recycles', authMiddleware, hasPerm('recycle'), async (_req, res) => {
     await initDB();
     const result = await safeExec("SELECT * FROM recycles ORDER BY id DESC LIMIT 100");
     const list = (result.values || []).map((r) => ({
@@ -964,7 +1044,7 @@ app.get('/api/store/recycles/:id', authMiddleware, async (req, res) => {
         total_amount: Number(r[4]), operator_id: r[5], operator_name: r[6], remark: r[7], created_at: r[8], items
     });
 });
-app.post('/api/store/recycles', authMiddleware, async (req, res) => {
+app.post('/api/store/recycles', authMiddleware, hasPerm('recycle'), async (req, res) => {
     await initDB();
     if (req.user && req.user.role === 'employee')
         return res.status(403).json({ error: '店员无权操作回收，请联系管理员' });
@@ -1022,7 +1102,7 @@ app.get('/api/store/pos/products', authMiddleware, async (req, res) => {
     const result = await safeExec(sql);
     res.json(result.values || []);
 });
-app.get('/api/store/settings', authMiddleware, adminOnly, async (_req, res) => {
+app.get('/api/store/settings', authMiddleware, hasPerm('settings'), async (_req, res) => {
     await initDB();
     const result = await safeExec("SELECT key, value FROM settings");
     const settings = {};
@@ -1031,7 +1111,7 @@ app.get('/api/store/settings', authMiddleware, adminOnly, async (_req, res) => {
     }
     res.json(settings);
 });
-app.put('/api/store/settings', authMiddleware, adminOnly, async (req, res) => {
+app.put('/api/store/settings', authMiddleware, hasPerm('settings'), async (req, res) => {
     await initDB();
     const { settings } = req.body;
     for (const [key, value] of Object.entries(settings)) {
@@ -1041,7 +1121,7 @@ app.put('/api/store/settings', authMiddleware, adminOnly, async (req, res) => {
     saveDB();
     res.json({ ok: true });
 });
-app.post('/api/store/settings/init', authMiddleware, adminOnly, async (_req, res) => {
+app.post('/api/store/settings/init', authMiddleware, hasPerm('settings'), async (_req, res) => {
     await initDB();
     const defaultSettings = {
         store_tax_rate: '0',
