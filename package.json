@@ -1,0 +1,18 @@
+{
+    "version":  "1.0.0",
+    "name":  "hongrui-boss-api",
+    "scripts":  {
+                    "start":  "node server-supabase.js"
+                },
+    "type":  "module",
+    "dependencies":  {
+                         "pg":  "^8.23.0",
+                         "cors":  "^2.8.6",
+                         "bcryptjs":  "^3.0.3",
+                         "helmet":  "^8.3.0",
+                         "jsonwebtoken":  "^9.0.3",
+                         "express":  "^5.2.1",
+                         "morgan":  "^1.11.0"
+                     },
+    "main":  "server-supabase.js"
+}
