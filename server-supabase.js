@@ -95,6 +95,24 @@ async function initDB() {
         await client.query('SELECT 1');
         // 迁移：users 表增加 permissions 列（幂等）
         try { await client.query("ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions TEXT DEFAULT '[]'"); } catch (e) { /* 已存在或不可用则忽略 */ }
+        // ===== 新增功能建表（幂等）：销售预订 / 进货退货 / 报价单 / 规格 / 单位 =====
+        const ddl = [
+            `ALTER TABLE users ADD COLUMN IF NOT EXISTS commission_rate DOUBLE PRECISION DEFAULT 0`,
+            `ALTER TABLE products ADD COLUMN IF NOT EXISTS wholesale_price DOUBLE PRECISION DEFAULT 0`,
+            `ALTER TABLE customers ADD COLUMN IF NOT EXISTS price_level TEXT DEFAULT 'retail'`,
+            `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS commission_amount DOUBLE PRECISION DEFAULT 0`,
+            `CREATE TABLE IF NOT EXISTS sales_reservations (id BIGSERIAL PRIMARY KEY, reservation_number TEXT, customer_id BIGINT, customer_name TEXT, total_amount DOUBLE PRECISION DEFAULT 0, status TEXT DEFAULT 'pending', remark TEXT, operator_id BIGINT, operator_name TEXT, created_at TEXT DEFAULT to_char(now() AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI:SS'))`,
+            `CREATE TABLE IF NOT EXISTS sales_reservation_items (id BIGSERIAL PRIMARY KEY, reservation_id BIGINT, product_id BIGINT, product_name TEXT, sku TEXT, quantity DOUBLE PRECISION DEFAULT 0, unit_price DOUBLE PRECISION DEFAULT 0, amount DOUBLE PRECISION DEFAULT 0)`,
+            `CREATE TABLE IF NOT EXISTS purchase_returns (id BIGSERIAL PRIMARY KEY, return_number TEXT, purchase_order_id BIGINT, supplier_id BIGINT, supplier_name TEXT, total_amount DOUBLE PRECISION DEFAULT 0, reason TEXT, operator_id BIGINT, operator_name TEXT, created_at TEXT DEFAULT to_char(now() AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI:SS'))`,
+            `CREATE TABLE IF NOT EXISTS purchase_return_items (id BIGSERIAL PRIMARY KEY, return_id BIGINT, product_id BIGINT, product_name TEXT, quantity DOUBLE PRECISION DEFAULT 0, unit_price DOUBLE PRECISION DEFAULT 0, amount DOUBLE PRECISION DEFAULT 0)`,
+            `CREATE TABLE IF NOT EXISTS quotes (id BIGSERIAL PRIMARY KEY, quote_number TEXT, customer_id BIGINT, customer_name TEXT, total_amount DOUBLE PRECISION DEFAULT 0, status TEXT DEFAULT 'draft', remark TEXT, operator_id BIGINT, operator_name TEXT, created_at TEXT DEFAULT to_char(now() AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI:SS'))`,
+            `CREATE TABLE IF NOT EXISTS quote_items (id BIGSERIAL PRIMARY KEY, quote_id BIGINT, product_id BIGINT, product_name TEXT, sku TEXT, quantity DOUBLE PRECISION DEFAULT 0, unit_price DOUBLE PRECISION DEFAULT 0, amount DOUBLE PRECISION DEFAULT 0)`,
+            `CREATE TABLE IF NOT EXISTS product_specs (id BIGSERIAL PRIMARY KEY, name TEXT, remark TEXT, created_at TEXT DEFAULT to_char(now() AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI:SS'))`,
+            `CREATE TABLE IF NOT EXISTS units (id BIGSERIAL PRIMARY KEY, name TEXT, remark TEXT, created_at TEXT DEFAULT to_char(now() AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI:SS'))`,
+        ];
+        for (const sql of ddl) {
+            try { await client.query(sql); } catch (e) { console.log('DDL skip:', e.message); }
+        }
         console.log('Database connected (Supabase)');
     }
     finally {
@@ -213,9 +231,9 @@ app.get('/api/auth/me', authMiddleware, (req, res) => res.json({ ...req.user, pe
 // Users management
 app.get('/api/auth/users', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
-    const result = await safeExec("SELECT id, username, real_name, role, phone, email, status, created_at, last_login, permissions FROM users ORDER BY id");
+    const result = await safeExec("SELECT id, username, real_name, role, phone, email, status, created_at, last_login, permissions, COALESCE(commission_rate,0) FROM users ORDER BY id");
     const users = (result.values || []).map((u) => ({
-        id: u[0], username: u[1], real_name: u[2], role: u[3], phone: u[4], email: u[5], status: parseInt(u[6]) || 0, created_at: u[7], last_login: u[8], permissions: parsePerms({ role: u[3], permissions: u[9] })
+        id: u[0], username: u[1], real_name: u[2], role: u[3], phone: u[4], email: u[5], status: parseInt(u[6]) || 0, created_at: u[7], last_login: u[8], permissions: parsePerms({ role: u[3], permissions: u[9] }), commission_rate: Number(u[10]) || 0
     }));
     res.json(users);
 });
@@ -232,12 +250,15 @@ app.post('/api/auth/users', authMiddleware, adminOnly, async (req, res) => {
 app.put('/api/auth/users/:id', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
     const { id } = req.params;
-    const { status, permissions } = req.body;
+    const { status, permissions, commission_rate } = req.body;
     if (status !== undefined) {
         await run("UPDATE users SET status = ? WHERE id = ?", [status, id]);
     }
     if (Array.isArray(permissions)) {
         await run("UPDATE users SET permissions = ? WHERE id = ?", [JSON.stringify(permissions), id]);
+    }
+    if (commission_rate !== undefined) {
+        await run("UPDATE users SET commission_rate = ? WHERE id = ?", [Number(commission_rate) || 0, id]);
     }
     saveDB();
     saveDB();
@@ -298,7 +319,8 @@ app.get('/api/inventory/products', authMiddleware, hasPerm('inventory_view'), as
         id: p[0], sku: p[1], name: p[2], category: p[3], spec: p[4], unit: p[5],
         cost_price: Number(p[6]), sell_price: Number(p[7]), stock_quantity: Number(p[8]),
         warning_quantity: Number(p[9]), batch_number: p[10], production_date: p[11],
-        expiry_date: p[12], supplier_id: p[13], status: p[14], created_at: p[15], updated_at: p[16]
+        expiry_date: p[12], supplier_id: p[13], status: p[14], created_at: p[15], updated_at: p[16],
+        wholesale_price: Number(p[17] || 0)
     }));
     res.json(products);
 });
@@ -309,7 +331,8 @@ app.get('/api/inventory/products/warning', authMiddleware, hasPerm('inventory_vi
         id: p[0], sku: p[1], name: p[2], category: p[3], spec: p[4], unit: p[5],
         cost_price: Number(p[6]), sell_price: Number(p[7]), stock_quantity: Number(p[8]),
         warning_quantity: Number(p[9]), batch_number: p[10], production_date: p[11],
-        expiry_date: p[12], supplier_id: p[13], status: p[14], created_at: p[15], updated_at: p[16]
+        expiry_date: p[12], supplier_id: p[13], status: p[14], created_at: p[15], updated_at: p[16],
+        wholesale_price: Number(p[17] || 0)
     }));
     res.json(products);
 });
@@ -327,7 +350,8 @@ app.get('/api/inventory/products/batch', authMiddleware, hasPerm('inventory_view
         id: p[0], sku: p[1], name: p[2], category: p[3], spec: p[4], unit: p[5],
         cost_price: Number(p[6]), sell_price: Number(p[7]), stock_quantity: Number(p[8]),
         warning_quantity: Number(p[9]), batch_number: p[10], production_date: p[11],
-        expiry_date: p[12], supplier_id: p[13], status: p[14], created_at: p[15], updated_at: p[16]
+        expiry_date: p[12], supplier_id: p[13], status: p[14], created_at: p[15], updated_at: p[16],
+        wholesale_price: Number(p[17] || 0)
     }));
     res.json(products);
 });
@@ -339,14 +363,15 @@ app.get('/api/inventory/products/expiry', authMiddleware, hasPerm('inventory_vie
         id: p[0], sku: p[1], name: p[2], category: p[3], spec: p[4], unit: p[5],
         cost_price: Number(p[6]), sell_price: Number(p[7]), stock_quantity: Number(p[8]),
         warning_quantity: Number(p[9]), batch_number: p[10], production_date: p[11],
-        expiry_date: p[12], supplier_id: p[13], status: p[14], created_at: p[15], updated_at: p[16]
+        expiry_date: p[12], supplier_id: p[13], status: p[14], created_at: p[15], updated_at: p[16],
+        wholesale_price: Number(p[17] || 0)
     }));
     res.json(products);
 });
 app.post('/api/inventory/products', authMiddleware, hasPerm('inventory_full'), async (req, res) => {
     await initDB();
-    const { sku, name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity, batch_number, production_date, expiry_date, supplier_id } = req.body;
-    run("INSERT INTO products (sku, name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity, batch_number, production_date, expiry_date, supplier_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [sku, name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity, batch_number, production_date, expiry_date, supplier_id]);
+    const { sku, name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity, batch_number, production_date, expiry_date, supplier_id, wholesale_price } = req.body;
+    run("INSERT INTO products (sku, name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity, batch_number, production_date, expiry_date, supplier_id, wholesale_price) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [sku, name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity, batch_number, production_date, expiry_date, supplier_id, wholesale_price || 0]);
     saveDB();
     saveDB();
     res.json({ ok: true });
@@ -354,8 +379,8 @@ app.post('/api/inventory/products', authMiddleware, hasPerm('inventory_full'), a
 app.put('/api/inventory/products/:id', authMiddleware, hasPerm('inventory_full'), async (req, res) => {
     await initDB();
     const { id } = req.params;
-    const { sku, name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity, batch_number, production_date, expiry_date, supplier_id } = req.body;
-    run("UPDATE products SET sku=?, name=?, category=?, spec=?, unit=?, cost_price=?, sell_price=?, stock_quantity=?, warning_quantity=?, batch_number=?, production_date=?, expiry_date=?, supplier_id=?, updated_at=datetime('now','localtime') WHERE id=?", [sku, name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity, batch_number, production_date, expiry_date, supplier_id, id]);
+    const { sku, name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity, batch_number, production_date, expiry_date, supplier_id, wholesale_price } = req.body;
+    run("UPDATE products SET sku=?, name=?, category=?, spec=?, unit=?, cost_price=?, sell_price=?, stock_quantity=?, warning_quantity=?, batch_number=?, production_date=?, expiry_date=?, supplier_id=?, wholesale_price=?, updated_at=datetime('now','localtime') WHERE id=?", [sku, name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity, batch_number, production_date, expiry_date, supplier_id, wholesale_price || 0, id]);
     saveDB();
     saveDB();
     res.json({ ok: true });
@@ -647,9 +672,19 @@ app.get('/api/analysis/profit', authMiddleware, hasPerm('sales_stats'), async (r
     const todayCost = Number((await safeExec(`SELECT COALESCE(SUM(oi.amount - (p.cost_price * oi.quantity)),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE date(so.created_at)='${today}'`)).values?.[0]?.[0] || 0);
     const monthSales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at) >= '${monthStart}'`)).values?.[0]?.[0] || 0);
     const monthCost = Number((await safeExec(`SELECT COALESCE(SUM(oi.amount - (p.cost_price * oi.quantity)),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE date(so.created_at) >= '${monthStart}'`)).values?.[0]?.[0] || 0);
+    // 其他收入/其他支出（category 以"其他"开头的收支，如 其他收入-房租、其他支出-水电）
+    const otherSql = (t, from) => `SELECT COALESCE(SUM(amount),0) FROM transactions WHERE type='${t}' AND (category LIKE '其他%' OR category LIKE '%其他%') AND date(created_at) ${from}`;
+    const todayOtherIncome = Number((await safeExec(otherSql('income', `='${today}'`))).values?.[0]?.[0] || 0);
+    const todayOtherExpense = Number((await safeExec(otherSql('expense', `='${today}'`))).values?.[0]?.[0] || 0);
+    const monthOtherIncome = Number((await safeExec(otherSql('income', `>= '${monthStart}'`))).values?.[0]?.[0] || 0);
+    const monthOtherExpense = Number((await safeExec(otherSql('expense', `>= '${monthStart}'`))).values?.[0]?.[0] || 0);
     res.json({
         today_sales: todaySales, today_cost: todayCost, today_profit: todaySales - todayCost,
-        month_sales: monthSales, month_cost: monthCost, month_profit: monthSales - monthCost
+        today_other_income: todayOtherIncome, today_other_expense: todayOtherExpense,
+        today_net: todaySales - todayCost + todayOtherIncome - todayOtherExpense,
+        month_sales: monthSales, month_cost: monthCost, month_profit: monthSales - monthCost,
+        month_other_income: monthOtherIncome, month_other_expense: monthOtherExpense,
+        month_net: monthSales - monthCost + monthOtherIncome - monthOtherExpense
     });
 });
 // 员工业绩：按日期范围统计（默认本月）。管理员/店长看全员；店员只返回自己（看不到成本与利润）
@@ -675,11 +710,13 @@ app.get('/api/analysis/performance', authMiddleware, async (req, res) => {
         if (!isAdmin && role !== 'employee')
             continue;
         const stat = (await safeExec("SELECT COUNT(*), COALESCE(SUM(final_amount),0) FROM sales_orders WHERE operator_id = ? AND final_amount > 0 AND created_at >= ? AND created_at <= ?", [uid, defStart, defEnd + ' 23:59:59'])).values?.[0] || [0, 0];
+        const comm = (await safeExec("SELECT COALESCE(SUM(commission_amount),0) FROM sales_orders WHERE operator_id = ? AND created_at >= ? AND created_at <= ?", [uid, defStart, defEnd + ' 23:59:59'])).values?.[0]?.[0] || 0;
         rows.push({
             name,
             role: role === 'admin' ? '管理员' : role === 'manager' ? '店长' : '店员',
             orders: Number(stat[0] || 0),
             sales: Math.round(Number(stat[1] || 0) * 100) / 100,
+            commission: Math.round(Number(comm) * 100) / 100,
             // 店员看不到成本和利润（前端也不展示，这里直接不给字段）
             cost: isAdmin ? Math.round(Number((await safeExec("SELECT COALESCE(SUM(oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id=so.id JOIN products p ON oi.product_id=p.id WHERE so.operator_id=? AND so.final_amount>0 AND so.created_at>=? AND so.created_at<=?", [uid, defStart, defEnd + ' 23:59:59'])).values?.[0]?.[0] || 0) * 100) / 100 : undefined,
             profit: isAdmin ? Math.round((Number(stat[1] || 0) - Number((await safeExec("SELECT COALESCE(SUM(oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id=so.id JOIN products p ON oi.product_id=p.id WHERE so.operator_id=? AND so.final_amount>0 AND so.created_at>=? AND so.created_at<=?", [uid, defStart, defEnd + ' 23:59:59'])).values?.[0]?.[0] || 0)) * 100) / 100 : undefined,
@@ -891,14 +928,23 @@ app.get('/api/store/customers', authMiddleware, hasPerm('customers'), async (_re
     await initDB();
     const result = await safeExec("SELECT * FROM customers WHERE status=1 ORDER BY id");
     const list = (result.values || []).map((c) => ({
-        id: Number(c[0]), name: c[1], phone: c[2], address: c[3], contact: c[4], remark: c[5], status: c[6], created_at: c[7]
+        id: Number(c[0]), name: c[1], phone: c[2], address: c[3], contact: c[4], remark: c[5], status: c[6], created_at: c[7], price_level: c[8] || 'retail'
     }));
     res.json(list);
 });
 app.post('/api/store/customers', authMiddleware, hasPerm('customers'), async (req, res) => {
     await initDB();
-    const { name, phone, address, contact, remark } = req.body;
-    await run("INSERT INTO customers (name, phone, address, contact, remark) VALUES (?, ?, ?, ?, ?)", [name, phone, address, contact, remark]);
+    const { name, phone, address, contact, remark, price_level } = req.body;
+    await run("INSERT INTO customers (name, phone, address, contact, remark, price_level) VALUES (?, ?, ?, ?, ?, ?)", [name, phone, address, contact, remark, price_level || 'retail']);
+    saveDB();
+    saveDB();
+    res.json({ ok: true });
+});
+app.put('/api/store/customers/:id', authMiddleware, hasPerm('customers'), async (req, res) => {
+    await initDB();
+    const { id } = req.params;
+    const { name, phone, address, contact, remark, price_level, status } = req.body;
+    await run("UPDATE customers SET name=?, phone=?, address=?, contact=?, remark=?, price_level=?, status=? WHERE id=?", [name, phone, address, contact, remark, price_level || 'retail', status !== undefined ? status : 1, id]);
     saveDB();
     saveDB();
     res.json({ ok: true });
@@ -977,7 +1023,13 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
         }
     }
     const finalAmount = totalAmount - (discount || 0);
-    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", [orderNumber, customer_id || null, customer_name || null, finalAmount, discount || 0, finalAmount, payment_method || null, req.user.id, req.user.real_name]);
+    // 业绩提成：按操作员 commission_rate% 计算
+    let commissionAmount = 0;
+    try {
+        const cr = (await safeExec("SELECT COALESCE(commission_rate,0) FROM users WHERE id = ?", [req.user.id])).values?.[0]?.[0];
+        commissionAmount = Math.round((Number(cr) || 0) * finalAmount) / 100;
+    } catch (e) { commissionAmount = 0; }
+    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, commission_amount) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [orderNumber, customer_id || null, customer_name || null, finalAmount, discount || 0, finalAmount, payment_method || null, req.user.id, req.user.real_name, commissionAmount]);
     saveDB();
     // Get the inserted order ID by finding the max id
     const orderIdResult = await safeExec("SELECT MAX(id) FROM sales_orders WHERE order_number = ?", [orderNumber]);
@@ -1231,6 +1283,214 @@ app.get('/api/finance/supplier-reconciliation', authMiddleware, hasPerm('reconci
         supplier_id: r[0], supplier_name: r[1] || '未填供应商', order_count: Number(r[2]), total_amount: Number(r[3])
     }));
     res.json(list);
+});
+// ==================== 销售预订 ====================
+app.get('/api/store/reservations', authMiddleware, hasPerm('sales'), async (_req, res) => {
+    await initDB();
+    const result = await safeExec("SELECT * FROM sales_reservations ORDER BY id DESC LIMIT 100");
+    const list = (result.values || []).map((r) => ({
+        id: r[0], reservation_number: r[1], customer_id: Number(r[2]) || null, customer_name: r[3],
+        total_amount: Number(r[4]), status: r[5], remark: r[6], operator_id: r[7], operator_name: r[8], created_at: r[9]
+    }));
+    res.json(list);
+});
+app.post('/api/store/reservations', authMiddleware, hasPerm('sales'), async (req, res) => {
+    await initDB();
+    let { customer_id, customer_name, items, remark } = req.body;
+    if (!customer_id && customer_name) {
+        const cidRes = await safeExec("SELECT id FROM customers WHERE name = ? ORDER BY id LIMIT 1", [customer_name]);
+        if (cidRes.values?.[0]?.[0]) customer_id = cidRes.values[0][0];
+    }
+    if (!items || !items.length) return res.status(400).json({ error: '请添加预订商品' });
+    const rn = generateOrderNumber('YD');
+    let totalAmount = 0;
+    for (const it of items) totalAmount += (it.quantity || 0) * (it.price || 0);
+    await run("INSERT INTO sales_reservations (reservation_number, customer_id, customer_name, total_amount, status, remark, operator_id, operator_name) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
+        [rn, customer_id || null, customer_name || null, totalAmount, remark || '', req.user.id, req.user.real_name]);
+    const rid = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0];
+    if (items && rid) {
+        for (const it of items) {
+            await run("INSERT INTO sales_reservation_items (reservation_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [rid, it.product_id || null, it.product_name, it.sku || '', it.quantity, it.price || 0, (it.quantity || 0) * (it.price || 0)]);
+        }
+    }
+    saveDB(); saveDB();
+    res.json({ ok: true, reservation_number: rn });
+});
+// 预订出库：生成销售单并扣库存，状态置 done
+app.post('/api/store/reservations/:id/complete', authMiddleware, hasPerm('sales'), async (req, res) => {
+    await initDB();
+    const id = Number(req.params.id);
+    const r = (await safeExec("SELECT * FROM sales_reservations WHERE id = ?", [id])).values?.[0];
+    if (!r) return res.status(404).json({ error: '预订不存在' });
+    if (r[5] !== 'pending') return res.status(400).json({ error: '仅待处理预订可出库' });
+    const items = (await safeExec("SELECT * FROM sales_reservation_items WHERE reservation_id = ?", [id])).values || [];
+    const orderNumber = generateOrderNumber('XS');
+    const finalAmount = Number(r[4]) || 0;
+    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name) VALUES (?, ?, ?, ?, 0, ?, NULL, ?, ?)",
+        [orderNumber, r[2], r[3], finalAmount, finalAmount, req.user.id, req.user.real_name]);
+    const orderId = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0];
+    for (const it of items) {
+        await run("INSERT INTO sales_order_items (order_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [orderId, it[2], it[3], it[4] || '', it[5], it[6], it[7]]);
+        if (it[2]) await run("UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?", [it[5], it[2]]);
+    }
+    await run("UPDATE sales_reservations SET status = 'done' WHERE id = ?", [id]);
+    saveDB(); saveDB();
+    res.json({ ok: true, order_number: orderNumber });
+});
+// 取消预订
+app.post('/api/store/reservations/:id/cancel', authMiddleware, hasPerm('sales'), async (req, res) => {
+    await initDB();
+    const id = Number(req.params.id);
+    await run("UPDATE sales_reservations SET status = 'cancelled' WHERE id = ?", [id]);
+    saveDB(); saveDB();
+    res.json({ ok: true });
+});
+// ==================== 进货退货 ====================
+app.get('/api/store/purchase-returns', authMiddleware, hasPerm('purchase'), async (_req, res) => {
+    await initDB();
+    const result = await safeExec("SELECT * FROM purchase_returns ORDER BY id DESC LIMIT 100");
+    const list = (result.values || []).map((r) => ({
+        id: r[0], return_number: r[1], purchase_order_id: Number(r[2]) || null, supplier_id: Number(r[3]) || null,
+        supplier_name: r[4], total_amount: Number(r[5]), reason: r[6], operator_id: r[7], operator_name: r[8], created_at: r[9]
+    }));
+    res.json(list);
+});
+// 进货退货：purchase_order_id 可选，直接按商品退，冲减库存
+app.post('/api/store/purchase-returns', authMiddleware, hasPerm('purchase'), async (req, res) => {
+    await initDB();
+    const { purchase_order_id, supplier_id, supplier_name, items, reason } = req.body;
+    if (!items || !items.length) return res.status(400).json({ error: '请添加退货商品' });
+    const rn = generateOrderNumber('TH');
+    let totalAmount = 0;
+    for (const it of items) totalAmount += (it.quantity || 0) * (it.price || 0);
+    await run("INSERT INTO purchase_returns (return_number, purchase_order_id, supplier_id, supplier_name, total_amount, reason, operator_id, operator_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        [rn, purchase_order_id || null, supplier_id || null, supplier_name || null, totalAmount, reason || '', req.user.id, req.user.real_name]);
+    const rid = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0];
+    if (items && rid) {
+        for (const it of items) {
+            await run("INSERT INTO purchase_return_items (return_id, product_id, product_name, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?)",
+                [rid, it.product_id || null, it.product_name, it.quantity, it.price || 0, (it.quantity || 0) * (it.price || 0)]);
+            if (it.product_id) await run("UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?", [it.quantity, it.product_id]);
+        }
+    }
+    saveDB(); saveDB();
+    res.json({ ok: true, return_number: rn });
+});
+// ==================== 报价单 ====================
+app.get('/api/store/quotes', authMiddleware, hasPerm('sales'), async (_req, res) => {
+    await initDB();
+    const result = await safeExec("SELECT * FROM quotes ORDER BY id DESC LIMIT 100");
+    const list = (result.values || []).map((r) => ({
+        id: r[0], quote_number: r[1], customer_id: Number(r[2]) || null, customer_name: r[3],
+        total_amount: Number(r[4]), status: r[5], remark: r[6], operator_id: r[7], operator_name: r[8], created_at: r[9]
+    }));
+    res.json(list);
+});
+app.post('/api/store/quotes', authMiddleware, hasPerm('sales'), async (req, res) => {
+    await initDB();
+    let { customer_id, customer_name, items, remark } = req.body;
+    if (!customer_id && customer_name) {
+        const cidRes = await safeExec("SELECT id FROM customers WHERE name = ? ORDER BY id LIMIT 1", [customer_name]);
+        if (cidRes.values?.[0]?.[0]) customer_id = cidRes.values[0][0];
+    }
+    if (!items || !items.length) return res.status(400).json({ error: '请添加报价商品' });
+    const qn = generateOrderNumber('BJ');
+    let totalAmount = 0;
+    for (const it of items) totalAmount += (it.quantity || 0) * (it.price || 0);
+    await run("INSERT INTO quotes (quote_number, customer_id, customer_name, total_amount, status, remark, operator_id, operator_name) VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)",
+        [qn, customer_id || null, customer_name || null, totalAmount, remark || '', req.user.id, req.user.real_name]);
+    const qid = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0];
+    if (items && qid) {
+        for (const it of items) {
+            await run("INSERT INTO quote_items (quote_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [qid, it.product_id || null, it.product_name, it.sku || '', it.quantity, it.price || 0, (it.quantity || 0) * (it.price || 0)]);
+        }
+    }
+    saveDB(); saveDB();
+    res.json({ ok: true, quote_number: qn });
+});
+// 报价单转销售单（状态置 sent）
+app.post('/api/store/quotes/:id/convert', authMiddleware, hasPerm('sales'), async (req, res) => {
+    await initDB();
+    const id = Number(req.params.id);
+    const q = (await safeExec("SELECT * FROM quotes WHERE id = ?", [id])).values?.[0];
+    if (!q) return res.status(404).json({ error: '报价单不存在' });
+    const items = (await safeExec("SELECT * FROM quote_items WHERE quote_id = ?", [id])).values || [];
+    const orderNumber = generateOrderNumber('XS');
+    const finalAmount = Number(q[4]) || 0;
+    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name) VALUES (?, ?, ?, ?, 0, ?, NULL, ?, ?)",
+        [orderNumber, q[2], q[3], finalAmount, finalAmount, req.user.id, req.user.real_name]);
+    const orderId = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0];
+    for (const it of items) {
+        await run("INSERT INTO sales_order_items (order_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [orderId, it[2], it[3], it[4] || '', it[5], it[6], it[7]]);
+        if (it[2]) await run("UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?", [it[5], it[2]]);
+    }
+    await run("UPDATE quotes SET status = 'sent' WHERE id = ?", [id]);
+    saveDB(); saveDB();
+    res.json({ ok: true, order_number: orderNumber });
+});
+// ==================== 规格 / 单位字典 ====================
+app.get('/api/inventory/specs', authMiddleware, hasPerm('inventory_view'), async (_req, res) => {
+    await initDB();
+    const result = await safeExec("SELECT * FROM product_specs ORDER BY id");
+    res.json((result.values || []).map((r) => ({ id: r[0], name: r[1], remark: r[2] })));
+});
+app.post('/api/inventory/specs', authMiddleware, hasPerm('inventory_full'), async (req, res) => {
+    await initDB();
+    const { name, remark } = req.body;
+    if (!name) return res.status(400).json({ error: '规格名称必填' });
+    await run("INSERT INTO product_specs (name, remark) VALUES (?, ?)", [name, remark || '']);
+    saveDB(); saveDB();
+    res.json({ ok: true });
+});
+app.delete('/api/inventory/specs/:id', authMiddleware, hasPerm('inventory_full'), async (req, res) => {
+    await initDB();
+    await run("DELETE FROM product_specs WHERE id = ?", [Number(req.params.id)]);
+    saveDB(); saveDB();
+    res.json({ ok: true });
+});
+app.get('/api/inventory/units', authMiddleware, hasPerm('inventory_view'), async (_req, res) => {
+    await initDB();
+    const result = await safeExec("SELECT * FROM units ORDER BY id");
+    res.json((result.values || []).map((r) => ({ id: r[0], name: r[1], remark: r[2] })));
+});
+app.post('/api/inventory/units', authMiddleware, hasPerm('inventory_full'), async (req, res) => {
+    await initDB();
+    const { name, remark } = req.body;
+    if (!name) return res.status(400).json({ error: '单位名称必填' });
+    await run("INSERT INTO units (name, remark) VALUES (?, ?)", [name, remark || '']);
+    saveDB(); saveDB();
+    res.json({ ok: true });
+});
+app.delete('/api/inventory/units/:id', authMiddleware, hasPerm('inventory_full'), async (req, res) => {
+    await initDB();
+    await run("DELETE FROM units WHERE id = ?", [Number(req.params.id)]);
+    saveDB(); saveDB();
+    res.json({ ok: true });
+});
+// ==================== 资金流水汇总 ====================
+app.get('/api/finance/summary', authMiddleware, hasPerm('finance_view'), async (req, res) => {
+    await initDB();
+    const days = Number(req.query.days || 30);
+    const start = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+    const rows = (await safeExec(`SELECT to_char(date(created_at), 'YYYY-MM-DD') d, type, COALESCE(SUM(amount),0) FROM transactions WHERE date(created_at) >= '${start}' AND type IN ('income','expense') GROUP BY date(created_at), type ORDER BY d`)).values || [];
+    const byDate = {};
+    for (const r of rows) {
+        const d = String(r[0]);
+        if (!byDate[d]) byDate[d] = { date: d, income: 0, expense: 0 };
+        if (r[1] === 'income') byDate[d].income = Number(r[2]);
+        else byDate[d].expense = Number(r[2]);
+    }
+    const catRows = (await safeExec(`SELECT type, COALESCE(NULLIF(category,''),'未分类'), COALESCE(SUM(amount),0) FROM transactions WHERE date(created_at) >= '${start}' AND type IN ('income','expense') GROUP BY type, category ORDER BY 3 DESC`)).values || [];
+    const byCat = { income: [], expense: [] };
+    for (const r of catRows) {
+        if (r[0] === 'income') byCat.income.push({ category: r[1], amount: Number(r[2]) });
+        else byCat.expense.push({ category: r[1], amount: Number(r[2]) });
+    }
+    res.json({ by_date: Object.values(byDate), by_category: byCat, days });
 });
 // 静态资源（dist 下的 assets/favicon 等；SPA 路由交给 catch-all）
 app.use(express.static(DIST_PATH));
