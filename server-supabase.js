@@ -6,6 +6,9 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import pg from 'pg';
 import path from 'path';
+import multer from 'multer';
+import XLSX from 'xlsx';
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 const PORT = Number(process.env.PORT || 3001);
 const JWT_SECRET = process.env.JWT_SECRET || 'hongrui-boss-secret-key-2024';
 const PROJECT_ROOT = path.join(path.dirname(path.resolve(process.argv[1])), "..");
@@ -1137,6 +1140,87 @@ app.post('/api/store/settings/init', authMiddleware, hasPerm('settings'), async 
     saveDB();
     saveDB();
     res.json({ ok: true });
+});
+// ==================== Excel 导入导出 ====================
+// 导出商品（xlsx）
+app.get('/api/inventory/products/export', authMiddleware, hasPerm('inventory_view'), async (_req, res) => {
+    await initDB();
+    const result = await safeExec("SELECT name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity FROM products WHERE status = 1 ORDER BY id");
+    const rows = [['商品名称', '分类', '规格', '单位', '进货价', '销售价', '库存数量', '预警数量']];
+    for (const r of result.values || []) rows.push(r);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), '商品');
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="products.xlsx"');
+    res.send(buf);
+});
+// 导入商品（按名称 upsert；表头：商品名称/分类/规格/单位/进货价/销售价/库存数量/预警数量）
+app.post('/api/inventory/products/import', authMiddleware, hasPerm('inventory_full'), upload.single('file'), async (req, res) => {
+    await initDB();
+    if (!req.file) return res.status(400).json({ error: '未上传文件' });
+    const wb = XLSX.read(req.file.buffer);
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: '' });
+    let added = 0, updated = 0, skipped = 0;
+    for (const r of rows.slice(1)) {
+        const name = String(r[0] || '').trim();
+        if (!name) { skipped++; continue; }
+        const exist = (await safeExec("SELECT id FROM products WHERE name = ? AND status = 1", [name])).values?.[0];
+        const cost = Number(r[4]) || 0, sell = Number(r[5]) || 0, stock = Number(r[6]) || 0, warn = Number(r[7]) || 0;
+        if (exist) {
+            await run("UPDATE products SET category=?, spec=?, unit=?, cost_price=?, sell_price=?, stock_quantity=?, warning_quantity=?, updated_at=datetime('now','localtime') WHERE id=?", [String(r[1] || ''), String(r[2] || ''), String(r[3] || ''), cost, sell, stock, warn, exist[0]]);
+            updated++;
+        } else {
+            await run("INSERT INTO products (name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [name, String(r[1] || ''), String(r[2] || ''), String(r[3] || ''), cost, sell, stock, warn]);
+            added++;
+        }
+    }
+    saveDB(); saveDB();
+    res.json({ ok: true, added, updated, skipped });
+});
+// 导出客户（xlsx）
+app.get('/api/store/customers/export', authMiddleware, hasPerm('customers'), async (_req, res) => {
+    await initDB();
+    const result = await safeExec("SELECT name, contact, phone, address, remark FROM customers WHERE status = 1 ORDER BY id");
+    const rows = [['客户名称', '联系人', '电话', '地址', '备注']];
+    for (const r of result.values || []) rows.push(r);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), '客户');
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="customers.xlsx"');
+    res.send(buf);
+});
+// 导入客户（按名称 upsert；表头：客户名称/联系人/电话/地址/备注）
+app.post('/api/store/customers/import', authMiddleware, hasPerm('customers'), upload.single('file'), async (req, res) => {
+    await initDB();
+    if (!req.file) return res.status(400).json({ error: '未上传文件' });
+    const wb = XLSX.read(req.file.buffer);
+    const rows = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: '' });
+    let added = 0, updated = 0, skipped = 0;
+    for (const r of rows.slice(1)) {
+        const name = String(r[0] || '').trim();
+        if (!name) { skipped++; continue; }
+        const exist = (await safeExec("SELECT id FROM customers WHERE name = ? AND status = 1", [name])).values?.[0];
+        if (exist) {
+            await run("UPDATE customers SET contact=?, phone=?, address=?, remark=? WHERE id=?", [String(r[1] || ''), String(r[2] || ''), String(r[3] || ''), String(r[4] || ''), exist[0]]);
+            updated++;
+        } else {
+            await run("INSERT INTO customers (name, contact, phone, address, remark) VALUES (?, ?, ?, ?, ?)", [name, String(r[1] || ''), String(r[2] || ''), String(r[3] || ''), String(r[4] || '')]);
+            added++;
+        }
+    }
+    saveDB(); saveDB();
+    res.json({ ok: true, added, updated, skipped });
+});
+// ==================== 供应商对账 ====================
+app.get('/api/finance/supplier-reconciliation', authMiddleware, hasPerm('reconciliation'), async (_req, res) => {
+    await initDB();
+    const result = await safeExec("SELECT supplier_id, supplier_name, COUNT(*), COALESCE(SUM(total_amount),0) FROM purchase_orders WHERE status = '1' OR status IS NULL OR status = '' GROUP BY supplier_id, supplier_name ORDER BY SUM(total_amount) DESC");
+    const list = (result.values || []).map((r) => ({
+        supplier_id: r[0], supplier_name: r[1] || '未填供应商', order_count: Number(r[2]), total_amount: Number(r[3])
+    }));
+    res.json(list);
 });
 // 静态资源（dist 下的 assets/favicon 等；SPA 路由交给 catch-all）
 app.use(express.static(DIST_PATH));
