@@ -1278,11 +1278,32 @@ app.post('/api/store/customers/import', authMiddleware, hasPerm('customers'), up
 // ==================== 供应商对账 ====================
 app.get('/api/finance/supplier-reconciliation', authMiddleware, hasPerm('reconciliation'), async (_req, res) => {
     await initDB();
-    const result = await safeExec("SELECT supplier_id, supplier_name, COUNT(*), COALESCE(SUM(total_amount),0) FROM purchase_orders WHERE status = '1' OR status IS NULL OR status = '' GROUP BY supplier_id, supplier_name ORDER BY SUM(total_amount) DESC");
+    // status 可能是 '1' / 'completed' / 空，统一视为有效单据
+    const result = await safeExec("SELECT supplier_id, supplier_name, COUNT(*), COALESCE(SUM(total_amount),0) FROM purchase_orders WHERE status NOT IN ('cancelled','void') GROUP BY supplier_id, supplier_name ORDER BY SUM(total_amount) DESC");
     const list = (result.values || []).map((r) => ({
         supplier_id: r[0], supplier_name: r[1] || '未填供应商', order_count: Number(r[2]), total_amount: Number(r[3])
     }));
     res.json(list);
+});
+// ==================== 应收应付汇总（全量，不依赖销售/采购权限） ====================
+app.get('/api/finance/arap', authMiddleware, hasPerm('finance_view'), async (_req, res) => {
+    await initDB();
+    const recv = (await safeExec(`SELECT customer_id, customer_name, COUNT(*), COALESCE(SUM(final_amount),0) FROM sales_orders WHERE final_amount > 0 GROUP BY customer_id, customer_name ORDER BY 4 DESC`)).values || [];
+    const pay = (await safeExec(`SELECT supplier_id, supplier_name, COUNT(*), COALESCE(SUM(total_amount),0) FROM purchase_orders WHERE status NOT IN ('cancelled','void') GROUP BY supplier_id, supplier_name ORDER BY 4 DESC`)).values || [];
+    const receivables = recv.map((r) => ({
+        party_id: Number(r[0]) || null, name: r[1] || '未知客户', order_count: Number(r[2]), total: Math.round(Number(r[3]) * 100) / 100
+    }));
+    const payables = pay.map((r) => ({
+        party_id: Number(r[0]) || null, name: r[1] || '未知供应商', order_count: Number(r[2]), total: Math.round(Number(r[3]) * 100) / 100
+    }));
+    res.json({
+        receivables,
+        payables,
+        summary: {
+            total_receivable: Math.round(receivables.reduce((s, r) => s + r.total, 0) * 100) / 100,
+            total_payable: Math.round(payables.reduce((s, r) => s + r.total, 0) * 100) / 100,
+        },
+    });
 });
 // ==================== 销售预订 ====================
 app.get('/api/store/reservations', authMiddleware, hasPerm('sales'), async (_req, res) => {
