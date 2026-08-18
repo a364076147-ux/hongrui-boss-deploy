@@ -1032,10 +1032,16 @@ app.get('/api/store/sales-orders/:id', authMiddleware, async (req, res) => {
     const items = ((await safeExec("SELECT * FROM sales_order_items WHERE order_id = ?", [id])).values || []).map((i) => ({
         id: i[0], product_id: i[2], product_name: i[3], sku: i[4], quantity: Number(i[5]), unit_price: Number(i[6]), amount: Number(i[7])
     }));
+    // 联查商品表补充规格/单位/条形码（打印用）
+    const enriched = await Promise.all(items.map(async (it) => {
+        if (!it.product_id) return { ...it, spec: '', unit: '', barcode: '' };
+        const p = (await safeExec("SELECT spec, unit, batch_number, production_date FROM products WHERE id = ?", [it.product_id])).values?.[0];
+        return { ...it, spec: p?.[0] || '', unit: p?.[1] || '', barcode: p?.[2] || '' };
+    }));
     res.json({
         id: o[0], order_number: o[1], customer_id: o[2], customer_name: o[3],
         total_amount: Number(o[4]), discount: Number(o[5]), final_amount: Number(o[6]),
-        payment_method: o[7], operator_id: o[8], operator_name: o[9], created_at: o[10], items
+        payment_method: o[7], operator_id: o[8], operator_name: o[9], created_at: o[10], items: enriched
     });
 });
 app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req, res) => {
