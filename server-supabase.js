@@ -980,11 +980,33 @@ app.put('/api/store/customers/:id', authMiddleware, hasPerm('customers'), async 
 });
 app.get('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), async (_req, res) => {
     await initDB();
-    const result = await safeExec("SELECT * FROM purchase_orders ORDER BY created_at DESC, id DESC LIMIT 50");
+    const result = await safeExec("SELECT * FROM purchase_orders ORDER BY created_at DESC, id DESC");
     const orders = (result.values || []).map((o) => ({
-        id: o[0], order_number: o[1], supplier_id: Number(o[2]) || null, supplier_name: o[3], total_amount: Number(o[4]), status: o[5], operator_id: o[6], operator_name: o[7], created_at: o[8]
+        id: o[0], order_number: o[1], supplier_id: Number(o[2]) || null, supplier_name: o[3], total_amount: Number(o[4]), status: o[5], operator_id: o[6], operator_name: o[7], created_at: o[8], payment_status: o[9] || '已结清'
     }));
     res.json(orders);
+});
+// 进货单详情（含商品明细，用于 A4 打印）
+app.get('/api/store/purchase-orders/:id', authMiddleware, hasPerm('purchase'), async (req, res) => {
+    await initDB();
+    const id = Number(req.params.id);
+    const o = (await safeExec("SELECT * FROM purchase_orders WHERE id = ?", [id])).values?.[0];
+    if (!o)
+        return res.status(404).json({ error: '进货单不存在' });
+    const items = ((await safeExec("SELECT * FROM purchase_order_items WHERE order_id = ?", [id])).values || []).map((i) => ({
+        id: i[0], product_id: i[2], product_name: i[3], quantity: Number(i[4]), unit_price: Number(i[5]), amount: Number(i[6])
+    }));
+    // 联查商品表补充规格/单位/条形码/编号（打印用）
+    const enriched = await Promise.all(items.map(async (it) => {
+        if (!it.product_id) return { ...it, sku: '', spec: '', unit: '', barcode: '' };
+        const p = (await safeExec("SELECT sku, spec, unit, batch_number FROM products WHERE id = ?", [it.product_id])).values?.[0];
+        return { ...it, sku: p?.[0] || '', spec: p?.[1] || '', unit: p?.[2] || '', barcode: p?.[3] || '' };
+    }));
+    res.json({
+        id: o[0], order_number: o[1], supplier_id: Number(o[2]) || null, supplier_name: o[3],
+        total_amount: Number(o[4]), status: o[5], operator_id: o[6], operator_name: o[7], created_at: o[8],
+        payment_status: o[9] || '已结清', items: enriched
+    });
 });
 app.post('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), async (req, res) => {
     await initDB();
