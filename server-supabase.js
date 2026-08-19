@@ -1011,6 +1011,19 @@ app.get('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), async
 // 进货单详情（含商品明细，用于 A4 打印）
 app.get('/api/store/purchase-orders/:id', authMiddleware, hasPerm('purchase'), async (req, res) => {
     await initDB();
+    if (req.params.id === 'export') {
+        // 导出进货单（避免与 :id 冲突）
+        const { startDate = '2020-01-01', endDate = '2030-12-31' } = req.query;
+        const result = await safeExec("SELECT order_number, supplier_name, total_amount, payment_status, operator_name, created_at FROM purchase_orders WHERE date(created_at) >= ? AND date(created_at) <= ? ORDER BY id", [String(startDate), String(endDate)]);
+        const rows = [['单据编号', '供应商名称', '应付金额', '付款状态', '操作员', '日期']];
+        for (const r of result.values || []) rows.push(r);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), '进货单');
+        const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', 'attachment; filename="purchase-orders.xlsx"');
+        return res.send(buf);
+    }
     const id = Number(req.params.id);
     const o = (await safeExec("SELECT * FROM purchase_orders WHERE id = ?", [id])).values?.[0];
     if (!o)
@@ -1078,6 +1091,19 @@ app.get('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req,
 // 销售单详情（含商品明细，用于小票/PDF 打印）
 app.get('/api/store/sales-orders/:id', authMiddleware, async (req, res) => {
     await initDB();
+    if (req.params.id === 'export') {
+        // 导出销售单（避免与 :id 冲突）
+        const { startDate = '2020-01-01', endDate = '2030-12-31' } = req.query;
+        const result = await safeExec("SELECT order_number, customer_name, total_amount, discount, final_amount, payment_method, payment_status, operator_name, created_at FROM sales_orders WHERE date(created_at) >= ? AND date(created_at) <= ? ORDER BY id", [String(startDate), String(endDate)]);
+        const rows = [['单据编号', '客户名称', '应收金额', '优惠', '实收金额', '收款方式', '收款状态', '操作员', '日期']];
+        for (const r of result.values || []) rows.push(r);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), '销售单');
+        const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+        res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        res.setHeader('Content-Disposition', 'attachment; filename="sales-orders.xlsx"');
+        return res.send(buf);
+    }
     const id = Number(req.params.id);
     const o = (await safeExec("SELECT * FROM sales_orders WHERE id = ?", [id])).values?.[0];
     if (!o)
@@ -1357,34 +1383,6 @@ app.get('/api/store/suppliers/export', authMiddleware, hasPerm('suppliers'), asy
     const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', 'attachment; filename="suppliers.xlsx"');
-    res.send(buf);
-});
-// 导出销售单（按日期范围）
-app.get('/api/store/sales-orders/export', authMiddleware, hasPerm('orders'), async (req, res) => {
-    await initDB();
-    const { startDate = '2020-01-01', endDate = '2030-12-31' } = req.query;
-    const result = await safeExec("SELECT order_number, customer_name, total_amount, discount, final_amount, payment_method, payment_status, operator_name, created_at FROM sales_orders WHERE date(created_at) >= ? AND date(created_at) <= ? ORDER BY id", [String(startDate), String(endDate)]);
-    const rows = [['单据编号', '客户名称', '应收金额', '优惠', '实收金额', '收款方式', '收款状态', '操作员', '日期']];
-    for (const r of result.values || []) rows.push(r);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), '销售单');
-    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename="sales-orders.xlsx"');
-    res.send(buf);
-});
-// 导出进货单（按日期范围）
-app.get('/api/store/purchase-orders/export', authMiddleware, hasPerm('purchase'), async (req, res) => {
-    await initDB();
-    const { startDate = '2020-01-01', endDate = '2030-12-31' } = req.query;
-    const result = await safeExec("SELECT order_number, supplier_name, total_amount, payment_status, operator_name, created_at FROM purchase_orders WHERE date(created_at) >= ? AND date(created_at) <= ? ORDER BY id", [String(startDate), String(endDate)]);
-    const rows = [['单据编号', '供应商名称', '应付金额', '付款状态', '操作员', '日期']];
-    for (const r of result.values || []) rows.push(r);
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), '进货单');
-    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename="purchase-orders.xlsx"');
     res.send(buf);
 });
 // 导出资金流水（按日期范围）
