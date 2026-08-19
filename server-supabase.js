@@ -187,6 +187,26 @@ function adminOnly(req, res, next) {
         return next();
     return res.status(403).json({ error: '无权限：该功能仅管理员可用' });
 }
+// 敏感数据权限检查中间件
+const checkSensitivePerm = (category, permId) => {
+    return (req, res, next) => {
+        if (isAdminLike(req.user.role)) return next(); // 管理员跳过
+        const sensitivePerms = JSON.parse(req.user.sensitive_permissions || '{}');
+        if (sensitivePerms[category]?.includes(permId)) {
+            return next();
+        }
+        res.status(403).json({ error: '无敏感数据访问权限' });
+    };
+};
+
+// 过滤敏感数据（根据权限返回 null 或脱敏值）
+const filterSensitiveData = (data, user, category, field) => {
+    if (isAdminLike(user.role)) return data;
+    const sensitivePerms = JSON.parse(user.sensitive_permissions || '{}');
+    if (sensitivePerms[category]?.includes(field)) return data;
+    return null;
+};
+
 // ==================== AUTH ====================
 app.get('/api/auth/verify', async (_req, res) => {
     try {
@@ -231,9 +251,9 @@ app.get('/api/auth/me', authMiddleware, (req, res) => res.json({ ...req.user, pe
 // Users management
 app.get('/api/auth/users', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
-    const result = await safeExec("SELECT id, username, real_name, role, phone, email, status, created_at, last_login, permissions, COALESCE(commission_rate,0) FROM users ORDER BY id");
+    const result = await safeExec("SELECT id, username, real_name, role, phone, email, status, created_at, last_login, permissions, COALESCE(commission_rate,0), sensitive_permissions FROM users ORDER BY id");
     const users = (result.values || []).map((u) => ({
-        id: u[0], username: u[1], real_name: u[2], role: u[3], phone: u[4], email: u[5], status: parseInt(u[6]) || 0, created_at: u[7], last_login: u[8], permissions: parsePerms({ role: u[3], permissions: u[9] }), commission_rate: Number(u[10]) || 0
+        id: u[0], username: u[1], real_name: u[2], role: u[3], phone: u[4], email: u[5], status: parseInt(u[6]) || 0, created_at: u[7], last_login: u[8], permissions: parsePerms({ role: u[3], permissions: u[9] }), commission_rate: Number(u[10]) || 0, sensitive_permissions: JSON.parse(u[11] || '{}')
     }));
     res.json(users);
 });
@@ -250,7 +270,7 @@ app.post('/api/auth/users', authMiddleware, adminOnly, async (req, res) => {
 app.put('/api/auth/users/:id', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
     const { id } = req.params;
-    const { status, permissions, commission_rate } = req.body;
+    const { status, permissions, commission_rate, sensitive_permissions } = req.body;
     if (status !== undefined) {
         await run("UPDATE users SET status = ? WHERE id = ?", [status, id]);
     }
@@ -258,9 +278,11 @@ app.put('/api/auth/users/:id', authMiddleware, adminOnly, async (req, res) => {
         await run("UPDATE users SET permissions = ? WHERE id = ?", [JSON.stringify(permissions), id]);
     }
     if (commission_rate !== undefined) {
-        await run("UPDATE users SET commission_rate = ? WHERE id = ?", [Number(commission_rate) || 0, id]);
+        await run("UPDATE users SET commission_rate = ? WHERE id = ?", [commission_rate, id]);
     }
-    saveDB();
+    if (sensitive_permissions !== undefined) {
+        await run("UPDATE users SET sensitive_permissions = ? WHERE id = ?", [JSON.stringify(sensitive_permissions), id]);
+    }
     saveDB();
     res.json({ ok: true });
 });
@@ -1038,7 +1060,16 @@ app.post('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), asyn
 app.get('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req, res) => {
     await initDB();
     const { pageSize = 200 } = req.query;
-    const result = await safeExec("SELECT * FROM sales_orders ORDER BY created_at DESC, id DESC LIMIT ?", [Number(pageSize)]);
+    // 数据权限：员工默认只能看自己的销售单（管理员/店长看全部）
+    let sql = "SELECT * FROM sales_orders";
+    const params = [];
+    if (!isAdminLike(req.user.role) && !(JSON.parse(req.user.sensitive_permissions || '{}').data || []).includes('view_other_sales')) {
+        sql += " WHERE operator_id = ?";
+        params.push(req.user.id);
+    }
+    sql += " ORDER BY created_at DESC, id DESC LIMIT ?";
+    params.push(Number(pageSize));
+    const result = await safeExec(sql, params);
     const orders = (result.values || []).map((o) => ({
         id: o[0], order_number: o[1], customer_id: Number(o[2]) || null, customer_name: o[3], total_amount: Number(o[4]), discount: Number(o[5]), final_amount: Number(o[6]), payment_method: o[7], operator_id: o[8], operator_name: o[9], created_at: o[10]
     }));
@@ -1312,6 +1343,62 @@ app.get('/api/store/customers/export', authMiddleware, hasPerm('customers'), asy
     const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', 'attachment; filename="customers.xlsx"');
+    res.send(buf);
+});
+// ==================== 数据导出扩展 ====================
+// 导出供应商
+app.get('/api/store/suppliers/export', authMiddleware, hasPerm('suppliers'), async (_req, res) => {
+    await initDB();
+    const result = await safeExec("SELECT name, contact, phone, address, remark FROM suppliers WHERE status = 1 ORDER BY id");
+    const rows = [['供应商名称', '联系人', '电话', '地址', '备注']];
+    for (const r of result.values || []) rows.push(r);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), '供应商');
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="suppliers.xlsx"');
+    res.send(buf);
+});
+// 导出销售单（按日期范围）
+app.get('/api/store/sales-orders/export', authMiddleware, hasPerm('orders'), async (req, res) => {
+    await initDB();
+    const { startDate = '2020-01-01', endDate = '2030-12-31' } = req.query;
+    const result = await safeExec("SELECT order_number, customer_name, total_amount, discount, final_amount, payment_method, payment_status, operator_name, created_at FROM sales_orders WHERE date(created_at) >= ? AND date(created_at) <= ? ORDER BY id", [String(startDate), String(endDate)]);
+    const rows = [['单据编号', '客户名称', '应收金额', '优惠', '实收金额', '收款方式', '收款状态', '操作员', '日期']];
+    for (const r of result.values || []) rows.push(r);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), '销售单');
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="sales-orders.xlsx"');
+    res.send(buf);
+});
+// 导出进货单（按日期范围）
+app.get('/api/store/purchase-orders/export', authMiddleware, hasPerm('purchase'), async (req, res) => {
+    await initDB();
+    const { startDate = '2020-01-01', endDate = '2030-12-31' } = req.query;
+    const result = await safeExec("SELECT order_number, supplier_name, total_amount, payment_status, operator_name, created_at FROM purchase_orders WHERE date(created_at) >= ? AND date(created_at) <= ? ORDER BY id", [String(startDate), String(endDate)]);
+    const rows = [['单据编号', '供应商名称', '应付金额', '付款状态', '操作员', '日期']];
+    for (const r of result.values || []) rows.push(r);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), '进货单');
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="purchase-orders.xlsx"');
+    res.send(buf);
+});
+// 导出资金流水（按日期范围）
+app.get('/api/finance/transactions/export', authMiddleware, hasPerm('finance_view'), async (req, res) => {
+    await initDB();
+    const { startDate = '2020-01-01', endDate = '2030-12-31' } = req.query;
+    const result = await safeExec("SELECT type, account_id, amount, category, description, party_name, operator_name, created_at FROM transactions WHERE date(created_at) >= ? AND date(created_at) <= ? ORDER BY id", [String(startDate), String(endDate)]);
+    const rows = [['类型', '账户ID', '金额', '类别', '描述', '往来对象', '操作员', '日期']];
+    for (const r of result.values || []) rows.push(r);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), '资金流水');
+    const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="transactions.xlsx"');
     res.send(buf);
 });
 // 导入客户（按名称 upsert；表头：客户名称/联系人/电话/地址/备注）
