@@ -166,7 +166,7 @@ async function authMiddleware(req, res, next) {
         // 每次请求从数据库刷新角色/权限/状态：管理员修改权限或停用后即时生效（无需重新登录）
         try {
             await initDB();
-            const r = await safeExec("SELECT role, status, permissions FROM users WHERE id = ?", [req.user.id]);
+            const r = await safeExec("SELECT role, status, permissions, COALESCE(sensitive_permissions,'{}') FROM users WHERE id = ?", [req.user.id]);
             const row = r.values?.[0];
             if (!row)
                 return res.status(401).json({ error: '账号不存在' });
@@ -174,6 +174,7 @@ async function authMiddleware(req, res, next) {
                 return res.status(403).json({ error: '账户已被禁用' });
             req.user.role = row[0];
             req.user.permissions = row[2];
+            req.user.sensitive_permissions = row[3];
         } catch (e) { /* 数据库不可用时降级使用 token 内的数据 */ }
         next();
     }
@@ -188,9 +189,10 @@ function adminOnly(req, res, next) {
     return res.status(403).json({ error: '无权限：该功能仅管理员可用' });
 }
 // 敏感数据权限检查中间件
+const isAdminUser = (role) => role === 'admin' || role === 'manager';
 const checkSensitivePerm = (category, permId) => {
     return (req, res, next) => {
-        if (isAdminLike(req.user.role)) return next(); // 管理员跳过
+        if (isAdminUser(req.user.role)) return next(); // 管理员跳过
         const sensitivePerms = JSON.parse(req.user.sensitive_permissions || '{}');
         if (sensitivePerms[category]?.includes(permId)) {
             return next();
@@ -201,7 +203,7 @@ const checkSensitivePerm = (category, permId) => {
 
 // 过滤敏感数据（根据权限返回 null 或脱敏值）
 const filterSensitiveData = (data, user, category, field) => {
-    if (isAdminLike(user.role)) return data;
+    if (isAdminUser(user.role)) return data;
     const sensitivePerms = JSON.parse(user.sensitive_permissions || '{}');
     if (sensitivePerms[category]?.includes(field)) return data;
     return null;
@@ -568,7 +570,12 @@ app.post('/api/finance/transactions/transfer', authMiddleware, adminOnly, async 
     saveDB();
     res.json({ ok: true });
 });
-app.get('/api/finance/transactions', authMiddleware, hasPerm('finance_view'), async (req, res) => {
+app.get('/api/finance/transactions', authMiddleware, (req, res, next) => {
+    // 收款/付款列表：有 income 或 expense 或 finance_view 任一权限即可查看
+    const perms = parsePerms(req.user);
+    if (hasPerm(req.user, 'finance_view') || hasPerm(req.user, 'income') || hasPerm(req.user, 'expense')) return next();
+    return res.status(403).json({ error: '无权限：该功能未开放给当前账号' });
+}, async (req, res) => {
     await initDB();
     const { type, account_id, page = 1, pageSize = 50 } = req.query;
     let sql = "SELECT * FROM transactions WHERE 1=1";
@@ -648,14 +655,17 @@ app.get('/api/finance/reconciliation', authMiddleware, hasPerm('reconciliation')
     res.json(reconciliations);
 });
 // ==================== ANALYSIS ====================
-app.get('/api/analysis/dashboard', authMiddleware, async (_req, res) => {
+app.get('/api/analysis/dashboard', authMiddleware, async (req, res) => {
     await initDB();
     const today = new Date().toISOString().slice(0, 10);
     const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10);
-    const todaySales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at)='${today}'`)).values?.[0]?.[0] || 0);
-    const todayExpense = Number((await safeExec(`SELECT COALESCE(SUM(amount),0) FROM transactions WHERE type='expense' AND date(created_at)='${today}'`)).values?.[0]?.[0] || 0);
+    // 数据权限：子账户只统计自己的销售单（避免泄露全店数据）
+    const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
+    const scopeSql = isAdminUser ? '' : ' AND operator_id = ' + Number(req.user.id);
+    const todaySales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at)='${today}'${scopeSql}`)).values?.[0]?.[0] || 0);
+    const todayExpense = Number((await safeExec(`SELECT COALESCE(SUM(amount),0) FROM transactions WHERE type='expense' AND date(created_at)='${today}'${scopeSql}`)).values?.[0]?.[0] || 0);
     const warningCount = Number((await safeExec("SELECT COUNT(*) FROM products WHERE stock_quantity <= warning_quantity AND status=1")).values?.[0]?.[0] || 0);
-    const monthSales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at) >= '${monthStart}'`)).values?.[0]?.[0] || 0);
+    const monthSales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at) >= '${monthStart}'${scopeSql}`)).values?.[0]?.[0] || 0);
     res.json({ todaySales, todayExpense, warningCount, monthSales });
 });
 app.get('/api/analysis/sales', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
@@ -1076,7 +1086,7 @@ app.get('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req,
     // 数据权限：员工默认只能看自己的销售单（管理员/店长看全部）
     let sql = "SELECT * FROM sales_orders";
     const params = [];
-    if (!isAdminLike(req.user.role) && !(JSON.parse(req.user.sensitive_permissions || '{}').data || []).includes('view_other_sales')) {
+    if (!(req.user.role === 'admin' || req.user.role === 'manager') && !(JSON.parse(req.user.sensitive_permissions || '{}').data || []).includes('view_other_sales')) {
         sql += " WHERE operator_id = ?";
         params.push(req.user.id);
     }
