@@ -1321,7 +1321,15 @@ app.get('/api/store/pos/products', authMiddleware, async (req, res) => {
     }
     sql += " ORDER BY id DESC LIMIT 100";
     const result = await safeExec(sql);
-    res.json(result.values || []);
+    // 转换为对象格式（与 /inventory/products 保持一致，前端按 p.name/p.sku 解析）
+    const products = (result.values || []).map((p) => ({
+        id: p[0], sku: p[1], name: p[2], category: p[3], spec: p[4], unit: p[5],
+        cost_price: Number(p[6]), sell_price: Number(p[7]), stock_quantity: Number(p[8]),
+        warning_quantity: Number(p[9]), batch_number: p[10], production_date: p[11],
+        expiry_date: p[12], supplier_id: p[13], status: p[14], created_at: p[15], updated_at: p[16],
+        wholesale_price: Number(p[17] || 0)
+    }));
+    res.json(products);
 });
 app.get('/api/store/settings', authMiddleware, hasPerm('settings'), async (_req, res) => {
     await initDB();
