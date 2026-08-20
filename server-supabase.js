@@ -605,6 +605,11 @@ app.get('/api/finance/transactions', authMiddleware, (req, res, next) => {
     const { type, account_id, page = 1, pageSize = 50 } = req.query;
     let sql = "SELECT * FROM transactions WHERE 1=1";
     const params = [];
+    // 数据隔离：子账户只能看自己的流水（管理员/店长看全部）
+    const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
+    if (!isAdminUser) {
+        sql += " AND operator_id = " + Number(req.user.id);
+    }
     if (type) {
         sql += " AND type = '" + String(type).replace(/'/g, "''") + "'";
     }
