@@ -1175,7 +1175,8 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
     let totalAmount = 0;
     if (items) {
         for (const item of items) {
-            totalAmount += (item.quantity || 0) * (item.price || 0);
+            // 兼容 unit_price / price 两种字段名（前端传 unit_price）
+            totalAmount += (item.quantity || 0) * (item.price ?? item.unit_price ?? 0);
         }
     }
     const finalAmount = totalAmount - (discount || 0);
@@ -1194,7 +1195,7 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
     const orderId = orderIdResult.values?.[0]?.[0] || 0;
     if (items && orderId > 0) {
         for (const item of items) {
-            await run("INSERT INTO sales_order_items (order_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)", [orderId, item.product_id, item.product_name, item.specification || '', item.quantity, item.price || 0, item.amount || 0]);
+            await run("INSERT INTO sales_order_items (order_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)", [orderId, item.product_id, item.product_name, item.specification || '', item.quantity, item.price ?? item.unit_price ?? 0, item.amount ?? item.quantity * (item.price ?? item.unit_price ?? 0)]);
             // Deduct stock
             if (item.product_id) {
                 await run("UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?", [item.quantity, item.product_id]);
