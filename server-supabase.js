@@ -6,6 +6,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import pg from 'pg';
 import path from 'path';
+import fs from 'fs';
 import multer from 'multer';
 import XLSX from 'xlsx';
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
@@ -1754,10 +1755,18 @@ app.get('/api/finance/summary', authMiddleware, hasPerm('finance_view'), async (
     res.json({ by_date: Object.values(byDate), by_category: byCat, days });
 });
 // 静态资源（dist 下的 assets/favicon 等；SPA 路由交给 catch-all）
-app.use(express.static(DIST_PATH));
+// 仅当 dist 目录存在时启用（纯 API 部署无 dist，避免每次启动 stat 报 ENOENT）
+const hasDist = fs.existsSync(DIST_PATH);
+if (hasDist) {
+    app.use(express.static(DIST_PATH));
+}
 // SPA catch-all
 app.use((_req, res) => {
-    res.sendFile(path.join(DIST_PATH, 'index.html'));
+    if (hasDist) {
+        res.sendFile(path.join(DIST_PATH, 'index.html'));
+    } else {
+        res.status(404).json({ error: 'Not Found', api: 'ok' });
+    }
 });
 async function start() {
     await initDB();
