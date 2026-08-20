@@ -523,9 +523,21 @@ app.post('/api/finance/transactions/income', authMiddleware, hasPerm('income'), 
     }
     if (pid) { ptype = 'customer'; }
     else if (pname) { ptype = 'customer'; }
+    // 账户兜底：优先前端指定 → 现金账户 → 任意账户 → 自动创建现金账户
+    let accId = account_id || null;
+    if (!accId) {
+        accId = (await safeExec("SELECT id FROM accounts WHERE type = 'cash' LIMIT 1")).values?.[0]?.[0] || null;
+    }
+    if (!accId) {
+        accId = (await safeExec("SELECT id FROM accounts ORDER BY id LIMIT 1")).values?.[0]?.[0] || null;
+    }
+    if (!accId) {
+        await run("INSERT INTO accounts (name, type, balance) VALUES ('现金', 'cash', 0)");
+        accId = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0] || null;
+    }
     const cat = category || (pname ? '收欠款' : '直接收款');
-    run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name) VALUES ('income', ?, ?, ?, ?, ?, ?, ?, ?, ?)", [account_id, amount, cat, description, req.user.id, req.user.real_name, ptype, pid, pname]);
-    run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [amount, account_id]);
+    run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name) VALUES ('income', ?, ?, ?, ?, ?, ?, ?, ?, ?)", [accId, amount, cat, description, req.user.id, req.user.real_name, ptype, pid, pname]);
+    run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [amount, accId]);
     // 冲减该客户欠款：若指定客户，将其最早未结清销售单标记已结清（按金额抵扣）
     if (pid && category !== '直接收款') {
         const unpaid = (await safeExec("SELECT id FROM sales_orders WHERE customer_id = ? AND payment_status != '已结清' ORDER BY id LIMIT 20", [pid])).values || [];
@@ -547,9 +559,21 @@ app.post('/api/finance/transactions/expense', authMiddleware, hasPerm('expense')
     }
     if (pid) { ptype = 'supplier'; }
     else if (pname) { ptype = 'supplier'; }
+    // 账户兜底：优先前端指定 → 现金账户 → 任意账户 → 自动创建现金账户
+    let accId = account_id || null;
+    if (!accId) {
+        accId = (await safeExec("SELECT id FROM accounts WHERE type = 'cash' LIMIT 1")).values?.[0]?.[0] || null;
+    }
+    if (!accId) {
+        accId = (await safeExec("SELECT id FROM accounts ORDER BY id LIMIT 1")).values?.[0]?.[0] || null;
+    }
+    if (!accId) {
+        await run("INSERT INTO accounts (name, type, balance) VALUES ('现金', 'cash', 0)");
+        accId = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0] || null;
+    }
     const cat = category || (pname ? '付欠款' : '直接付款');
-    run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name) VALUES ('expense', ?, ?, ?, ?, ?, ?, ?, ?, ?)", [account_id, amount, cat, description, req.user.id, req.user.real_name, ptype, pid, pname]);
-    run("UPDATE accounts SET balance = balance - ? WHERE id = ?", [amount, account_id]);
+    run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name) VALUES ('expense', ?, ?, ?, ?, ?, ?, ?, ?, ?)", [accId, amount, cat, description, req.user.id, req.user.real_name, ptype, pid, pname]);
+    run("UPDATE accounts SET balance = balance - ? WHERE id = ?", [amount, accId]);
     if (pid && category !== '直接付款') {
         const unpaid = (await safeExec("SELECT id FROM purchase_orders WHERE supplier_id = ? AND payment_status != '已结清' ORDER BY id LIMIT 20", [pid])).values || [];
         for (const row of unpaid) {
