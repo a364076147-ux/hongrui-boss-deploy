@@ -1113,6 +1113,12 @@ app.post('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), asyn
     saveDB();
     res.json({ ok: true, order_number: orderNumber });
 });
+// 开单可选业务员：返回在职业务员 + 管理员（管理员开单选业务员，子账户开单选自己或管理员）
+app.get('/api/store/sales-staff', authMiddleware, hasPerm('sales'), async (_req, res) => {
+    await initDB();
+    const result = await safeExec("SELECT id, real_name, role FROM users WHERE status = 1 AND role IN ('employee','admin') ORDER BY role, id");
+    res.json((result.values || []).map((u) => ({ id: u[0], real_name: u[1], role: u[2] })));
+});
 app.get('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req, res) => {
     await initDB();
     const { pageSize = 200 } = req.query;
@@ -1168,11 +1174,36 @@ app.get('/api/store/sales-orders/:id', authMiddleware, async (req, res) => {
 });
 app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req, res) => {
     await initDB();
-    let { order_number: customOrderNumber, customer_id, customer_name, items, payment_method, discount, payment_status } = req.body;
+    let { order_number: customOrderNumber, customer_id, customer_name, items, payment_method, discount, payment_status, operator_id: targetOperatorId } = req.body;
     // 兜底：未传 customer_id 时按名称自动解析
     if (!customer_id && customer_name) {
         const cidRes = await safeExec("SELECT id FROM customers WHERE name = ? ORDER BY id LIMIT 1", [customer_name]);
         if (cidRes.values?.[0]?.[0]) customer_id = cidRes.values[0][0];
+    }
+    // 业务员归属：
+    // - 管理员/店长：可指定在职业务员(employee)代开，业绩记业务员；管理员自己不参与业绩
+    // - 子账户：可选「自己」或「管理员」（老板安排送货的单记管理员）；不能记给其他业务员（防互挂造假）
+    const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
+    let operatorId = req.user.id;
+    let operatorName = req.user.real_name;
+    if (targetOperatorId && Number(targetOperatorId) > 0) {
+        const tid = Number(targetOperatorId);
+        const emp = (await safeExec("SELECT real_name, role, COALESCE(commission_rate,0) FROM users WHERE id = ? AND status = 1", [tid])).values?.[0];
+        if (emp) {
+            if (isAdminUser) {
+                // 管理员只能指定在职业务员
+                if (emp[1] === 'employee') {
+                    operatorId = tid;
+                    operatorName = emp[0] || req.user.real_name;
+                }
+            } else {
+                // 子账户只能记 自己 或 管理员
+                if (tid === req.user.id || emp[1] === 'admin') {
+                    operatorId = tid;
+                    operatorName = emp[0] || req.user.real_name;
+                }
+            }
+        }
     }
     const orderNumber = customOrderNumber || generateOrderNumber('XS');
     let totalAmount = 0;
@@ -1183,15 +1214,15 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
         }
     }
     const finalAmount = totalAmount - (discount || 0);
-    // 业绩提成：按操作员 commission_rate% 计算
+    // 业绩提成：按业务员（业绩归属人）commission_rate% 计算
     let commissionAmount = 0;
     try {
-        const cr = (await safeExec("SELECT COALESCE(commission_rate,0) FROM users WHERE id = ?", [req.user.id])).values?.[0]?.[0];
+        const cr = (await safeExec("SELECT COALESCE(commission_rate,0) FROM users WHERE id = ?", [operatorId])).values?.[0]?.[0];
         commissionAmount = Math.round((Number(cr) || 0) * finalAmount) / 100;
     } catch (e) { commissionAmount = 0; }
     // 收款状态：选了支付方式视为已结清；不选（赊账）为未结清 → 计入客户欠款
     const paymentStatus = payment_method ? '已结清' : '未结清';
-    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, commission_amount, payment_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [orderNumber, customer_id || null, customer_name || null, finalAmount, discount || 0, finalAmount, payment_method || null, req.user.id, req.user.real_name, commissionAmount, paymentStatus]);
+    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, commission_amount, payment_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [orderNumber, customer_id || null, customer_name || null, finalAmount, discount || 0, finalAmount, payment_method || null, operatorId, operatorName, commissionAmount, paymentStatus]);
     saveDB();
     // Get the inserted order ID by finding the max id
     const orderIdResult = await safeExec("SELECT MAX(id) FROM sales_orders WHERE order_number = ?", [orderNumber]);
