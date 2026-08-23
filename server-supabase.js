@@ -1191,8 +1191,8 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
         const emp = (await safeExec("SELECT real_name, role, COALESCE(commission_rate,0) FROM users WHERE id = ? AND status = 1", [tid])).values?.[0];
         if (emp) {
             if (isAdminUser) {
-                // 管理员只能指定在职业务员
-                if (emp[1] === 'employee') {
+                // 管理员可选：在职业务员 或 自己（自己对接的单记自己）
+                if (emp[1] === 'employee' || tid === req.user.id) {
                     operatorId = tid;
                     operatorName = emp[0] || req.user.real_name;
                 }
