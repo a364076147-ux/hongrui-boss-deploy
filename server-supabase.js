@@ -694,9 +694,12 @@ app.get('/api/analysis/dashboard', authMiddleware, async (req, res) => {
     const scopeSql = isAdminUser ? '' : ' AND operator_id = ' + Number(req.user.id);
     const todaySales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at)='${today}'${scopeSql}`)).values?.[0]?.[0] || 0);
     const todayExpense = Number((await safeExec(`SELECT COALESCE(SUM(amount),0) FROM transactions WHERE type='expense' AND date(created_at)='${today}'${scopeSql}`)).values?.[0]?.[0] || 0);
+    // 真实成本/毛利（成本 = Σ 数量×采购价；毛利 = 销售额 − 成本）
+    const todayCost = Number((await safeExec(`SELECT COALESCE(SUM(oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id=so.id JOIN products p ON oi.product_id=p.id WHERE date(so.created_at)='${today}'${scopeSql}`)).values?.[0]?.[0] || 0);
+    const todayOrders = Number((await safeExec(`SELECT COUNT(*) FROM sales_orders WHERE date(created_at)='${today}'${scopeSql}`)).values?.[0]?.[0] || 0);
     const warningCount = Number((await safeExec("SELECT COUNT(*) FROM products WHERE stock_quantity <= warning_quantity AND status=1")).values?.[0]?.[0] || 0);
     const monthSales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at) >= '${monthStart}'${scopeSql}`)).values?.[0]?.[0] || 0);
-    res.json({ todaySales, todayExpense, warningCount, monthSales });
+    res.json({ todaySales, todayExpense, todayCost, todayProfit: todaySales - todayCost, todayOrders, warningCount, monthSales });
 });
 app.get('/api/analysis/sales', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
     await initDB();
@@ -760,9 +763,9 @@ app.get('/api/analysis/profit', authMiddleware, hasPerm('sales_stats'), async (r
     const today = new Date().toISOString().slice(0, 10);
     const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10);
     const todaySales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at)='${today}'`)).values?.[0]?.[0] || 0);
-    const todayCost = Number((await safeExec(`SELECT COALESCE(SUM(oi.amount - (p.cost_price * oi.quantity)),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE date(so.created_at)='${today}'`)).values?.[0]?.[0] || 0);
+    const todayCost = Number((await safeExec(`SELECT COALESCE(SUM(oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE date(so.created_at)='${today}'`)).values?.[0]?.[0] || 0);
     const monthSales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at) >= '${monthStart}'`)).values?.[0]?.[0] || 0);
-    const monthCost = Number((await safeExec(`SELECT COALESCE(SUM(oi.amount - (p.cost_price * oi.quantity)),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE date(so.created_at) >= '${monthStart}'`)).values?.[0]?.[0] || 0);
+    const monthCost = Number((await safeExec(`SELECT COALESCE(SUM(oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE date(so.created_at) >= '${monthStart}'`)).values?.[0]?.[0] || 0);
     // 其他收入/其他支出（category 以"其他"开头的收支，如 其他收入-房租、其他支出-水电）
     const otherSql = (t, from) => `SELECT COALESCE(SUM(amount),0) FROM transactions WHERE type='${t}' AND (category LIKE '其他%' OR category LIKE '%其他%') AND date(created_at) ${from}`;
     const todayOtherIncome = Number((await safeExec(otherSql('income', `='${today}'`))).values?.[0]?.[0] || 0);
