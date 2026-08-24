@@ -425,7 +425,7 @@ app.delete('/api/inventory/products/:id', authMiddleware, hasPerm('inventory_ful
     res.json({ ok: true });
 });
 // Inventory checks
-app.get('/api/inventory/checks', authMiddleware, async (req, res) => {
+app.get('/api/inventory/checks', authMiddleware, hasPerm('inventory_view'), async (req, res) => {
     await initDB();
     const result = await safeExec("SELECT * FROM inventory_checks ORDER BY id DESC");
     res.json(result.values || []);
@@ -741,15 +741,16 @@ app.get('/api/analysis/sales', authMiddleware, hasPerm('sales_stats'), async (re
 });
 app.get('/api/analysis/sales/top-products', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
     await initDB();
-    const { days = 30 } = req.query;
+    const days = Math.min(Math.max(Number(req.query.days) || 30, 1), 365);
+    const startDate = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
     const result = (await safeExec(`
     SELECT p.name, p.sku, SUM(oi.quantity) as total_qty, SUM(oi.amount) as total_amount
     FROM sales_order_items oi
     JOIN sales_orders so ON oi.order_id = so.id
     JOIN products p ON oi.product_id = p.id
-    WHERE so.created_at >= date('now', '-${days} days')
+    WHERE so.created_at >= ?
     GROUP BY p.id ORDER BY total_amount DESC LIMIT 10
-  `));
+  `, [startDate]));
     const products = (result.values || []).map((p) => ({
         name: p[0], sku: p[1], total_qty: Number(p[2]), total_amount: Number(p[3])
     }));
