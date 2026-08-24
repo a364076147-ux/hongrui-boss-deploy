@@ -384,7 +384,8 @@ app.get('/api/inventory/products/batch', authMiddleware, hasPerm('inventory_view
 app.get('/api/inventory/products/expiry', authMiddleware, hasPerm('inventory_view'), async (req, res) => {
     await initDB();
     const { days = 30 } = req.query;
-    const result = await safeExec("SELECT * FROM products WHERE status = 1 AND expiry_date IS NOT NULL AND expiry_date <= date('now', '+' || ? || ' days') ORDER BY expiry_date ASC", [String(days)]);
+    const endDate = new Date(Date.now() + (Number(days) || 30) * 86400000).toISOString().slice(0, 10);
+    const result = await safeExec("SELECT * FROM products WHERE status = 1 AND expiry_date IS NOT NULL AND expiry_date <= ? ORDER BY expiry_date ASC", [endDate]);
     const products = (result.values || []).map((p) => ({
         id: p[0], sku: p[1], name: p[2], category: p[3], spec: p[4], unit: p[5],
         cost_price: Number(p[6]), sell_price: Number(p[7]), stock_quantity: Number(p[8]),
@@ -433,8 +434,8 @@ app.post('/api/inventory/checks', authMiddleware, adminOnly, async (req, res) =>
     await initDB();
     const checkNumber = generateOrderNumber('PD');
     await run("INSERT INTO inventory_checks (check_number, operator_id) VALUES (?, ?)", [checkNumber, req.user.id]);
-    const checkIdResult = await safeExec("SELECT lastval()");
-    const checkId = checkIdResult.values?.[0]?.[0];
+    // 获取刚插入的盘点单 ID（SQLite: last_insert_rowid，PG 端 translateSQL 自动转 lastval）
+    const checkId = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0];
     // Get all products for the check
     const products = await safeExec("SELECT id, name, sku, stock_quantity FROM products WHERE status = 1");
     if (products.values) {
@@ -443,8 +444,7 @@ app.post('/api/inventory/checks', authMiddleware, adminOnly, async (req, res) =>
         }
     }
     saveDB();
-    saveDB();
-    res.json({ ok: true });
+    res.json({ ok: true, check_id: checkId });
 });
 app.get('/api/inventory/checks/:id/items', authMiddleware, hasPerm('inventory_view'), async (req, res) => {
     await initDB();
@@ -542,18 +542,19 @@ app.post('/api/finance/transactions/income', authMiddleware, hasPerm('income'), 
     const cat = category || (pname ? '收欠款' : '直接收款');
     await run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name) VALUES ('income', ?, ?, ?, ?, ?, ?, ?, ?, ?)", [accId, amount, cat, description, req.user.id, req.user.real_name, ptype, pid, pname]);
     await run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [amount, accId]);
-    // 冲减该客户欠款：按金额逐单抵扣，不结清的保留原状态
+    // 冲减该客户欠款：若指定客户，将其最早未结清销售单标记已结清（按金额抵扣）
     if (pid && category !== '直接收款') {
-        let remaining = Number(amount);
-        const unpaid = (await safeExec("SELECT id, final_amount FROM sales_orders WHERE customer_id = ? AND payment_status != '已结清' ORDER BY id", [pid])).values || [];
+        const unpaid = (await safeExec("SELECT id, final_amount FROM sales_orders WHERE customer_id = ? AND payment_status != '已结清' ORDER BY id LIMIT 20", [pid])).values || [];
+        // 按金额逐单抵扣：收款金额先抵最早的欠单，不足部分保持未结清（不再一刀切全部标记已结清）
+        let remain = Number(amount) || 0;
         for (const row of unpaid) {
-            if (remaining <= 0) break;
-            const orderAmt = Number(row[1]) || 0;
-            if (remaining >= orderAmt) {
+            if (remain <= 0) break;
+            const due = Number(row[1]) || 0;
+            if (remain >= due) {
                 await run("UPDATE sales_orders SET payment_status = '已结清' WHERE id = ?", [row[0]]);
-                remaining -= orderAmt;
+                remain -= due;
             } else {
-                remaining = 0;
+                remain = 0;
             }
         }
     }
@@ -586,16 +587,17 @@ app.post('/api/finance/transactions/expense', authMiddleware, hasPerm('expense')
     await run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name) VALUES ('expense', ?, ?, ?, ?, ?, ?, ?, ?, ?)", [accId, amount, cat, description, req.user.id, req.user.real_name, ptype, pid, pname]);
     await run("UPDATE accounts SET balance = balance - ? WHERE id = ?", [amount, accId]);
     if (pid && category !== '直接付款') {
-        let remaining = Number(amount);
-        const unpaid = (await safeExec("SELECT id, total_amount FROM purchase_orders WHERE supplier_id = ? AND payment_status != '已结清' ORDER BY id", [pid])).values || [];
+        const unpaid = (await safeExec("SELECT id, total_amount FROM purchase_orders WHERE supplier_id = ? AND payment_status != '已结清' ORDER BY id LIMIT 20", [pid])).values || [];
+        // 按金额逐单抵扣：付款金额先抵最早的欠单，不足部分保持未结清
+        let remain = Number(amount) || 0;
         for (const row of unpaid) {
-            if (remaining <= 0) break;
-            const orderAmt = Number(row[1]) || 0;
-            if (remaining >= orderAmt) {
+            if (remain <= 0) break;
+            const due = Number(row[1]) || 0;
+            if (remain >= due) {
                 await run("UPDATE purchase_orders SET payment_status = '已结清' WHERE id = ?", [row[0]]);
-                remaining -= orderAmt;
+                remain -= due;
             } else {
-                remaining = 0;
+                remain = 0;
             }
         }
     }
@@ -1141,7 +1143,7 @@ app.get('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req,
     await initDB();
     const { pageSize = 200 } = req.query;
     // 数据权限：员工默认只能看自己的销售单（管理员/店长看全部）
-    let sql = "SELECT * FROM sales_orders";
+    let sql = "SELECT id, order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, created_at, payment_status, commission_amount FROM sales_orders";
     const params = [];
     if (!(req.user.role === 'admin' || req.user.role === 'manager') && !(JSON.parse(req.user.sensitive_permissions || '{}').data || []).includes('view_other_sales')) {
         sql += " WHERE operator_id = ?";
@@ -1151,7 +1153,7 @@ app.get('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req,
     params.push(Number(pageSize));
     const result = await safeExec(sql, params);
     const orders = (result.values || []).map((o) => ({
-        id: o[0], order_number: o[1], customer_id: Number(o[2]) || null, customer_name: o[3], total_amount: Number(o[4]), discount: Number(o[5]), final_amount: Number(o[6]), payment_method: o[7], operator_id: o[8], operator_name: o[9], commission_amount: Number(o[11]) || 0, payment_status: o[12] || '已结清', created_at: o[10]
+        id: o[0], order_number: o[1], customer_id: Number(o[2]) || null, customer_name: o[3], total_amount: Number(o[4]), discount: Number(o[5]), final_amount: Number(o[6]), payment_method: o[7], operator_id: o[8], operator_name: o[9], created_at: o[10], payment_status: o[11], commission_amount: Number(o[12] || 0)
     }));
     res.json(orders);
 });
@@ -1172,7 +1174,7 @@ app.get('/api/store/sales-orders/:id', authMiddleware, hasPerm('sales'), async (
         return res.send(buf);
     }
     const id = Number(req.params.id);
-    const o = (await safeExec("SELECT * FROM sales_orders WHERE id = ?", [id])).values?.[0];
+    const o = (await safeExec("SELECT id, order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, created_at, payment_status, commission_amount FROM sales_orders WHERE id = ?", [id])).values?.[0];
     if (!o)
         return res.status(404).json({ error: '订单不存在' });
     const items = ((await safeExec("SELECT * FROM sales_order_items WHERE order_id = ?", [id])).values || []).map((i) => ({
@@ -1187,7 +1189,7 @@ app.get('/api/store/sales-orders/:id', authMiddleware, hasPerm('sales'), async (
     res.json({
         id: o[0], order_number: o[1], customer_id: o[2], customer_name: o[3],
         total_amount: Number(o[4]), discount: Number(o[5]), final_amount: Number(o[6]),
-        payment_method: o[7], operator_id: o[8], operator_name: o[9], created_at: o[10], items: enriched
+        payment_method: o[7], operator_id: o[8], operator_name: o[9], created_at: o[10], payment_status: o[11], commission_amount: Number(o[12] || 0), items: enriched
     });
 });
 app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req, res) => {
