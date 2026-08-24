@@ -174,6 +174,7 @@ async function authMiddleware(req, res, next) {
             if (parseInt(row[1]) !== 1)
                 return res.status(403).json({ error: '账户已被禁用' });
             req.user.role = row[0];
+            req.user.status = row[1]; // 补充：/api/auth/me 返回完整 status（前端刷新后状态一致）
             req.user.permissions = row[2];
             req.user.sensitive_permissions = row[3];
         } catch (e) { /* 数据库不可用时降级使用 token 内的数据 */ }
