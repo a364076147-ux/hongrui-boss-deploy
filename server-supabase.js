@@ -724,8 +724,14 @@ app.get('/api/analysis/dashboard', authMiddleware, async (req, res) => {
 app.get('/api/analysis/sales', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
     await initDB();
     const { start_date, end_date } = req.query;
+    // 数据权限：员工只统计自己的销售单（管理员/店长看全店）
+    const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
     let sql = "SELECT date(created_at) as date, SUM(final_amount) as actual_sales, COUNT(*) as order_count FROM sales_orders WHERE 1=1";
     const params = [];
+    if (!isAdminUser) {
+        sql += " AND operator_id = ?";
+        params.push(req.user.id);
+    }
     if (start_date) {
         sql += " AND date(created_at) >= '" + String(start_date).replace(/'/g, "''") + "'";
     }
@@ -743,12 +749,15 @@ app.get('/api/analysis/sales/top-products', authMiddleware, hasPerm('sales_stats
     await initDB();
     const days = Math.min(Math.max(Number(req.query.days) || 30, 1), 365);
     const startDate = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+    // 数据权限：员工只统计自己的销售单
+    const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
+    const scopeSql = isAdminUser ? '' : ' AND so.operator_id = ' + Number(req.user.id);
     const result = (await safeExec(`
     SELECT p.name, p.sku, SUM(oi.quantity) as total_qty, SUM(oi.amount) as total_amount
     FROM sales_order_items oi
     JOIN sales_orders so ON oi.order_id = so.id
     JOIN products p ON oi.product_id = p.id
-    WHERE so.created_at >= ?
+    WHERE so.created_at >= ?${scopeSql}
     GROUP BY p.id ORDER BY total_amount DESC LIMIT 10
   `, [startDate]));
     const products = (result.values || []).map((p) => ({
@@ -759,7 +768,14 @@ app.get('/api/analysis/sales/top-products', authMiddleware, hasPerm('sales_stats
 app.get('/api/analysis/purchase', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
     await initDB();
     const { start_date, end_date } = req.query;
+    // 数据权限：员工只统计自己的采购单（管理员/店长看全店）
+    const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
     let sql = "SELECT date(created_at) as date, SUM(total_amount) as total, COUNT(*) as order_count FROM purchase_orders WHERE 1=1";
+    const params = [];
+    if (!isAdminUser) {
+        sql += " AND operator_id = ?";
+        params.push(req.user.id);
+    }
     if (start_date) {
         sql += " AND date(created_at) >= '" + String(start_date).replace(/'/g, "''") + "'";
     }
@@ -767,7 +783,7 @@ app.get('/api/analysis/purchase', authMiddleware, hasPerm('sales_stats'), async 
         sql += " AND date(created_at) <= '" + String(end_date).replace(/'/g, "''") + "'";
     }
     sql += " GROUP BY date(created_at) ORDER BY date ASC";
-    const result = await safeExec(sql);
+    const result = await safeExec(sql, params);
     const rows = result.values || [];
     res.json(rows.map((r) => ({ date: r[0], total: Number(r[1]), order_count: Number(r[2]) })));
 });
@@ -783,12 +799,15 @@ app.get('/api/analysis/profit', authMiddleware, hasPerm('sales_stats'), async (r
     await initDB();
     const today = new Date().toISOString().slice(0, 10);
     const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10);
-    const todaySales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at)='${today}'`)).values?.[0]?.[0] || 0);
-    const todayCost = Number((await safeExec(`SELECT COALESCE(SUM(oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE date(so.created_at)='${today}'`)).values?.[0]?.[0] || 0);
-    const monthSales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at) >= '${monthStart}'`)).values?.[0]?.[0] || 0);
-    const monthCost = Number((await safeExec(`SELECT COALESCE(SUM(oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE date(so.created_at) >= '${monthStart}'`)).values?.[0]?.[0] || 0);
-    // 其他收入/其他支出（category 以"其他"开头的收支，如 其他收入-房租、其他支出-水电）
-    const otherSql = (t, from) => `SELECT COALESCE(SUM(amount),0) FROM transactions WHERE type='${t}' AND (category LIKE '其他%' OR category LIKE '%其他%') AND date(created_at) ${from}`;
+    // 数据权限：员工只统计自己的销售单（管理员/店长看全店）
+    const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
+    const scopeSql = isAdminUser ? '' : ' AND operator_id = ' + Number(req.user.id);
+    const todaySales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at)='${today}'${scopeSql}`)).values?.[0]?.[0] || 0);
+    const todayCost = Number((await safeExec(`SELECT COALESCE(SUM(oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE date(so.created_at)='${today}'${scopeSql}`)).values?.[0]?.[0] || 0);
+    const monthSales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at) >= '${monthStart}'${scopeSql}`)).values?.[0]?.[0] || 0);
+    const monthCost = Number((await safeExec(`SELECT COALESCE(SUM(oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE date(so.created_at) >= '${monthStart}'${scopeSql}`)).values?.[0]?.[0] || 0);
+    // 其他收入/其他支出（category 以"其他"开头的收支，如 其他收入-房租、其他支出-水电）；员工只看自己的流水
+    const otherSql = (t, from) => `SELECT COALESCE(SUM(amount),0) FROM transactions WHERE type='${t}' AND (category LIKE '其他%' OR category LIKE '%其他%') AND date(created_at) ${from}${scopeSql}`;
     const todayOtherIncome = Number((await safeExec(otherSql('income', `='${today}'`))).values?.[0]?.[0] || 0);
     const todayOtherExpense = Number((await safeExec(otherSql('expense', `='${today}'`))).values?.[0]?.[0] || 0);
     const monthOtherIncome = Number((await safeExec(otherSql('income', `>= '${monthStart}'`))).values?.[0]?.[0] || 0);
@@ -851,9 +870,12 @@ app.get('/api/analysis/performance', authMiddleware, async (req, res) => {
     });
 });
 // ==================== 生产需求分析（按厂/客户的需求情况与月度经营建议） ====================
-app.get('/api/analysis/demand', authMiddleware, hasPerm('sales_stats'), async (_req, res) => {
+app.get('/api/analysis/demand', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
     await initDB();
     const now = new Date();
+    // 数据权限：员工只看自己的销售单（管理员/店长看全店）
+    const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
+    const scopeSql = isAdminUser ? '' : ' AND operator_id = ' + Number(req.user.id);
     // 本地时间 YYYY-MM（不能用 toISOString，UTC 会偏移月份）
     const ymOf = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
     const curYM = ymOf(now); // 当月 YYYY-MM
@@ -863,7 +885,7 @@ app.get('/api/analysis/demand', authMiddleware, hasPerm('sales_stats'), async (_
     const custRows = (await safeExec(`
     SELECT customer_name, substr(created_at,1,7) as ym, COUNT(*) as cnt, SUM(final_amount) as amt
     FROM sales_orders
-    WHERE final_amount > 0 AND created_at >= '${startDate}' AND customer_name IS NOT NULL AND customer_name != ''
+    WHERE final_amount > 0 AND created_at >= '${startDate}' AND customer_name IS NOT NULL AND customer_name != ''${scopeSql}
     GROUP BY customer_name, ym
   `)).values || [];
     const byCust = {};
@@ -912,7 +934,7 @@ app.get('/api/analysis/demand', authMiddleware, hasPerm('sales_stats'), async (_
     SELECT oi.product_name, SUM(oi.quantity) as qty, SUM(oi.amount) as amt
     FROM sales_order_items oi
     JOIN sales_orders so ON oi.order_id = so.id
-    WHERE so.created_at >= '${startDate}' AND so.final_amount > 0
+    WHERE so.created_at >= '${startDate}' AND so.final_amount > 0${scopeSql.replace('operator_id', 'so.operator_id')}
     GROUP BY oi.product_name
   `)).values || [];
     const stockRows = (await safeExec("SELECT name, stock_quantity, warning_quantity, sell_price, cost_price FROM products WHERE status = 1")).values || [];
