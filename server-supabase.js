@@ -1201,29 +1201,15 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
         const cidRes = await safeExec("SELECT id FROM customers WHERE name = ? ORDER BY id LIMIT 1", [customer_name]);
         if (cidRes.values?.[0]?.[0]) customer_id = cidRes.values[0][0];
     }
-    // 业务员归属：
-    // - 管理员/店长：可指定在职业务员(employee)代开，业绩记业务员；管理员自己不参与业绩
-    // - 子账户：可选「自己」或「管理员」（老板安排送货的单记管理员）；不能记给其他业务员（防互挂造假）
-    const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
+    // 业务员归属：所有开单人均可指定任意在职员工（业绩记所选业务员）；未指定则记自己
     let operatorId = req.user.id;
     let operatorName = req.user.real_name;
     if (targetOperatorId && Number(targetOperatorId) > 0) {
         const tid = Number(targetOperatorId);
-        const emp = (await safeExec("SELECT real_name, role, COALESCE(commission_rate,0) FROM users WHERE id = ? AND status = 1", [tid])).values?.[0];
+        const emp = (await safeExec("SELECT real_name, COALESCE(commission_rate,0) FROM users WHERE id = ? AND status = 1", [tid])).values?.[0];
         if (emp) {
-            if (isAdminUser) {
-                // 管理员可选：在职业务员 或 自己（自己对接的单记自己）
-                if (emp[1] === 'employee' || tid === req.user.id) {
-                    operatorId = tid;
-                    operatorName = emp[0] || req.user.real_name;
-                }
-            } else {
-                // 子账户只能记 自己 或 管理员
-                if (tid === req.user.id || emp[1] === 'admin') {
-                    operatorId = tid;
-                    operatorName = emp[0] || req.user.real_name;
-                }
-            }
+            operatorId = tid;
+            operatorName = emp[0] || req.user.real_name;
         }
     }
     const orderNumber = customOrderNumber || generateOrderNumber('XS');
