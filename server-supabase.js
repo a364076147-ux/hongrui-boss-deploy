@@ -1256,7 +1256,9 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
 // Sales Return APIs
 app.get('/api/store/sales-returns', authMiddleware, hasPerm('return'), async (_req, res) => {
     await initDB();
-    const result = await safeExec("SELECT * FROM sales_returns ORDER BY id DESC LIMIT 50");
+    const isAdminUser = _req.user.role === 'admin' || _req.user.role === 'manager';
+    const scopeSql = isAdminUser ? '' : ` WHERE operator_id = ${Number(_req.user.id)}`;
+    const result = await safeExec(`SELECT * FROM sales_returns${scopeSql} ORDER BY id DESC LIMIT 50`);
     const returns = (result.values || []).map((r) => ({
         id: r[0], return_number: r[1], sales_order_id: r[2], total_amount: Number(r[3]),
         operator_id: r[4], operator_name: r[5], reason: r[6], status: r[7], created_at: r[8]
@@ -1291,7 +1293,9 @@ app.post('/api/store/sales-returns', authMiddleware, hasPerm('return'), async (r
 // ==================== 回收单（旧件回收：回收入库 + 成本=回收价 + 记回收支出） ====================
 app.get('/api/store/recycles', authMiddleware, hasPerm('recycle'), async (_req, res) => {
     await initDB();
-    const result = await safeExec("SELECT * FROM recycles ORDER BY id DESC LIMIT 100");
+    const isAdminUser = _req.user.role === 'admin' || _req.user.role === 'manager';
+    const scopeSql = isAdminUser ? '' : ` WHERE operator_id = ${Number(_req.user.id)}`;
+    const result = await safeExec(`SELECT * FROM recycles${scopeSql} ORDER BY id DESC LIMIT 100`);
     const list = (result.values || []).map((r) => ({
         id: r[0], recycle_number: r[1], customer_id: r[2], customer_name: r[3],
         total_amount: Number(r[4]), operator_id: r[5], operator_name: r[6], remark: r[7], created_at: r[8]
@@ -1604,7 +1608,9 @@ app.get('/api/finance/supplier-statement/:id', authMiddleware, hasPerm('finance_
 // ==================== 销售预订 ====================
 app.get('/api/store/reservations', authMiddleware, hasPerm('sales'), async (_req, res) => {
     await initDB();
-    const result = await safeExec("SELECT * FROM sales_reservations ORDER BY id DESC LIMIT 100");
+    const isAdminUser = _req.user.role === 'admin' || _req.user.role === 'manager';
+    const scopeSql = isAdminUser ? '' : ` WHERE operator_id = ${Number(_req.user.id)}`;
+    const result = await safeExec(`SELECT * FROM sales_reservations${scopeSql} ORDER BY id DESC LIMIT 100`);
     const list = (result.values || []).map((r) => ({
         id: r[0], reservation_number: r[1], customer_id: Number(r[2]) || null, customer_name: r[3],
         total_amount: Number(r[4]), status: r[5], remark: r[6], operator_id: r[7], operator_name: r[8], created_at: r[9]
@@ -1698,7 +1704,9 @@ app.post('/api/store/purchase-returns', authMiddleware, hasPerm('purchase'), asy
 // ==================== 报价单 ====================
 app.get('/api/store/quotes', authMiddleware, hasPerm('sales'), async (_req, res) => {
     await initDB();
-    const result = await safeExec("SELECT * FROM quotes ORDER BY id DESC LIMIT 100");
+    const isAdminUser = _req.user.role === 'admin' || _req.user.role === 'manager';
+    const scopeSql = isAdminUser ? '' : ` WHERE operator_id = ${Number(_req.user.id)}`;
+    const result = await safeExec(`SELECT * FROM quotes${scopeSql} ORDER BY id DESC LIMIT 100`);
     const list = (result.values || []).map((r) => ({
         id: r[0], quote_number: r[1], customer_id: Number(r[2]) || null, customer_name: r[3],
         total_amount: Number(r[4]), status: r[5], remark: r[6], operator_id: r[7], operator_name: r[8], created_at: r[9]
