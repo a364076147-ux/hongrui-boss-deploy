@@ -1061,6 +1061,28 @@ app.post('/api/store/suppliers', authMiddleware, hasPerm('suppliers'), async (re
     saveDB();
     res.json({ ok: true });
 });
+// 更新供应商
+app.put('/api/store/suppliers/:id', authMiddleware, hasPerm('suppliers'), async (req, res) => {
+    await initDB();
+    const { id } = req.params;
+    const { name, contact, phone, address, remark } = req.body;
+    await run("UPDATE suppliers SET name=?, contact=?, phone=?, address=?, remark=? WHERE id=?", [name, contact, phone, address, remark, id]);
+    saveDB();
+    saveDB();
+    res.json({ ok: true });
+});
+// 删除供应商（软删除：status=0，保留历史引用）
+app.delete('/api/store/suppliers/:id', authMiddleware, hasPerm('suppliers'), async (req, res) => {
+    await initDB();
+    const { id } = req.params;
+    const target = (await safeExec("SELECT id FROM suppliers WHERE id = ? AND status = 1", [id])).values?.[0];
+    if (!target)
+        return res.status(404).json({ error: '供应商不存在' });
+    await run("UPDATE suppliers SET status = 0 WHERE id = ?", [id]);
+    saveDB();
+    saveDB();
+    res.json({ ok: true });
+});
 app.get('/api/store/customers', authMiddleware, hasPerm('customers'), async (_req, res) => {
     await initDB();
     const result = await safeExec("SELECT * FROM customers WHERE status=1 ORDER BY id");
@@ -1082,6 +1104,18 @@ app.put('/api/store/customers/:id', authMiddleware, hasPerm('customers'), async 
     const { id } = req.params;
     const { name, phone, address, contact, remark, price_level, status } = req.body;
     await run("UPDATE customers SET name=?, phone=?, address=?, contact=?, remark=?, price_level=?, status=? WHERE id=?", [name, phone, address, contact, remark, price_level || 'retail', status !== undefined ? status : 1, id]);
+    saveDB();
+    saveDB();
+    res.json({ ok: true });
+});
+// 删除客户（软删除：status=0，保留历史订单引用）
+app.delete('/api/store/customers/:id', authMiddleware, hasPerm('customers'), async (req, res) => {
+    await initDB();
+    const { id } = req.params;
+    const target = (await safeExec("SELECT id FROM customers WHERE id = ? AND status = 1", [id])).values?.[0];
+    if (!target)
+        return res.status(404).json({ error: '客户不存在' });
+    await run("UPDATE customers SET status = 0 WHERE id = ?", [id]);
     saveDB();
     saveDB();
     res.json({ ok: true });
