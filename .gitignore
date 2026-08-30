@@ -1,0 +1,5 @@
+# 含敏感凭据的本地脚本，禁止推送到 GitHub
+verify.sh
+push.sh
+.probe_token.txt
+*.token
