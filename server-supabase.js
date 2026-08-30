@@ -11,14 +11,24 @@ import multer from 'multer';
 import XLSX from 'xlsx';
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 const PORT = Number(process.env.PORT || 3001);
-const JWT_SECRET = process.env.JWT_SECRET || 'hongrui-boss-secret-key-2024';
+// ===== 安全加固：凭据必须来自环境变量（Render 控制台 Secret 注入），禁止明文 fallback =====
+const JWT_SECRET = process.env.JWT_SECRET;
 const PROJECT_ROOT = path.join(path.dirname(path.resolve(process.argv[1])), "..");
 const DIST_PATH = path.join(PROJECT_ROOT, 'dist').replace(/\\\\/g, '/');
 const PG_HOST = process.env.PG_HOST || 'aws-0-ap-southeast-1.pooler.supabase.com';
 const PG_PORT = Number(process.env.PG_PORT || 6543);
 const PG_DB = process.env.PG_DB || 'postgres';
 const PG_USER = process.env.PG_USER || 'postgres.uithwozfgkcotophscuu';
-const PG_PASSWORD = process.env.PG_PASSWORD || 'Zyf021556..@';
+const PG_PASSWORD = process.env.PG_PASSWORD;
+// 启动校验：缺失关键凭据立即退出（避免用弱配置运行线上服务）
+const _missing = [];
+if (!JWT_SECRET) _missing.push('JWT_SECRET');
+if (!PG_PASSWORD) _missing.push('PG_PASSWORD');
+if (_missing.length) {
+    console.error('[FATAL] 缺少必需环境变量: ' + _missing.join(', '));
+    console.error('请在 Render 控制台 → Environment → 添加 Secret 环境变量后重新部署。');
+    process.exit(1);
+}
 let pool = null;
 function getPool() {
     if (!pool) {
