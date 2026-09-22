@@ -1321,6 +1321,21 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
     saveDB();
     res.json({ ok: true, order_number: orderNumber });
 });
+// 删除销售单（仅管理员）：物理删除单据与明细，并冲回库存
+app.delete('/api/store/sales-orders/:id', authMiddleware, adminOnly, async (req, res) => {
+    await initDB();
+    const id = Number(req.params.id);
+    const o = (await safeExec("SELECT * FROM sales_orders WHERE id = ?", [id])).values?.[0];
+    if (!o) return res.status(404).json({ error: '订单不存在' });
+    const items = (await safeExec("SELECT * FROM sales_order_items WHERE order_id = ?", [id])).values || [];
+    for (const it of items) {
+        if (it[2]) await run("UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?", [Number(it[5]) || 0, it[2]]);
+    }
+    await run("DELETE FROM sales_order_items WHERE order_id = ?", [id]);
+    await run("DELETE FROM sales_orders WHERE id = ?", [id]);
+    saveDB();
+    res.json({ ok: true });
+});
 // Sales Return APIs
 app.get('/api/store/sales-returns', authMiddleware, hasPerm('return'), async (_req, res) => {
     await initDB();
