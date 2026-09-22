@@ -245,15 +245,15 @@ app.post('/api/auth/login', async (req, res) => {
         const status = parseInt(user[7]);
         if (status !== 1)
             return res.status(403).json({ error: '账户已被禁用' });
-        const defaultHash = '$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl769eQhK5ZBGDLdOaJ3.xOyK';
-        const isValid = password === 'admin123' && storedHash === defaultHash || bcrypt.compareSync(password, storedHash);
+        // [安全] 移除历史硬编码万能密码后门，仅允许 bcrypt 校验
+        const isValid = bcrypt.compareSync(password, storedHash);
         if (!isValid)
             return res.status(401).json({ error: '用户名或密码错误' });
         await run("UPDATE users SET last_login = datetime('now','localtime') WHERE id = ?", [id]);
         saveDB();
         const permissions = user[10] || '[]';
         const payload = { id, username, real_name: realName, role, permissions };
-        const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '365d' });
+        const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
         res.json({ token, user: { ...payload, status } });
     }
     catch (err) {
@@ -274,7 +274,9 @@ app.get('/api/auth/users', authMiddleware, adminOnly, async (req, res) => {
 app.post('/api/auth/users', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
     const { username, password, real_name, role, phone, email, permissions } = req.body;
-    const hashedPassword = await bcrypt.hash(password || 'admin123', 10);
+    // [安全] 创建用户必须显式提供密码，不再回退到默认密码
+    if (!password) return res.status(400).json({ error: '必须提供初始密码' });
+    const hashedPassword = await bcrypt.hash(password, 10);
     const perms = JSON.stringify(Array.isArray(permissions) ? permissions : (role === 'employee' ? DEFAULT_EMPLOYEE_PERMS : ALL_PERMS));
     await run("INSERT INTO users (username, password, real_name, role, phone, email, permissions, status) VALUES (?, ?, ?, ?, ?, ?, ?, 1)", [username, hashedPassword, real_name, role || 'employee', phone, email, perms]);
     saveDB();
@@ -1302,7 +1304,7 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
     const orderId = orderIdResult.values?.[0]?.[0] || 0;
     if (items && orderId > 0) {
         for (const item of items) {
-            await run("INSERT INTO sales_order_items (order_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)", [orderId, item.product_id, item.product_name, item.specification || '', item.quantity, item.price ?? item.unit_price ?? 0, item.amount ?? item.quantity * (item.price ?? item.unit_price ?? 0)]);
+            await run("INSERT INTO sales_order_items (order_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)", [orderId, item.product_id, item.product_name, item.sku || '', item.quantity, item.price ?? item.unit_price ?? 0, item.amount ?? item.quantity * (item.price ?? item.unit_price ?? 0)]);
             // Deduct stock
             if (item.product_id) {
                 await run("UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?", [item.quantity, item.product_id]);

@@ -3,3 +3,5 @@ verify.sh
 push.sh
 .probe_token.txt
 *.token
+JWT_SECRET.new.txt
+*.secret
