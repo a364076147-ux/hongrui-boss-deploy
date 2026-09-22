@@ -637,11 +637,6 @@ app.get('/api/finance/transactions', authMiddleware, (req, res, next) => {
     const { type, account_id, page = 1, pageSize = 50 } = req.query;
     let sql = "SELECT * FROM transactions WHERE 1=1";
     const params = [];
-    // 数据隔离：子账户只能看自己的流水（管理员/店长看全部）
-    const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
-    if (!isAdminUser) {
-        sql += " AND operator_id = " + Number(req.user.id);
-    }
     if (type) {
         sql += " AND type = '" + String(type).replace(/'/g, "''") + "'";
     }
@@ -721,29 +716,25 @@ app.get('/api/analysis/dashboard', authMiddleware, async (req, res) => {
     await initDB();
     const today = new Date().toISOString().slice(0, 10);
     const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10);
-    // 数据权限：子账户只统计自己的销售单（避免泄露全店数据）
-    const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
-    const scopeSql = isAdminUser ? '' : ' AND operator_id = ' + Number(req.user.id);
-    const todaySales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at)='${today}'${scopeSql}`)).values?.[0]?.[0] || 0);
+    // 数据权限：所有账号统计全店数据（对齐智慧记云端默认，管理员开单成员也可查看）
+    const scopeSql = '';
+    // 排除作废单（对齐智慧记：作废单不计入统计）
+    const VOID = " AND COALESCE(payment_status,'') <> '作废'";
+    const VOID_SO = " AND COALESCE(so.payment_status,'') <> '作废'";
+    const todaySales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at)='${today}'${scopeSql}${VOID}`)).values?.[0]?.[0] || 0);
     const todayExpense = Number((await safeExec(`SELECT COALESCE(SUM(amount),0) FROM transactions WHERE type='expense' AND date(created_at)='${today}'${scopeSql}`)).values?.[0]?.[0] || 0);
     // 真实成本/毛利（成本 = Σ 数量×采购价；毛利 = 销售额 − 成本）
-    const todayCost = Number((await safeExec(`SELECT COALESCE(SUM(oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id=so.id JOIN products p ON oi.product_id=p.id WHERE date(so.created_at)='${today}'${scopeSql}`)).values?.[0]?.[0] || 0);
-    const todayOrders = Number((await safeExec(`SELECT COUNT(*) FROM sales_orders WHERE date(created_at)='${today}'${scopeSql}`)).values?.[0]?.[0] || 0);
+    const todayCost = Number((await safeExec(`SELECT COALESCE(SUM(oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id=so.id JOIN products p ON oi.product_id=p.id WHERE date(so.created_at)='${today}'${scopeSql}${VOID_SO}`)).values?.[0]?.[0] || 0);
+    const todayOrders = Number((await safeExec(`SELECT COUNT(*) FROM sales_orders WHERE date(created_at)='${today}'${scopeSql}${VOID}`)).values?.[0]?.[0] || 0);
     const warningCount = Number((await safeExec("SELECT COUNT(*) FROM products WHERE stock_quantity <= warning_quantity AND status=1")).values?.[0]?.[0] || 0);
-    const monthSales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at) >= '${monthStart}'${scopeSql}`)).values?.[0]?.[0] || 0);
+    const monthSales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at) >= '${monthStart}'${scopeSql}${VOID}`)).values?.[0]?.[0] || 0);
     res.json({ todaySales, todayExpense, todayCost, todayProfit: todaySales - todayCost, todayOrders, warningCount, monthSales });
 });
 app.get('/api/analysis/sales', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
     await initDB();
     const { start_date, end_date } = req.query;
-    // 数据权限：员工只统计自己的销售单（管理员/店长看全店）
-    const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
-    let sql = "SELECT date(created_at) as date, SUM(final_amount) as actual_sales, COUNT(*) as order_count FROM sales_orders WHERE 1=1";
+    let sql = "SELECT date(created_at) as date, SUM(final_amount) as actual_sales, COUNT(*) as order_count FROM sales_orders WHERE 1=1 AND COALESCE(payment_status,'') <> '作废'";
     const params = [];
-    if (!isAdminUser) {
-        sql += " AND operator_id = ?";
-        params.push(req.user.id);
-    }
     if (start_date) {
         sql += " AND date(created_at) >= '" + String(start_date).replace(/'/g, "''") + "'";
     }
@@ -763,7 +754,7 @@ app.get('/api/analysis/sales/top-products', authMiddleware, hasPerm('sales_stats
     const startDate = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
     // 数据权限：员工只统计自己的销售单
     const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
-    const scopeSql = isAdminUser ? '' : ' AND so.operator_id = ' + Number(req.user.id);
+    const scopeSql = ''; // 全店可见
     const result = (await safeExec(`
     SELECT p.name, p.sku, SUM(oi.quantity) as total_qty, SUM(oi.amount) as total_amount
     FROM sales_order_items oi
@@ -780,14 +771,8 @@ app.get('/api/analysis/sales/top-products', authMiddleware, hasPerm('sales_stats
 app.get('/api/analysis/purchase', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
     await initDB();
     const { start_date, end_date } = req.query;
-    // 数据权限：员工只统计自己的采购单（管理员/店长看全店）
-    const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
     let sql = "SELECT date(created_at) as date, SUM(total_amount) as total, COUNT(*) as order_count FROM purchase_orders WHERE 1=1";
     const params = [];
-    if (!isAdminUser) {
-        sql += " AND operator_id = ?";
-        params.push(req.user.id);
-    }
     if (start_date) {
         sql += " AND date(created_at) >= '" + String(start_date).replace(/'/g, "''") + "'";
     }
@@ -813,7 +798,7 @@ app.get('/api/analysis/profit', authMiddleware, hasPerm('sales_stats'), async (r
     const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10);
     // 数据权限：员工只统计自己的销售单（管理员/店长看全店）
     const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
-    const scopeSql = isAdminUser ? '' : ' AND operator_id = ' + Number(req.user.id);
+    const scopeSql = ''; // 全店可见
     const todaySales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at)='${today}'${scopeSql}`)).values?.[0]?.[0] || 0);
     const todayCost = Number((await safeExec(`SELECT COALESCE(SUM(oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE date(so.created_at)='${today}'${scopeSql}`)).values?.[0]?.[0] || 0);
     const monthSales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at) >= '${monthStart}'${scopeSql}`)).values?.[0]?.[0] || 0);
@@ -887,7 +872,7 @@ app.get('/api/analysis/demand', authMiddleware, hasPerm('sales_stats'), async (r
     const now = new Date();
     // 数据权限：员工只看自己的销售单（管理员/店长看全店）
     const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
-    const scopeSql = isAdminUser ? '' : ' AND operator_id = ' + Number(req.user.id);
+    const scopeSql = ''; // 全店可见
     // 本地时间 YYYY-MM（不能用 toISOString，UTC 会偏移月份）
     const ymOf = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
     const curYM = ymOf(now); // 当月 YYYY-MM
@@ -1211,13 +1196,9 @@ app.get('/api/store/sales-staff', authMiddleware, hasPerm('sales'), async (_req,
 app.get('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req, res) => {
     await initDB();
     const { pageSize = 200 } = req.query;
-    // 数据权限：员工默认只能看自己的销售单（管理员/店长看全部）
+    // 数据权限：所有账号均可见全部销售单（对齐智慧记云端默认，管理员开单成员也可查看）
     let sql = "SELECT id, order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, created_at, payment_status, commission_amount FROM sales_orders";
     const params = [];
-    if (!(req.user.role === 'admin' || req.user.role === 'manager') && !(JSON.parse(req.user.sensitive_permissions || '{}').data || []).includes('view_other_sales')) {
-        sql += " WHERE operator_id = ?";
-        params.push(req.user.id);
-    }
     sql += " ORDER BY created_at DESC, id DESC LIMIT ?";
     params.push(Number(pageSize));
     const result = await safeExec(sql, params);
@@ -1321,18 +1302,18 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
     saveDB();
     res.json({ ok: true, order_number: orderNumber });
 });
-// 删除销售单（仅管理员）：物理删除单据与明细，并冲回库存
+// 作废销售单（仅管理员）：标记作废 + 冲回库存，保留记录与明细（对齐智慧记 invalid，不做物理删除）
 app.delete('/api/store/sales-orders/:id', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
     const id = Number(req.params.id);
     const o = (await safeExec("SELECT * FROM sales_orders WHERE id = ?", [id])).values?.[0];
     if (!o) return res.status(404).json({ error: '订单不存在' });
+    if (o[11] === '作废') return res.status(400).json({ error: '该单已作废，无需重复操作' });
     const items = (await safeExec("SELECT * FROM sales_order_items WHERE order_id = ?", [id])).values || [];
     for (const it of items) {
         if (it[2]) await run("UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?", [Number(it[5]) || 0, it[2]]);
     }
-    await run("DELETE FROM sales_order_items WHERE order_id = ?", [id]);
-    await run("DELETE FROM sales_orders WHERE id = ?", [id]);
+    await run("UPDATE sales_orders SET payment_status='作废' WHERE id = ?", [id]);
     saveDB();
     res.json({ ok: true });
 });
@@ -1340,7 +1321,7 @@ app.delete('/api/store/sales-orders/:id', authMiddleware, adminOnly, async (req,
 app.get('/api/store/sales-returns', authMiddleware, hasPerm('return'), async (_req, res) => {
     await initDB();
     const isAdminUser = _req.user.role === 'admin' || _req.user.role === 'manager';
-    const scopeSql = isAdminUser ? '' : ` WHERE operator_id = ${Number(_req.user.id)}`;
+    const scopeSql = ''; // 全店可见
     const result = await safeExec(`SELECT * FROM sales_returns${scopeSql} ORDER BY id DESC LIMIT 50`);
     const returns = (result.values || []).map((r) => ({
         id: r[0], return_number: r[1], sales_order_id: r[2], total_amount: Number(r[3]),
@@ -1377,7 +1358,7 @@ app.post('/api/store/sales-returns', authMiddleware, hasPerm('return'), async (r
 app.get('/api/store/recycles', authMiddleware, hasPerm('recycle'), async (_req, res) => {
     await initDB();
     const isAdminUser = _req.user.role === 'admin' || _req.user.role === 'manager';
-    const scopeSql = isAdminUser ? '' : ` WHERE operator_id = ${Number(_req.user.id)}`;
+    const scopeSql = ''; // 全店可见
     const result = await safeExec(`SELECT * FROM recycles${scopeSql} ORDER BY id DESC LIMIT 100`);
     const list = (result.values || []).map((r) => ({
         id: r[0], recycle_number: r[1], customer_id: r[2], customer_name: r[3],
@@ -1692,7 +1673,7 @@ app.get('/api/finance/supplier-statement/:id', authMiddleware, hasPerm('finance_
 app.get('/api/store/reservations', authMiddleware, hasPerm('sales'), async (_req, res) => {
     await initDB();
     const isAdminUser = _req.user.role === 'admin' || _req.user.role === 'manager';
-    const scopeSql = isAdminUser ? '' : ` WHERE operator_id = ${Number(_req.user.id)}`;
+    const scopeSql = ''; // 全店可见
     const result = await safeExec(`SELECT * FROM sales_reservations${scopeSql} ORDER BY id DESC LIMIT 100`);
     const list = (result.values || []).map((r) => ({
         id: r[0], reservation_number: r[1], customer_id: Number(r[2]) || null, customer_name: r[3],
@@ -1788,7 +1769,7 @@ app.post('/api/store/purchase-returns', authMiddleware, hasPerm('purchase'), asy
 app.get('/api/store/quotes', authMiddleware, hasPerm('sales'), async (_req, res) => {
     await initDB();
     const isAdminUser = _req.user.role === 'admin' || _req.user.role === 'manager';
-    const scopeSql = isAdminUser ? '' : ` WHERE operator_id = ${Number(_req.user.id)}`;
+    const scopeSql = ''; // 全店可见
     const result = await safeExec(`SELECT * FROM quotes${scopeSql} ORDER BY id DESC LIMIT 100`);
     const list = (result.values || []).map((r) => ({
         id: r[0], quote_number: r[1], customer_id: Number(r[2]) || null, customer_name: r[3],
