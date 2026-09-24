@@ -70,9 +70,16 @@ async function safeExec(sql, params = []) {
         const { sql: finalSql } = convertPlaceholders(translated);
         const client = await getPool().connect();
         try {
-            const result = await client.query(finalSql, params);
+            /* ⚠️ 必须用 rowMode:'array'（位置数组），不能用默认的行对象。
+             * 原因：Postgres 里多个未加别名的聚合列（如两次 COALESCE(SUM(x),0)）
+             * 列名都叫 "coalesce"；默认行对象按列名赋值 → 后面的列覆盖前面的，
+             * 再 map(columns) 取值时所有重名列都会拿到「最后一列」的值。
+             * 历史 bug：/store/sales-orders?withTotal=1 的 sum_final/sum_owe/sum_received
+             * 三个金额曾全部返回同一个数（¥3,184,331.69），采购单同样。
+             * rowMode:'array' 让每行就是按 SELECT 顺序的位置数组，重名列不再塌缩。 */
+            const result = await client.query({ text: finalSql, values: params, rowMode: 'array' });
             const columns = result.fields.map((f) => f.name);
-            const values = result.rows.map((row) => columns.map((c) => row[c]));
+            const values = result.rows;
             return { columns, values };
         }
         finally {
@@ -100,7 +107,7 @@ async function run(sql, params = []) {
         console.error('Run Error:', e.message, 'SQL:', sql);
     }
 }
-async function initDB() {
+async function _runMigrations() {
     const client = await getPool().connect();
     try {
         await client.query('SELECT 1');
@@ -112,6 +119,24 @@ async function initDB() {
             `ALTER TABLE products ADD COLUMN IF NOT EXISTS wholesale_price DOUBLE PRECISION DEFAULT 0`,
             `ALTER TABLE customers ADD COLUMN IF NOT EXISTS price_level TEXT DEFAULT 'retail'`,
             `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS commission_amount DOUBLE PRECISION DEFAULT 0`,
+            // ===== 财务口径补全（对齐智慧记）：业务日期 / 应收 / 已收 / 欠款 / 抹零 / 运费 / 税额 / 备注 / 单据类型 =====
+            `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS bill_date TEXT`,
+            `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS receivable_amount DOUBLE PRECISION DEFAULT 0`,
+            `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS received_amount DOUBLE PRECISION DEFAULT 0`,
+            `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS owe_amount DOUBLE PRECISION DEFAULT 0`,
+            `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS small_change_amount DOUBLE PRECISION DEFAULT 0`,
+            `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS express_amount DOUBLE PRECISION DEFAULT 0`,
+            `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS tax_amount DOUBLE PRECISION DEFAULT 0`,
+            `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS remark TEXT`,
+            `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS biz_type TEXT DEFAULT 'sale'`,
+            `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS bill_date TEXT`,
+            `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS paid_amount DOUBLE PRECISION DEFAULT 0`,
+            `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS owe_amount DOUBLE PRECISION DEFAULT 0`,
+            `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS remark TEXT`,
+            `CREATE INDEX IF NOT EXISTS idx_sales_orders_number ON sales_orders(order_number)`,
+            `CREATE INDEX IF NOT EXISTS idx_sales_orders_bill_date ON sales_orders(bill_date)`,
+            `CREATE INDEX IF NOT EXISTS idx_sales_orders_biz_type ON sales_orders(biz_type)`,
+            `CREATE INDEX IF NOT EXISTS idx_purchase_orders_number ON purchase_orders(order_number)`,
             `CREATE TABLE IF NOT EXISTS sales_reservations (id BIGSERIAL PRIMARY KEY, reservation_number TEXT, customer_id BIGINT, customer_name TEXT, total_amount DOUBLE PRECISION DEFAULT 0, status TEXT DEFAULT 'pending', remark TEXT, operator_id BIGINT, operator_name TEXT, created_at TEXT DEFAULT to_char(now() AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI:SS'))`,
             `CREATE TABLE IF NOT EXISTS sales_reservation_items (id BIGSERIAL PRIMARY KEY, reservation_id BIGINT, product_id BIGINT, product_name TEXT, sku TEXT, quantity DOUBLE PRECISION DEFAULT 0, unit_price DOUBLE PRECISION DEFAULT 0, amount DOUBLE PRECISION DEFAULT 0)`,
             `CREATE TABLE IF NOT EXISTS purchase_returns (id BIGSERIAL PRIMARY KEY, return_number TEXT, purchase_order_id BIGINT, supplier_id BIGINT, supplier_name TEXT, total_amount DOUBLE PRECISION DEFAULT 0, reason TEXT, operator_id BIGINT, operator_name TEXT, created_at TEXT DEFAULT to_char(now() AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI:SS'))`,
@@ -131,7 +156,36 @@ async function initDB() {
     }
     return true;
 }
+
+/* ⚠️ initDB 被 90+ 个路由在入口处调用（用于「表结构自愈」）。
+ * 但迁移本身是 1 条 SELECT 1 + 1 条 ALTER + 29 条 DDL = 每个请求 31 次数据库往返：
+ *   线上（同区域）≈ 0.5s/请求 —— 与查询量无关，所有接口耗时都卡在同一水位；
+ *   本地（跨境 RTT ~75ms）≈ 2.3s/请求，若中间件与处理器各调一次就是 4.6s。
+ * 这不是慢查询，是「每请求重跑建表语句」。改为进程内只执行一次：
+ * 首次调用真正执行，其余调用复用同一个 Promise；失败则清空以便下次重试。 */
+let _migrationsPromise = null;
+function initDB() {
+    if (!_migrationsPromise) {
+        _migrationsPromise = _runMigrations().catch((e) => {
+            _migrationsPromise = null; // 允许下一次请求重试
+            console.error('initDB 迁移失败（将在下次请求重试）:', e.message);
+            return false;
+        });
+    }
+    return _migrationsPromise;
+}
 function saveDB() { }
+/** 业务日期（东八区），格式 YYYY-MM-DD —— 与智慧记 bill_date 口径一致 */
+function todayCST() {
+    return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+}
+/**
+ * 成本符号修正（关键）：智慧记里「红字冲销单」以负数销售单形式存在（实测 348 张），
+ * 其单据金额为负、但明细数量与成本仍记正 → 直接 SUM(qty×cost) 会把成本虚增。
+ * 同理销售退货单。故成本必须按「单据符号」取反，否则成本率 >100%（实测 105.83%）。
+ * 修正后全期间毛利率 = 6.76%（原为 -5.83%）。
+ */
+const COST_SIGN_SQL = "CASE WHEN so.final_amount < 0 OR COALESCE(so.biz_type,'sale')='sale_return' THEN -1 ELSE 1 END";
 function generateOrderNumber(prefix) {
     const now = new Date();
     const date = now.toISOString().slice(0, 10).replace(/-/g, '');
@@ -340,18 +394,18 @@ app.put('/api/auth/password', authMiddleware, async (req, res) => {
 // ==================== INVENTORY ====================
 app.get('/api/inventory/products', authMiddleware, hasPerm('inventory_view'), async (req, res) => {
     await initDB();
-    const { category, keyword, page = 1, pageSize = 50 } = req.query;
-    let sql = "SELECT * FROM products WHERE status = 1";
-    const params = [];
+    const { category, keyword, page = 1, pageSize = 50, withTotal } = req.query;
+    let where = " WHERE status = 1";
     if (category) {
-        sql += " AND category = '" + String(category).replace(/'/g, "''") + "'";
+        where += " AND category = '" + String(category).replace(/'/g, "''") + "'";
     }
     if (keyword) {
-        sql += " AND (name LIKE '%" + String(keyword).replace(/'/g, "''") + "%' OR sku LIKE '%" + String(keyword).replace(/'/g, "''") + "%')";
+        const kw = String(keyword).replace(/'/g, "''");
+        where += " AND (name LIKE '%" + kw + "%' OR sku LIKE '%" + kw + "%')";
     }
-    sql += " ORDER BY id DESC LIMIT ? OFFSET ?";
-    params.push(Number(pageSize), (Number(page) - 1) * Number(pageSize));
-    const result = await safeExec(sql, params);
+    const pg = Math.max(1, Number(page) || 1);
+    const ps = Math.min(2000, Math.max(1, Number(pageSize) || 50));
+    const result = await safeExec("SELECT * FROM products" + where + " ORDER BY id DESC LIMIT ? OFFSET ?", [ps, (pg - 1) * ps]);
     // 转换为对象格式
     const products = (result.values || []).map((p) => ({
         id: p[0], sku: p[1], name: p[2], category: p[3], spec: p[4], unit: p[5],
@@ -360,6 +414,11 @@ app.get('/api/inventory/products', authMiddleware, hasPerm('inventory_view'), as
         expiry_date: p[12], supplier_id: p[13], status: p[14], created_at: p[15], updated_at: p[16],
         wholesale_price: Number(p[17] || 0)
     }));
+    // 追加式：带 withTotal=1 时返回 { rows, total, page, pageSize }；否则保持原数组返回（老调用不受影响）
+    if (withTotal) {
+        const totalRow = (await safeExec("SELECT COUNT(*) FROM products" + where)).values?.[0]?.[0];
+        return res.json({ rows: products, total: Number(totalRow || 0), page: pg, pageSize: ps });
+    }
     res.json(products);
 });
 app.get('/api/inventory/products/warning', authMiddleware, hasPerm('inventory_view'), async (_req, res) => {
@@ -721,27 +780,37 @@ app.get('/api/analysis/dashboard', authMiddleware, async (req, res) => {
     // 排除作废单（对齐智慧记：作废单不计入统计）
     const VOID = " AND COALESCE(payment_status,'') <> '作废'";
     const VOID_SO = " AND COALESCE(so.payment_status,'') <> '作废'";
-    const todaySales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at)='${today}'${scopeSql}${VOID}`)).values?.[0]?.[0] || 0);
+    const todaySales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE substr(COALESCE(bill_date, created_at),1,10)='${today}'${scopeSql}${VOID}`)).values?.[0]?.[0] || 0);
     const todayExpense = Number((await safeExec(`SELECT COALESCE(SUM(amount),0) FROM transactions WHERE type='expense' AND date(created_at)='${today}'${scopeSql}`)).values?.[0]?.[0] || 0);
-    // 真实成本/毛利（成本 = Σ 数量×采购价；毛利 = 销售额 − 成本）
-    const todayCost = Number((await safeExec(`SELECT COALESCE(SUM(oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id=so.id JOIN products p ON oi.product_id=p.id WHERE date(so.created_at)='${today}'${scopeSql}${VOID_SO}`)).values?.[0]?.[0] || 0);
-    const todayOrders = Number((await safeExec(`SELECT COUNT(*) FROM sales_orders WHERE date(created_at)='${today}'${scopeSql}${VOID}`)).values?.[0]?.[0] || 0);
+    // 真实成本/毛利（成本 = Σ 数量×采购价；退货单收入为负，成本同步取负）
+    const todayCost = Number((await safeExec(`SELECT COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id=so.id JOIN products p ON oi.product_id=p.id WHERE substr(COALESCE(so.bill_date, so.created_at),1,10)='${today}'${scopeSql}${VOID_SO}`)).values?.[0]?.[0] || 0);
+    const todayOrders = Number((await safeExec(`SELECT COUNT(*) FROM sales_orders WHERE substr(COALESCE(bill_date, created_at),1,10)='${today}'${scopeSql}${VOID}`)).values?.[0]?.[0] || 0);
     const warningCount = Number((await safeExec("SELECT COUNT(*) FROM products WHERE stock_quantity <= warning_quantity AND status=1")).values?.[0]?.[0] || 0);
-    const monthSales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at) >= '${monthStart}'${scopeSql}${VOID}`)).values?.[0]?.[0] || 0);
-    res.json({ todaySales, todayExpense, todayCost, todayProfit: todaySales - todayCost, todayOrders, warningCount, monthSales });
+    const monthSales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE substr(COALESCE(bill_date, created_at),1,10) >= '${monthStart}'${scopeSql}${VOID}`)).values?.[0]?.[0] || 0);
+    const monthCost = Number((await safeExec(`SELECT COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id=so.id JOIN products p ON oi.product_id=p.id WHERE substr(COALESCE(so.bill_date, so.created_at),1,10) >= '${monthStart}'${scopeSql}${VOID_SO}`)).values?.[0]?.[0] || 0);
+    // 应收/欠款（对齐智慧记）：欠款余额 = Σ owe_amount；未结清单数
+    const ar = (await safeExec(`SELECT COALESCE(SUM(owe_amount),0), COUNT(*) FROM sales_orders WHERE COALESCE(biz_type,'sale') <> 'sale_return' AND COALESCE(owe_amount,0) > 0.005${scopeSql}${VOID}`)).values?.[0] || [0, 0];
+    const ap = (await safeExec(`SELECT COALESCE(SUM(owe_amount),0), COUNT(*) FROM purchase_orders WHERE COALESCE(owe_amount,0) > 0.005`)).values?.[0] || [0, 0];
+    res.json({
+        todaySales, todayExpense, todayCost, todayProfit: todaySales - todayCost, todayOrders, warningCount, monthSales,
+        monthCost, monthProfit: monthSales - monthCost,
+        receivable: Number(ar[0] || 0), unpaidCount: Number(ar[1] || 0),
+        payable: Number(ap[0] || 0), payableCount: Number(ap[1] || 0),
+    });
 });
 app.get('/api/analysis/sales', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
     await initDB();
     const { start_date, end_date } = req.query;
-    let sql = "SELECT date(created_at) as date, SUM(final_amount) as actual_sales, COUNT(*) as order_count FROM sales_orders WHERE 1=1 AND COALESCE(payment_status,'') <> '作废'";
+    const BD = "substr(COALESCE(bill_date, created_at),1,10)";
+    let sql = `SELECT ${BD} as date, SUM(final_amount) as actual_sales, COUNT(*) as order_count FROM sales_orders WHERE 1=1 AND COALESCE(payment_status,'') <> '作废' AND COALESCE(biz_type,'sale') <> 'sale_return'`;
     const params = [];
     if (start_date) {
-        sql += " AND date(created_at) >= '" + String(start_date).replace(/'/g, "''") + "'";
+        sql += " AND " + BD + " >= '" + String(start_date).replace(/'/g, "''") + "'";
     }
     if (end_date) {
-        sql += " AND date(created_at) <= '" + String(end_date).replace(/'/g, "''") + "'";
+        sql += " AND " + BD + " <= '" + String(end_date).replace(/'/g, "''") + "'";
     }
-    sql += " GROUP BY date(created_at) ORDER BY date ASC";
+    sql += ` GROUP BY ${BD} ORDER BY ${BD} ASC`;
     const result = await safeExec(sql, params);
     const rows = result.values || [];
     res.json(rows.map((r) => ({
@@ -756,12 +825,14 @@ app.get('/api/analysis/sales/top-products', authMiddleware, hasPerm('sales_stats
     const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
     const scopeSql = ''; // 全店可见
     const result = (await safeExec(`
-    SELECT p.name, p.sku, SUM(oi.quantity) as total_qty, SUM(oi.amount) as total_amount
+    SELECT p.name, p.sku,
+           SUM(${COST_SIGN_SQL} * oi.quantity) as total_qty,
+           SUM(${COST_SIGN_SQL} * oi.amount)   as total_amount
     FROM sales_order_items oi
     JOIN sales_orders so ON oi.order_id = so.id
     JOIN products p ON oi.product_id = p.id
-    WHERE so.created_at >= ?${scopeSql}
-    GROUP BY p.id ORDER BY total_amount DESC LIMIT 10
+    WHERE COALESCE(so.bill_date, substr(so.created_at,1,10)) >= ? AND COALESCE(so.payment_status,'') <> '作废'${scopeSql}
+    GROUP BY p.id, p.name, p.sku ORDER BY total_amount DESC LIMIT 10
   `, [startDate]));
     const products = (result.values || []).map((p) => ({
         name: p[0], sku: p[1], total_qty: Number(p[2]), total_amount: Number(p[3])
@@ -799,10 +870,14 @@ app.get('/api/analysis/profit', authMiddleware, hasPerm('sales_stats'), async (r
     // 数据权限：员工只统计自己的销售单（管理员/店长看全店）
     const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
     const scopeSql = ''; // 全店可见
-    const todaySales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at)='${today}'${scopeSql}`)).values?.[0]?.[0] || 0);
-    const todayCost = Number((await safeExec(`SELECT COALESCE(SUM(oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE date(so.created_at)='${today}'${scopeSql}`)).values?.[0]?.[0] || 0);
-    const monthSales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE date(created_at) >= '${monthStart}'${scopeSql}`)).values?.[0]?.[0] || 0);
-    const monthCost = Number((await safeExec(`SELECT COALESCE(SUM(oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE date(so.created_at) >= '${monthStart}'${scopeSql}`)).values?.[0]?.[0] || 0);
+    // 排除作废单（作废单不计入统计）
+    const VOID = " AND COALESCE(payment_status,'') <> '作废'";
+    const VOID_SO = " AND COALESCE(so.payment_status,'') <> '作废'";
+    const todaySales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE substr(COALESCE(bill_date, created_at),1,10)='${today}'${scopeSql}${VOID}`)).values?.[0]?.[0] || 0);
+    // 成本口径修正：退货单（biz_type='sale_return'）收入为负、成本必须同步取负，否则成本率会被虚增
+    const todayCost = Number((await safeExec(`SELECT COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE substr(COALESCE(so.bill_date, so.created_at),1,10)='${today}'${scopeSql}${VOID_SO}`)).values?.[0]?.[0] || 0);
+    const monthSales = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE substr(COALESCE(bill_date, created_at),1,10) >= '${monthStart}'${scopeSql}${VOID}`)).values?.[0]?.[0] || 0);
+    const monthCost = Number((await safeExec(`SELECT COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE substr(COALESCE(so.bill_date, so.created_at),1,10) >= '${monthStart}'${scopeSql}${VOID_SO}`)).values?.[0]?.[0] || 0);
     // 其他收入/其他支出（category 以"其他"开头的收支，如 其他收入-房租、其他支出-水电）；员工只看自己的流水
     const otherSql = (t, from) => `SELECT COALESCE(SUM(amount),0) FROM transactions WHERE type='${t}' AND (category LIKE '其他%' OR category LIKE '%其他%') AND date(created_at) ${from}${scopeSql}`;
     const todayOtherIncome = Number((await safeExec(otherSql('income', `='${today}'`))).values?.[0]?.[0] || 0);
@@ -1117,12 +1192,41 @@ app.delete('/api/store/customers/:id', authMiddleware, hasPerm('customers'), asy
     saveDB();
     res.json({ ok: true });
 });
-app.get('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), async (_req, res) => {
+const PO_COLS = "id, order_number, supplier_id, supplier_name, total_amount, status, operator_id, operator_name, created_at, payment_status, bill_date, paid_amount, owe_amount, remark";
+function mapPurchaseOrder(o) {
+    return {
+        id: o[0], order_number: o[1], supplier_id: Number(o[2]) || null, supplier_name: o[3],
+        total_amount: Number(o[4]), status: o[5], operator_id: o[6], operator_name: o[7],
+        created_at: o[8], payment_status: o[9] || '已结清',
+        bill_date: o[10] || (o[8] ? String(o[8]).slice(0, 10) : null),
+        paid_amount: Number(o[11] || 0), owe_amount: Number(o[12] || 0), remark: o[13] || ''
+    };
+}
+app.get('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), async (req, res) => {
     await initDB();
-    const result = await safeExec("SELECT * FROM purchase_orders ORDER BY created_at DESC, id DESC");
-    const orders = (result.values || []).map((o) => ({
-        id: o[0], order_number: o[1], supplier_id: Number(o[2]) || null, supplier_name: o[3], total_amount: Number(o[4]), status: o[5], operator_id: o[6], operator_name: o[7], created_at: o[8], payment_status: o[9] || '已结清'
-    }));
+    const { page = 1, pageSize = 200, keyword, startDate, endDate, status, withTotal } = req.query;
+    let where = " WHERE 1=1";
+    if (keyword) {
+        const kw = String(keyword).replace(/'/g, "''");
+        where += " AND (order_number LIKE '%" + kw + "%' OR supplier_name LIKE '%" + kw + "%')";
+    }
+    if (startDate) where += " AND COALESCE(bill_date, substr(created_at,1,10)) >= '" + String(startDate).replace(/'/g, "''") + "'";
+    if (endDate) where += " AND COALESCE(bill_date, substr(created_at,1,10)) <= '" + String(endDate).replace(/'/g, "''") + "'";
+    if (status === 'unpaid') where += " AND COALESCE(owe_amount,0) > 0.005";
+    if (status === 'paid') where += " AND COALESCE(owe_amount,0) <= 0.005 AND COALESCE(payment_status,'') <> '作废'";
+    const pg = Math.max(1, Number(page) || 1);
+    const ps = Math.min(5000, Math.max(1, Number(pageSize) || 200));
+    const result = await safeExec("SELECT " + PO_COLS + " FROM purchase_orders" + where +
+        " ORDER BY COALESCE(bill_date, substr(created_at,1,10)) DESC, id DESC LIMIT ? OFFSET ?", [ps, (pg - 1) * ps]);
+    const orders = (result.values || []).map(mapPurchaseOrder);
+    if (withTotal) {
+        const totalRow = (await safeExec("SELECT COUNT(*) FROM purchase_orders" + where)).values?.[0]?.[0];
+        const agg = (await safeExec("SELECT COALESCE(SUM(total_amount),0) AS sum_total, COALESCE(SUM(owe_amount),0) AS sum_owe FROM purchase_orders" + where)).values?.[0] || [0, 0];
+        return res.json({
+            rows: orders, total: Number(totalRow || 0), page: pg, pageSize: ps,
+            sum_total: Number(agg[0] || 0), sum_owe: Number(agg[1] || 0),
+        });
+    }
     res.json(orders);
 });
 // 进货单详情（含商品明细，用于 A4 打印）
@@ -1131,8 +1235,9 @@ app.get('/api/store/purchase-orders/:id', authMiddleware, hasPerm('purchase'), a
     if (req.params.id === 'export') {
         // 导出进货单（避免与 :id 冲突）
         const { startDate = '2020-01-01', endDate = '2030-12-31' } = req.query;
-        const result = await safeExec("SELECT order_number, supplier_name, total_amount, payment_status, operator_name, created_at FROM purchase_orders WHERE date(created_at) >= ? AND date(created_at) <= ? ORDER BY id", [String(startDate), String(endDate)]);
-        const rows = [['单据编号', '供应商名称', '应付金额', '付款状态', '操作员', '日期']];
+        const BD = "COALESCE(bill_date, substr(created_at,1,10))";
+        const result = await safeExec(`SELECT order_number, supplier_name, total_amount, paid_amount, owe_amount, payment_status, operator_name, ${BD} FROM purchase_orders WHERE ${BD} >= ? AND ${BD} <= ? ORDER BY ${BD}, id`, [String(startDate), String(endDate)]);
+        const rows = [['单据编号', '供应商名称', '应付金额', '已付金额', '欠款', '付款状态', '操作员', '业务日期']];
         for (const r of result.values || []) rows.push(r);
         const wb = XLSX.utils.book_new();
         XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), '进货单');
@@ -1142,7 +1247,7 @@ app.get('/api/store/purchase-orders/:id', authMiddleware, hasPerm('purchase'), a
         return res.send(buf);
     }
     const id = Number(req.params.id);
-    const o = (await safeExec("SELECT * FROM purchase_orders WHERE id = ?", [id])).values?.[0];
+    const o = (await safeExec("SELECT " + PO_COLS + " FROM purchase_orders WHERE id = ?", [id])).values?.[0];
     if (!o)
         return res.status(404).json({ error: '进货单不存在' });
     const items = ((await safeExec("SELECT * FROM purchase_order_items WHERE order_id = ?", [id])).values || []).map((i) => ({
@@ -1154,15 +1259,18 @@ app.get('/api/store/purchase-orders/:id', authMiddleware, hasPerm('purchase'), a
         const p = (await safeExec("SELECT sku, spec, unit, batch_number FROM products WHERE id = ?", [it.product_id])).values?.[0];
         return { ...it, sku: p?.[0] || '', spec: p?.[1] || '', unit: p?.[2] || '', barcode: p?.[3] || '' };
     }));
-    res.json({
-        id: o[0], order_number: o[1], supplier_id: Number(o[2]) || null, supplier_name: o[3],
-        total_amount: Number(o[4]), status: o[5], operator_id: o[6], operator_name: o[7], created_at: o[8],
-        payment_status: o[9] || '已结清', items: enriched
-    });
+    res.json({ ...mapPurchaseOrder(o), items: enriched });
 });
 app.post('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), async (req, res) => {
     await initDB();
-    let { supplier_id, supplier_name, items, discount, final_amount } = req.body;
+    let { supplier_id, supplier_name, items, discount, final_amount, remark, bill_date, paid_amount } = req.body;
+    // 采购单必须含有效明细（与服务端销售单同口径兜底）
+    if (!Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ error: '请至少添加一件商品后再建进货单' });
+    }
+    if (items.find((it) => !(Number(it.quantity ?? 0) > 0))) {
+        return res.status(400).json({ error: '商品数量必须大于 0' });
+    }
     // 兜底：未传 supplier_id 时按名称自动解析
     if (!supplier_id && supplier_name) {
         const sidRes = await safeExec("SELECT id FROM suppliers WHERE name = ? ORDER BY id LIMIT 1", [supplier_name]);
@@ -1170,9 +1278,15 @@ app.post('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), asyn
     }
     const orderNumber = generateOrderNumber('JH');
     const totalAmount = final_amount || req.body.total_amount || 0;
-    // 进货同样支持赊账：未传支付信息视为未结清（计入供应商欠款）
-    const paymentStatus = req.body.payment_status || (req.body.settled ? '已结清' : '未结清');
-    await run("INSERT INTO purchase_orders (order_number, supplier_id, supplier_name, total_amount, operator_id, operator_name, payment_status) VALUES (?, ?, ?, ?, ?, ?, ?)", [orderNumber, supplier_id, supplier_name, totalAmount, req.user.id, req.user.real_name, paymentStatus]);
+    /* ---- 付款口径：与销售单对称 ----
+     * paid_amount 显式传入则用传入值；否则 settled=true 视为全额付讫，否则 0（赊购）
+     * owe_amount = 应付 - 已付 */
+    const paidAmount = paid_amount !== undefined && paid_amount !== null && paid_amount !== ''
+        ? (Number(paid_amount) || 0)
+        : (req.body.settled ? Number(totalAmount) : 0);
+    const oweAmount = Math.round((Number(totalAmount) - paidAmount) * 100) / 100;
+    const paymentStatus = req.body.payment_status || (oweAmount > 0.005 ? '未结清' : '已结清');
+    await run("INSERT INTO purchase_orders (order_number, supplier_id, supplier_name, total_amount, operator_id, operator_name, payment_status, bill_date, paid_amount, owe_amount, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [orderNumber, supplier_id, supplier_name, totalAmount, req.user.id, req.user.real_name, paymentStatus, bill_date || todayCST(), paidAmount, oweAmount, remark || '']);
     if (items) {
         const orderIdResult = await safeExec("SELECT last_insert_rowid()");
         const orderId = orderIdResult.values?.[0]?.[0];
@@ -1193,18 +1307,49 @@ app.get('/api/store/sales-staff', authMiddleware, hasPerm('sales'), async (_req,
     const result = await safeExec("SELECT id, real_name, role FROM users WHERE status = 1 AND role IN ('employee','admin') ORDER BY role, id");
     res.json((result.values || []).map((u) => ({ id: u[0], real_name: u[1], role: u[2] })));
 });
+// 销售单列清单（含财务口径字段），统一在此维护，避免各处 SELECT 漏字段
+const SO_COLS = "id, order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, created_at, payment_status, commission_amount, bill_date, receivable_amount, received_amount, owe_amount, small_change_amount, express_amount, tax_amount, remark, biz_type";
+function mapSalesOrder(o) {
+    return {
+        id: o[0], order_number: o[1], customer_id: Number(o[2]) || null, customer_name: o[3],
+        total_amount: Number(o[4]), discount: Number(o[5]), final_amount: Number(o[6]),
+        payment_method: o[7], operator_id: o[8], operator_name: o[9], created_at: o[10],
+        payment_status: o[11], commission_amount: Number(o[12] || 0),
+        bill_date: o[13] || (o[10] ? String(o[10]).slice(0, 10) : null),
+        receivable_amount: Number(o[14] || 0), received_amount: Number(o[15] || 0), owe_amount: Number(o[16] || 0),
+        small_change_amount: Number(o[17] || 0), express_amount: Number(o[18] || 0), tax_amount: Number(o[19] || 0),
+        remark: o[20] || '', biz_type: o[21] || 'sale'
+    };
+}
 app.get('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req, res) => {
     await initDB();
-    const { pageSize = 200 } = req.query;
+    const { pageSize = 200, page = 1, keyword, startDate, endDate, status, bizType, withTotal } = req.query;
     // 数据权限：所有账号均可见全部销售单（对齐智慧记云端默认，管理员开单成员也可查看）
-    let sql = "SELECT id, order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, created_at, payment_status, commission_amount FROM sales_orders";
-    const params = [];
-    sql += " ORDER BY created_at DESC, id DESC LIMIT ?";
-    params.push(Number(pageSize));
-    const result = await safeExec(sql, params);
-    const orders = (result.values || []).map((o) => ({
-        id: o[0], order_number: o[1], customer_id: Number(o[2]) || null, customer_name: o[3], total_amount: Number(o[4]), discount: Number(o[5]), final_amount: Number(o[6]), payment_method: o[7], operator_id: o[8], operator_name: o[9], created_at: o[10], payment_status: o[11], commission_amount: Number(o[12] || 0)
-    }));
+    let where = " WHERE 1=1";
+    if (keyword) {
+        const kw = String(keyword).replace(/'/g, "''");
+        where += " AND (order_number LIKE '%" + kw + "%' OR customer_name LIKE '%" + kw + "%' OR operator_name LIKE '%" + kw + "%')";
+    }
+    if (startDate) where += " AND COALESCE(bill_date, substr(created_at,1,10)) >= '" + String(startDate).replace(/'/g, "''") + "'";
+    if (endDate) where += " AND COALESCE(bill_date, substr(created_at,1,10)) <= '" + String(endDate).replace(/'/g, "''") + "'";
+    if (status === 'unpaid') where += " AND COALESCE(owe_amount,0) > 0.005";
+    if (status === 'paid') where += " AND COALESCE(owe_amount,0) <= 0.005 AND COALESCE(payment_status,'') <> '作废'";
+    if (status === 'void') where += " AND payment_status = '作废'";
+    if (bizType && bizType !== 'all') where += " AND COALESCE(biz_type,'sale') = '" + String(bizType).replace(/'/g, "''") + "'";
+    else if (!bizType) where += " AND COALESCE(biz_type,'sale') <> 'sale_return'"; // 默认列表不混入退货单
+    const pg = Math.max(1, Number(page) || 1);
+    const ps = Math.min(5000, Math.max(1, Number(pageSize) || 200));
+    const result = await safeExec("SELECT " + SO_COLS + " FROM sales_orders" + where +
+        " ORDER BY COALESCE(bill_date, substr(created_at,1,10)) DESC, id DESC LIMIT ? OFFSET ?", [ps, (pg - 1) * ps]);
+    const orders = (result.values || []).map(mapSalesOrder);
+    if (withTotal) {
+        const totalRow = (await safeExec("SELECT COUNT(*) FROM sales_orders" + where)).values?.[0]?.[0];
+        const agg = (await safeExec("SELECT COALESCE(SUM(final_amount),0) AS sum_final, COALESCE(SUM(owe_amount),0) AS sum_owe, COALESCE(SUM(received_amount),0) AS sum_received FROM sales_orders" + where)).values?.[0] || [0, 0, 0];
+        return res.json({
+            rows: orders, total: Number(totalRow || 0), page: pg, pageSize: ps,
+            sum_final: Number(agg[0] || 0), sum_owe: Number(agg[1] || 0), sum_received: Number(agg[2] || 0),
+        });
+    }
     res.json(orders);
 });
 // 销售单详情（含商品明细，用于小票/PDF 打印）
@@ -1213,8 +1358,9 @@ app.get('/api/store/sales-orders/:id', authMiddleware, hasPerm('sales'), async (
     if (req.params.id === 'export') {
         // 导出销售单（避免与 :id 冲突）
         const { startDate = '2020-01-01', endDate = '2030-12-31' } = req.query;
-        const result = await safeExec("SELECT order_number, customer_name, total_amount, discount, final_amount, payment_method, payment_status, operator_name, created_at FROM sales_orders WHERE date(created_at) >= ? AND date(created_at) <= ? ORDER BY id", [String(startDate), String(endDate)]);
-        const rows = [['单据编号', '客户名称', '应收金额', '优惠', '实收金额', '收款方式', '收款状态', '操作员', '日期']];
+        const BD = "COALESCE(bill_date, substr(created_at,1,10))";
+        const result = await safeExec(`SELECT order_number, customer_name, receivable_amount, discount, final_amount, received_amount, owe_amount, payment_method, payment_status, operator_name, ${BD} FROM sales_orders WHERE ${BD} >= ? AND ${BD} <= ? AND COALESCE(biz_type,'sale') <> 'sale_return' ORDER BY ${BD}, id`, [String(startDate), String(endDate)]);
+        const rows = [['单据编号', '客户名称', '应收金额', '优惠', '单据金额', '已收金额', '欠款', '收款方式', '收款状态', '操作员', '业务日期']];
         for (const r of result.values || []) rows.push(r);
         const wb = XLSX.utils.book_new();
         XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), '销售单');
@@ -1224,7 +1370,7 @@ app.get('/api/store/sales-orders/:id', authMiddleware, hasPerm('sales'), async (
         return res.send(buf);
     }
     const id = Number(req.params.id);
-    const o = (await safeExec("SELECT id, order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, created_at, payment_status, commission_amount FROM sales_orders WHERE id = ?", [id])).values?.[0];
+    const o = (await safeExec("SELECT " + SO_COLS + " FROM sales_orders WHERE id = ?", [id])).values?.[0];
     if (!o)
         return res.status(404).json({ error: '订单不存在' });
     const items = ((await safeExec("SELECT * FROM sales_order_items WHERE order_id = ?", [id])).values || []).map((i) => ({
@@ -1236,15 +1382,22 @@ app.get('/api/store/sales-orders/:id', authMiddleware, hasPerm('sales'), async (
         const p = (await safeExec("SELECT spec, unit, batch_number, production_date FROM products WHERE id = ?", [it.product_id])).values?.[0];
         return { ...it, spec: p?.[0] || '', unit: p?.[1] || '', barcode: p?.[2] || '' };
     }));
-    res.json({
-        id: o[0], order_number: o[1], customer_id: o[2], customer_name: o[3],
-        total_amount: Number(o[4]), discount: Number(o[5]), final_amount: Number(o[6]),
-        payment_method: o[7], operator_id: o[8], operator_name: o[9], created_at: o[10], payment_status: o[11], commission_amount: Number(o[12] || 0), items: enriched
-    });
+    res.json({ ...mapSalesOrder(o), items: enriched });
 });
 app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req, res) => {
     await initDB();
-    let { order_number: customOrderNumber, customer_id, customer_name, items, payment_method, discount, payment_status, operator_id: targetOperatorId } = req.body;
+    let { order_number: customOrderNumber, customer_id, customer_name, items, payment_method, discount,
+        payment_status, operator_id: targetOperatorId,
+        received_amount, small_change_amount, express_amount, tax_amount, remark, bill_date } = req.body;
+    /* 开单必须含有效明细：空单/零数量单无业务意义，且会污染欠款统计与利润报表
+     * （实测：不校验时可建出 final_amount=0 的空单）。前端已有 cart.length 守卫，此处为服务端兜底。 */
+    if (!Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ error: '请至少添加一件商品后再开单' });
+    }
+    const badItem = items.find((it) => !(Number(it.quantity ?? 0) > 0));
+    if (badItem) {
+        return res.status(400).json({ error: '商品数量必须大于 0（' + (badItem.product_name || '未命名商品') + '）' });
+    }
     // 兜底：未传 customer_id 时按名称自动解析
     if (!customer_id && customer_name) {
         const cidRes = await safeExec("SELECT id FROM customers WHERE name = ? ORDER BY id LIMIT 1", [customer_name]);
@@ -1262,6 +1415,7 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
         }
     }
     const orderNumber = customOrderNumber || generateOrderNumber('XS');
+    const extra = (Number(express_amount) || 0) + (Number(tax_amount) || 0) - (Number(small_change_amount) || 0);
     let totalAmount = 0;
     if (items) {
         for (const item of items) {
@@ -1269,16 +1423,30 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
             totalAmount += (item.quantity || 0) * (item.price ?? item.unit_price ?? 0);
         }
     }
-    const finalAmount = totalAmount - (discount || 0);
+    // final_amount = 明细合计 - 折扣 + 运费 + 税额 - 抹零（与智慧记 bill_amt 口径一致）
+    const finalAmount = Math.round((totalAmount - (discount || 0) + extra) * 100) / 100;
     // 业绩提成：按业务员（业绩归属人）commission_rate% 计算
     let commissionAmount = 0;
     try {
         const cr = (await safeExec("SELECT COALESCE(commission_rate,0) FROM users WHERE id = ?", [operatorId])).values?.[0]?.[0];
         commissionAmount = Math.round((Number(cr) || 0) * finalAmount) / 100;
     } catch (e) { commissionAmount = 0; }
-    // 收款状态：选了支付方式视为已结清；不选（赊账）为未结清 → 计入客户欠款
-    const paymentStatus = payment_method ? '已结清' : '未结清';
-    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, commission_amount, payment_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [orderNumber, customer_id || null, customer_name || null, totalAmount, discount || 0, finalAmount, payment_method || null, operatorId, operatorName, commissionAmount, paymentStatus]);
+    /* ---- 收款口径 ----
+     * received_amount 显式传入则用传入值；否则：有支付方式视为全额收讫，无支付方式（赊账）视为 0
+     * owe_amount = 应收 - 已收（赊账单的核心字段，供欠款对账） */
+    const receivedAmount = received_amount !== undefined && received_amount !== null && received_amount !== ''
+        ? (Number(received_amount) || 0)
+        : (payment_method ? finalAmount : 0);
+    const oweAmount = Math.round((finalAmount - receivedAmount) * 100) / 100;
+    const paymentStatus = oweAmount > 0.005 ? '未结清' : '已结清';
+    const billDate = bill_date || todayCST();
+    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, commission_amount, payment_status, bill_date, receivable_amount, received_amount, owe_amount, small_change_amount, express_amount, tax_amount, remark, biz_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+        orderNumber, customer_id || null, customer_name || null, totalAmount, discount || 0, finalAmount,
+        payment_method || null, operatorId, operatorName, commissionAmount, paymentStatus,
+        billDate, finalAmount, receivedAmount, oweAmount,
+        Number(small_change_amount) || 0, Number(express_amount) || 0, Number(tax_amount) || 0,
+        remark || '', 'sale'
+    ]);
     saveDB();
     // Get the inserted order ID by finding the max id
     const orderIdResult = await safeExec("SELECT MAX(id) FROM sales_orders WHERE order_number = ?", [orderNumber]);
@@ -1293,14 +1461,39 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
         }
     }
     // Update account balance if payment
-    if (payment_method && ['cash', 'alipay', 'wechat', 'bank'].includes(payment_method)) {
+    if (payment_method && ['cash', 'alipay', 'wechat', 'bank'].includes(payment_method) && receivedAmount > 0) {
         const accResult = await safeExec("SELECT id FROM accounts WHERE type = ? LIMIT 1", [payment_method]);
         if (accResult.values?.[0]) {
-            await run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [finalAmount, accResult.values[0][0]]);
+            await run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [receivedAmount, accResult.values[0][0]]);
         }
     }
     saveDB();
-    res.json({ ok: true, order_number: orderNumber });
+    res.json({ ok: true, order_number: orderNumber, id: orderId, final_amount: finalAmount, received_amount: receivedAmount, owe_amount: oweAmount, payment_status: paymentStatus });
+});
+// 销售单收款登记（收欠款 / 收尾款）：累加已收、重算欠款与结算状态，并记一笔资金流水
+app.post('/api/store/sales-orders/:id/receive', authMiddleware, hasPerm('sales'), async (req, res) => {
+    await initDB();
+    const id = Number(req.params.id);
+    const amount = Number(req.body.amount) || 0;
+    if (amount <= 0) return res.status(400).json({ error: '收款金额必须大于 0' });
+    const o = (await safeExec("SELECT " + SO_COLS + " FROM sales_orders WHERE id = ?", [id])).values?.[0];
+    if (!o) return res.status(404).json({ error: '订单不存在' });
+    const so = mapSalesOrder(o);
+    if (so.payment_status === '作废') return res.status(400).json({ error: '该单已作废，不能收款' });
+    const receivable = so.receivable_amount || so.final_amount;
+    const newReceived = Math.round((so.received_amount + amount) * 100) / 100;
+    const newOwe = Math.round((receivable - newReceived) * 100) / 100;
+    const newStatus = newOwe > 0.005 ? '未结清' : '已结清';
+    await run("UPDATE sales_orders SET received_amount = ?, owe_amount = ?, payment_status = ? WHERE id = ?", [newReceived, newOwe, newStatus, id]);
+    // 资金流水（可选账户）
+    const accountId = Number(req.body.account_id) || null;
+    if (accountId) {
+        await run("INSERT INTO transactions (type, account_id, amount, category, description, party_type, party_id, party_name, operator_id, operator_name) VALUES ('income', ?, ?, '销售收款', ?, 'customer', ?, ?, ?, ?)",
+            [accountId, amount, '销售单 ' + so.order_number + ' 收款', so.customer_id || null, so.customer_name || '', req.user.id, req.user.real_name]);
+        await run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [amount, accountId]);
+    }
+    saveDB();
+    res.json({ ok: true, received_amount: newReceived, owe_amount: newOwe, payment_status: newStatus });
 });
 // 作废销售单（仅管理员）：标记作废 + 冲回库存，保留记录与明细（对齐智慧记 invalid，不做物理删除）
 app.delete('/api/store/sales-orders/:id', authMiddleware, adminOnly, async (req, res) => {
@@ -1318,15 +1511,27 @@ app.delete('/api/store/sales-orders/:id', authMiddleware, adminOnly, async (req,
     res.json({ ok: true });
 });
 // Sales Return APIs
-app.get('/api/store/sales-returns', authMiddleware, hasPerm('return'), async (_req, res) => {
+app.get('/api/store/sales-returns', authMiddleware, hasPerm('return'), async (req, res) => {
     await initDB();
-    const isAdminUser = _req.user.role === 'admin' || _req.user.role === 'manager';
-    const scopeSql = ''; // 全店可见
-    const result = await safeExec(`SELECT * FROM sales_returns${scopeSql} ORDER BY id DESC LIMIT 50`);
+    const { page = 1, pageSize = 100, withTotal } = req.query;
+    const pg = Math.max(1, Number(page) || 1);
+    const ps = Math.min(1000, Math.max(1, Number(pageSize) || 100));
+    // 关联原销售单，补充原单号/客户/业务日期（便于退货对账）
+    const sql = `SELECT r.id, r.return_number, r.sales_order_id, r.total_amount, r.operator_id, r.operator_name,
+                        r.reason, r.status, r.created_at,
+                        so.order_number, so.customer_name, COALESCE(so.bill_date, substr(so.created_at,1,10))
+                   FROM sales_returns r LEFT JOIN sales_orders so ON so.id = r.sales_order_id
+                  ORDER BY r.id DESC LIMIT ? OFFSET ?`;
+    const result = await safeExec(sql, [ps, (pg - 1) * ps]);
     const returns = (result.values || []).map((r) => ({
         id: r[0], return_number: r[1], sales_order_id: r[2], total_amount: Number(r[3]),
-        operator_id: r[4], operator_name: r[5], reason: r[6], status: r[7], created_at: r[8]
+        operator_id: r[4], operator_name: r[5], reason: r[6], status: r[7], created_at: r[8],
+        ref_order_number: r[9] || '', customer_name: r[10] || '', bill_date: r[11] || null
     }));
+    if (withTotal) {
+        const totalRow = (await safeExec("SELECT COUNT(*) FROM sales_returns")).values?.[0]?.[0];
+        return res.json({ rows: returns, total: Number(totalRow || 0), page: pg, pageSize: ps });
+    }
     res.json(returns);
 });
 app.post('/api/store/sales-returns', authMiddleware, hasPerm('return'), async (req, res) => {
@@ -1873,7 +2078,7 @@ app.get('/api/finance/summary', authMiddleware, hasPerm('finance_view'), async (
         if (r[1] === 'income') byDate[d].income = Number(r[2]);
         else byDate[d].expense = Number(r[2]);
     }
-    const catRows = (await safeExec(`SELECT type, COALESCE(NULLIF(category,''),'未分类'), COALESCE(SUM(amount),0) FROM transactions WHERE date(created_at) >= '${start}' AND type IN ('income','expense') GROUP BY type, category ORDER BY 3 DESC`)).values || [];
+    const catRows = (await safeExec(`SELECT type, COALESCE(NULLIF(category,''),'未分类') AS cat_name, COALESCE(SUM(amount),0) AS cat_amount FROM transactions WHERE date(created_at) >= '${start}' AND type IN ('income','expense') GROUP BY type, category ORDER BY 3 DESC`)).values || [];
     const byCat = { income: [], expense: [] };
     for (const r of catRows) {
         if (r[0] === 'income') byCat.income.push({ category: r[1], amount: Number(r[2]) });
