@@ -1280,7 +1280,7 @@ app.get('/api/analysis/performance', authMiddleware, async (req, res) => {
         selfName = String(me?.[0] || '').trim();
     }
     // ---- 主聚合：订单数 / 销售额 / 提成（按归属名） ----
-    const c1 = ["COALESCE(so.payment_status,'') <> '作废'", "so.created_at >= ?", "so.created_at <= ?"];
+    const c1 = ["COALESCE(so.payment_status,'') <> '作废'", "substr(COALESCE(so.bill_date, so.created_at),1,10) >= ?", "substr(COALESCE(so.bill_date, so.created_at),1,10) <= ?"];
     const p1 = [defStart, END];
     if (!isAdmin) {
         c1.push(`${NAME_KEY} = ?`);
@@ -1296,7 +1296,7 @@ app.get('/api/analysis/performance', authMiddleware, async (req, res) => {
     WHERE ${c1.join(' AND ')}
     GROUP BY 1 ORDER BY sales DESC`, p1)).values || [];
     // ---- 件数与成本（同一归属键、同一区间；成本带 COST_SIGN 符号） ----
-    const c2 = ["COALESCE(so.payment_status,'') <> '作废'", "so.created_at >= ?", "so.created_at <= ?"];
+    const c2 = ["COALESCE(so.payment_status,'') <> '作废'", "substr(COALESCE(so.bill_date, so.created_at),1,10) >= ?", "substr(COALESCE(so.bill_date, so.created_at),1,10) <= ?"];
     const p2 = [defStart, END];
     if (!isAdmin) {
         c2.push(`${NAME_KEY} = ?`);
@@ -1338,7 +1338,7 @@ app.get('/api/analysis/performance', authMiddleware, async (req, res) => {
     }).filter((r) => r.orders > 0);
     rows.sort((a, b) => b.sales - a.sales);
     // ---- 全店汇总 ----
-    const tc = ["COALESCE(so.payment_status,'') <> '作废'", "so.created_at >= ?", "so.created_at <= ?"];
+    const tc = ["COALESCE(so.payment_status,'') <> '作废'", "substr(COALESCE(so.bill_date, so.created_at),1,10) >= ?", "substr(COALESCE(so.bill_date, so.created_at),1,10) <= ?"];
     const tp = [defStart, END];
     if (!isAdmin) {
         tc.push(`${NAME_KEY} = ?`);
@@ -1358,11 +1358,11 @@ app.get('/api/analysis/performance', authMiddleware, async (req, res) => {
            SUM(CASE WHEN so.operator_id IS NULL THEN 1 ELSE 0 END),
            SUM(CASE WHEN COALESCE(TRIM(so.operator_name),'') = '' THEN 1 ELSE 0 END),
            COUNT(DISTINCT NULLIF(TRIM(COALESCE(so.operator_name,'')),''))
-    FROM sales_orders so WHERE COALESCE(so.payment_status,'') <> '作废' AND so.created_at >= ? AND so.created_at <= ?`, [defStart, END])).values?.[0] || [0, 0, 0, 0];
+    FROM sales_orders so WHERE COALESCE(so.payment_status,'') <> '作废' AND substr(COALESCE(so.bill_date, so.created_at),1,10) >= ? AND substr(COALESCE(so.bill_date, so.created_at),1,10) <= ?`, [defStart, END])).values?.[0] || [0, 0, 0, 0];
     const unattributed = (await safeExec(`
     SELECT COUNT(*), COALESCE(SUM(so.final_amount),0)
     FROM sales_orders so LEFT JOIN users u ON u.id = so.operator_id
-    WHERE COALESCE(so.payment_status,'') <> '作废' AND so.created_at >= ? AND so.created_at <= ?
+    WHERE COALESCE(so.payment_status,'') <> '作废' AND substr(COALESCE(so.bill_date, so.created_at),1,10) >= ? AND substr(COALESCE(so.bill_date, so.created_at),1,10) <= ?
       AND ${NAME_KEY} = '未归属'`, [defStart, END])).values?.[0] || [0, 0];
     const attribution = {
         positive_orders: totalO,
@@ -1377,7 +1377,7 @@ app.get('/api/analysis/performance', authMiddleware, async (req, res) => {
     /* 按月趋势（用同一归属键，保证与 list 口径一致） */
     let by_month = [];
     if (String(req.query.group_by || '') === 'month') {
-        const c3 = ["COALESCE(so.payment_status,'') <> '作废'", "so.created_at >= ?", "so.created_at <= ?"];
+        const c3 = ["COALESCE(so.payment_status,'') <> '作废'", "substr(COALESCE(so.bill_date, so.created_at),1,10) >= ?", "substr(COALESCE(so.bill_date, so.created_at),1,10) <= ?"];
         const p3 = [defStart, END];
         if (!isAdmin) {
             c3.push(`${NAME_KEY} = ?`);
@@ -1425,7 +1425,7 @@ app.get('/api/analysis/demand', authMiddleware, hasPerm('sales_stats'), async (r
     const startDate = `${new Date(now.getFullYear(), now.getMonth() - 11, 1).getFullYear()}-${String(new Date(now.getFullYear(), now.getMonth() - 11, 1).getMonth() + 1).padStart(2, '0')}-01`;
     // ---- 1) 客户需求：按 客户×月份 聚合近12个月正金额销售 ----
     const custRows = (await safeExec(`
-    SELECT customer_name, substr(created_at,1,7) as ym, COUNT(*) as cnt, SUM(final_amount) as amt
+    SELECT customer_name, substr(COALESCE(bill_date, created_at),1,7) as ym, COUNT(*) as cnt, SUM(final_amount) as amt
     FROM sales_orders
     WHERE COALESCE(payment_status,'') <> '作废' AND substr(COALESCE(bill_date, created_at),1,10) >= '${startDate}' AND customer_name IS NOT NULL AND customer_name != ''${scopeSql}
     GROUP BY customer_name, ym
@@ -1507,7 +1507,7 @@ app.get('/api/analysis/demand', authMiddleware, hasPerm('sales_stats'), async (r
         .slice(0, 15);
     // ---- 3) 月度趋势与经营建议 ----
     const monthRows = (await safeExec(`
-    SELECT substr(created_at,1,7) as ym, COUNT(*) as cnt, SUM(final_amount) as amt
+    SELECT substr(COALESCE(bill_date, created_at),1,7) as ym, COUNT(*) as cnt, SUM(final_amount) as amt
     FROM sales_orders WHERE COALESCE(payment_status,'') <> '作废' AND substr(COALESCE(bill_date, created_at),1,10) >= '${startDate}'
     GROUP BY ym ORDER BY ym
   `)).values || [];
