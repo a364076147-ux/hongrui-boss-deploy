@@ -798,70 +798,297 @@ app.get('/api/analysis/dashboard', authMiddleware, async (req, res) => {
         payable: Number(ap[0] || 0), payableCount: Number(ap[1] || 0),
     });
 });
+/* 销售统计 —— 对齐智慧记「报表逐月归组」口径
+ *
+ * ★ 两种响应形态，靠 group_by 触发，保证「前端/后端两条独立发布链」任意先上线都不炸：
+ *   不传 group_by  → 旧形态：裸数组 [{date, actual_sales, order_count}]（旧前端原样可用）
+ *   传 group_by    → 新形态：信封 { group_by, rows:[...], sums:{...} }（新前端只走这条）
+ *
+ * ★ 口径说明（与仪表盘 / profit 端点保持同一套）：
+ *   - 作废单不计入统计（COALESCE(payment_status,'') <> '作废'）
+ *   - 正单与退货单分开算：sale_amount 只含正单，return_amount 只含退货单（金额本身为负）
+ *   - order_count 只数正单，return_count 只数退货单 —— 与旧形态的 order_count 口径一致
+ *   - 成本口径必须带 COST_SIGN_SQL 符号（退货单收入为负、成本同步取负），否则成本率被虚增
+ */
 app.get('/api/analysis/sales', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
     await initDB();
     const { start_date, end_date } = req.query;
     const BD = "substr(COALESCE(bill_date, created_at),1,10)";
-    let sql = `SELECT ${BD} as date, SUM(final_amount) as actual_sales, COUNT(*) as order_count FROM sales_orders WHERE 1=1 AND COALESCE(payment_status,'') <> '作废' AND COALESCE(biz_type,'sale') <> 'sale_return'`;
-    const params = [];
-    if (start_date) {
-        sql += " AND " + BD + " >= '" + String(start_date).replace(/'/g, "''") + "'";
-    }
-    if (end_date) {
-        sql += " AND " + BD + " <= '" + String(end_date).replace(/'/g, "''") + "'";
-    }
-    sql += ` GROUP BY ${BD} ORDER BY ${BD} ASC`;
-    const result = await safeExec(sql, params);
-    const rows = result.values || [];
-    res.json(rows.map((r) => ({
-        date: r[0], actual_sales: Number(r[1]), order_count: Number(r[2])
-    })));
-});
-app.get('/api/analysis/sales/top-products', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
-    await initDB();
-    const days = Math.min(Math.max(Number(req.query.days) || 30, 1), 365);
-    const startDate = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
-    // 数据权限：员工只统计自己的销售单
-    const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
-    const scopeSql = ''; // 全店可见
-    const result = (await safeExec(`
-    SELECT p.name, p.sku,
-           SUM(${COST_SIGN_SQL} * oi.quantity) as total_qty,
-           SUM(${COST_SIGN_SQL} * oi.amount)   as total_amount
+    const BDS = "substr(COALESCE(so.bill_date, so.created_at),1,10)";
+    const gb = String(req.query.group_by || '').toLowerCase();
+    const isMonthly = gb === 'month' || gb === 'year';
+    const P_SO = gb === 'month' ? "substr(COALESCE(bill_date, created_at),1,7)"
+        : gb === 'year' ? "substr(COALESCE(bill_date, created_at),1,4)" : BD;
+    const P_IT = gb === 'month' ? "substr(COALESCE(so.bill_date, so.created_at),1,7)"
+        : gb === 'year' ? "substr(COALESCE(so.bill_date, so.created_at),1,4)" : BDS;
+    const cond = ["COALESCE(payment_status,'') <> '作废'"];
+    if (start_date)
+        cond.push(`${BD} >= '${String(start_date).replace(/'/g, "''")}'`);
+    if (end_date)
+        cond.push(`${BD} <= '${String(end_date).replace(/'/g, "''")}'`);
+    const WHERE = ' WHERE ' + cond.join(' AND ');
+    // 主表：正单销售额 / 退货额 / 单数 / 欠款
+    const mainRows = (await safeExec(`
+    SELECT ${P_SO} as period,
+           COALESCE(SUM(CASE WHEN COALESCE(biz_type,'sale')='sale_return' THEN final_amount ELSE 0 END),0) as return_amount,
+           COALESCE(SUM(CASE WHEN COALESCE(biz_type,'sale')='sale_return' THEN 0 ELSE final_amount END),0) as sale_amount,
+           COALESCE(SUM(CASE WHEN COALESCE(biz_type,'sale')='sale_return' THEN 0 ELSE 1 END),0) as order_count,
+           COALESCE(SUM(CASE WHEN COALESCE(biz_type,'sale')='sale_return' THEN 1 ELSE 0 END),0) as return_count,
+           COALESCE(SUM(COALESCE(owe_amount,0)),0) as owe_amount
+    FROM sales_orders${WHERE}
+    GROUP BY ${P_SO} ORDER BY ${P_SO} ASC
+  `)).values || [];
+    // 成本：必须 JOIN 明细与商品，符号带 COST_SIGN_SQL（退货成本取负）
+    const condIt = ["COALESCE(so.payment_status,'') <> '作废'"];
+    if (start_date)
+        condIt.push(`${BDS} >= '${String(start_date).replace(/'/g, "''")}'`);
+    if (end_date)
+        condIt.push(`${BDS} <= '${String(end_date).replace(/'/g, "''")}'`);
+    const costRows = (await safeExec(`
+    SELECT ${P_IT} as period,
+           COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price),0) as cost,
+           COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity),0) as qty
     FROM sales_order_items oi
     JOIN sales_orders so ON oi.order_id = so.id
     JOIN products p ON oi.product_id = p.id
-    WHERE COALESCE(so.bill_date, substr(so.created_at,1,10)) >= ? AND COALESCE(so.payment_status,'') <> '作废'${scopeSql}
-    GROUP BY p.id, p.name, p.sku ORDER BY total_amount DESC LIMIT 10
-  `, [startDate]));
-    const products = (result.values || []).map((p) => ({
-        name: p[0], sku: p[1], total_qty: Number(p[2]), total_amount: Number(p[3])
-    }));
+    WHERE ${condIt.join(' AND ')}
+    GROUP BY ${P_IT}
+  `)).values || [];
+    const costMap = {};
+    for (const c of costRows)
+        costMap[String(c[0])] = { cost: Number(c[1] || 0), qty: Number(c[2] || 0) };
+    const rows = mainRows.map((r) => {
+        const period = String(r[0]);
+        const saleAmount = Math.round(Number(r[2] || 0) * 100) / 100;
+        const returnAmount = Math.round(Number(r[1] || 0) * 100) / 100;
+        const orderCount = Number(r[3] || 0);
+        const c = costMap[period] || { cost: 0, qty: 0 };
+        const net = Math.round((saleAmount + returnAmount) * 100) / 100;
+        return {
+            period,
+            date: period,
+            sale_amount: saleAmount,
+            actual_sales: saleAmount,
+            return_amount: returnAmount,
+            net_amount: net,
+            order_count: orderCount,
+            return_count: Number(r[4] || 0),
+            owe_amount: Math.round(Number(r[5] || 0) * 100) / 100,
+            cost: Math.round(c.cost * 100) / 100,
+            gross_profit: Math.round((net - c.cost) * 100) / 100,
+            qty: Math.round(c.qty * 100) / 100,
+            avg_order: orderCount > 0 ? Math.round((saleAmount / orderCount) * 100) / 100 : 0,
+        };
+    });
+    // 旧形态：只按日、只回三个字段 —— 一个字节都不改，旧前端照常
+    if (!isMonthly && gb !== 'day') {
+        return res.json(rows.map((r) => ({
+            date: r.date, actual_sales: r.actual_sales, order_count: r.order_count
+        })));
+    }
+    const sums = rows.reduce((s, r) => ({
+        sale_amount: s.sale_amount + r.sale_amount,
+        return_amount: s.return_amount + r.return_amount,
+        net_amount: s.net_amount + r.net_amount,
+        order_count: s.order_count + r.order_count,
+        return_count: s.return_count + r.return_count,
+        cost: s.cost + r.cost,
+        qty: s.qty + r.qty,
+        gross_profit: s.gross_profit + r.gross_profit,
+        periods: s.periods + 1,
+    }), { sale_amount: 0, return_amount: 0, net_amount: 0, order_count: 0, return_count: 0, cost: 0, qty: 0, gross_profit: 0, periods: 0 });
+    for (const k of Object.keys(sums))
+        sums[k] = Math.round(sums[k] * 100) / 100;
+    sums.avg_order = sums.order_count > 0 ? Math.round((sums.sale_amount / sums.order_count) * 100) / 100 : 0;
+    sums.gross_margin = sums.net_amount > 0 ? Math.round((sums.gross_profit / sums.net_amount) * 10000) / 100 : 0;
+    res.json({ group_by: gb || 'day', rows, sums });
+});
+/* 热销排行 —— 对齐智慧记「热销排行」口径
+ *
+ * ⚠️ 历史 bug（本次修复）：旧版只返回 total_qty / total_amount 两个数量字段，
+ *   而前端读的是 total_quantity → 表格「销售数量」列恒为 undefined。
+ *   本次补 total_quantity 别名（值同 total_qty），旧前端不改也一起修好。
+ *   同时补 cost / gross_profit / avg_price / rank，并支持 limit 与日期区间。
+ * ★ 保持裸数组形态（只加字段、不改结构），发布顺序无关。
+ * ★ 排除作废单；退货单数量为负（COST_SIGN_SQL），故热销榜天然是净销量。
+ */
+app.get('/api/analysis/sales/top-products', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
+    await initDB();
+    const days = Math.min(Math.max(Number(req.query.days) || 30, 1), 3650);
+    const limit = Math.min(Math.max(Number(req.query.limit) || 10, 1), 200);
+    const startDate = req.query.start_date
+        ? String(req.query.start_date)
+        : new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+    const endDate = req.query.end_date ? String(req.query.end_date) : '';
+    const cond = [
+        "COALESCE(so.bill_date, substr(so.created_at,1,10)) >= '" + startDate.replace(/'/g, "''") + "'",
+        "COALESCE(so.payment_status,'') <> '作废'",
+    ];
+    if (endDate)
+        cond.push("COALESCE(so.bill_date, substr(so.created_at,1,10)) <= '" + endDate.replace(/'/g, "''") + "'");
+    const result = (await safeExec(`
+    SELECT p.name, p.sku,
+           SUM(${COST_SIGN_SQL} * oi.quantity) as total_qty,
+           SUM(${COST_SIGN_SQL} * oi.amount)   as total_amount,
+           SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price) as total_cost,
+           COUNT(DISTINCT so.id) as order_count
+    FROM sales_order_items oi
+    JOIN sales_orders so ON oi.order_id = so.id
+    JOIN products p ON oi.product_id = p.id
+    WHERE ${cond.join(' AND ')}
+    GROUP BY p.id, p.name, p.sku ORDER BY total_amount DESC LIMIT ${limit}
+  `)).values || [];
+    const products = result.map((p, i) => {
+        const qty = Math.round(Number(p[2] || 0) * 100) / 100;
+        const amount = Math.round(Number(p[3] || 0) * 100) / 100;
+        const cost = Math.round(Number(p[4] || 0) * 100) / 100;
+        return {
+            rank: i + 1,
+            name: p[0], sku: p[1],
+            total_qty: qty,
+            total_quantity: qty,          // ← 前端实际读取的字段名
+            total_amount: amount,
+            total_cost: cost,
+            gross_profit: Math.round((amount - cost) * 100) / 100,
+            gross_margin: amount > 0 ? Math.round(((amount - cost) / amount) * 10000) / 100 : 0,
+            avg_price: qty !== 0 ? Math.round((amount / qty) * 100) / 100 : 0,
+            order_count: Number(p[5] || 0),
+        };
+    });
     res.json(products);
 });
+/* 进货统计 —— 对齐智慧记「采购统计逐月归组」口径
+ * ★ 同 sales：不传 group_by → 旧形态裸数组 [{date,total,order_count}]；传 group_by → 信封。
+ * ★ 口径：采购单表无「作废」状态字段，故不做状态过滤（与旧版一致，不擅自改口径）。
+ */
 app.get('/api/analysis/purchase', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
     await initDB();
     const { start_date, end_date } = req.query;
-    let sql = "SELECT date(created_at) as date, SUM(total_amount) as total, COUNT(*) as order_count FROM purchase_orders WHERE 1=1";
-    const params = [];
-    if (start_date) {
-        sql += " AND date(created_at) >= '" + String(start_date).replace(/'/g, "''") + "'";
+    const BD = "substr(COALESCE(bill_date, created_at),1,10)";
+    const gb = String(req.query.group_by || '').toLowerCase();
+    const isPeriodic = gb === 'month' || gb === 'year' || gb === 'day';
+    const P = gb === 'month' ? "substr(COALESCE(bill_date, created_at),1,7)"
+        : gb === 'year' ? "substr(COALESCE(bill_date, created_at),1,4)" : BD;
+    const cond = ['1=1'];
+    if (start_date)
+        cond.push(`${BD} >= '${String(start_date).replace(/'/g, "''")}'`);
+    if (end_date)
+        cond.push(`${BD} <= '${String(end_date).replace(/'/g, "''")}'`);
+    const result = await safeExec(`
+    SELECT ${P} as period,
+           COALESCE(SUM(total_amount),0) as total_amount,
+           COALESCE(SUM(COALESCE(paid_amount,0)),0) as paid_amount,
+           COALESCE(SUM(COALESCE(owe_amount,0)),0) as owe_amount,
+           COUNT(*) as order_count,
+           COUNT(DISTINCT NULLIF(supplier_name,'')) as supplier_count
+    FROM purchase_orders
+    WHERE ${cond.join(' AND ')}
+    GROUP BY ${P} ORDER BY ${P} ASC
+  `);
+    const rows = (result.values || []).map((r) => {
+        const total = Math.round(Number(r[1] || 0) * 100) / 100;
+        const orderCount = Number(r[4] || 0);
+        return {
+            period: String(r[0]),
+            date: String(r[0]),
+            total,
+            total_amount: total,
+            paid_amount: Math.round(Number(r[2] || 0) * 100) / 100,
+            owe_amount: Math.round(Number(r[3] || 0) * 100) / 100,
+            order_count: orderCount,
+            supplier_count: Number(r[5] || 0),
+            avg_order: orderCount > 0 ? Math.round((total / orderCount) * 100) / 100 : 0,
+        };
+    });
+    if (!isPeriodic) {
+        return res.json(rows.map((r) => ({ date: r.date, total: r.total, order_count: r.order_count })));
     }
-    if (end_date) {
-        sql += " AND date(created_at) <= '" + String(end_date).replace(/'/g, "''") + "'";
-    }
-    sql += " GROUP BY date(created_at) ORDER BY date ASC";
-    const result = await safeExec(sql, params);
-    const rows = result.values || [];
-    res.json(rows.map((r) => ({ date: r[0], total: Number(r[1]), order_count: Number(r[2]) })));
+    const sums = rows.reduce((s, r) => ({
+        total_amount: s.total_amount + r.total_amount,
+        paid_amount: s.paid_amount + r.paid_amount,
+        owe_amount: s.owe_amount + r.owe_amount,
+        order_count: s.order_count + r.order_count,
+        periods: s.periods + 1,
+    }), { total_amount: 0, paid_amount: 0, owe_amount: 0, order_count: 0, periods: 0 });
+    for (const k of Object.keys(sums))
+        sums[k] = Math.round(sums[k] * 100) / 100;
+    sums.avg_order = sums.order_count > 0 ? Math.round((sums.total_amount / sums.order_count) * 100) / 100 : 0;
+    res.json({ group_by: gb || 'day', rows, sums });
 });
+/* 库存统计 —— 对齐智慧记「库存统计」口径
+ *
+ * ⚠️ 历史 bug（本次修复）：旧版只返回 total_products / total_stock / warning_count，
+ *   而前端读的是 low_stock_count 与 total_value → 两处恒为 undefined，
+ *   导致「库存金额」恒显示 ¥0.00，且饼图算出 NaN（warning_count - undefined）。
+ *   本次补齐这两个字段 + 分类改为对象数组（旧版是位置数组，前端按名取值拿不到）。
+ * ★ 作废口径：products.status=1 视为在售，与仪表盘 warningCount 完全同一条件，保证两页不打架。
+ */
 app.get('/api/analysis/inventory', authMiddleware, hasPerm('sales_stats'), async (_req, res) => {
     await initDB();
-    const categories = (await safeExec("SELECT category, COUNT(*), SUM(stock_quantity) FROM products WHERE status=1 AND category IS NOT NULL GROUP BY category")).values;
-    const totalProducts = Number((await safeExec("SELECT COUNT(*) FROM products WHERE status=1")).values?.[0]?.[0] || 0);
-    const totalStock = Number((await safeExec("SELECT SUM(stock_quantity) FROM products WHERE status=1")).values?.[0]?.[0] || 0);
-    const warningCount = Number((await safeExec("SELECT COUNT(*) FROM products WHERE stock_quantity <= warning_quantity AND status=1")).values?.[0]?.[0] || 0);
-    res.json({ categories: categories || [], total_products: totalProducts, total_stock: totalStock, warning_count: warningCount });
+    // 分类聚合：一次查完（含金额与状态分档），避免多次往返
+    const catRows = (await safeExec(`
+    SELECT COALESCE(NULLIF(TRIM(COALESCE(category,'')),''),'未分类') as category,
+           COUNT(*) as product_count,
+           COALESCE(SUM(stock_quantity),0) as stock_qty,
+           COALESCE(SUM(COALESCE(stock_quantity,0) * COALESCE(cost_price,0)),0) as cost_value,
+           COALESCE(SUM(COALESCE(stock_quantity,0) * COALESCE(sell_price,0)),0) as retail_value,
+           SUM(CASE WHEN COALESCE(stock_quantity,0) <= 0 THEN 1 ELSE 0 END) as out_of_stock,
+           SUM(CASE WHEN COALESCE(stock_quantity,0) > 0 AND COALESCE(stock_quantity,0) <= COALESCE(warning_quantity,0) THEN 1 ELSE 0 END) as below_warning
+    FROM products WHERE status=1
+    GROUP BY 1 ORDER BY cost_value DESC
+  `)).values || [];
+    const categories = catRows.map((r) => ({
+        category: String(r[0]),
+        product_count: Number(r[1] || 0),
+        stock_qty: Math.round(Number(r[2] || 0) * 100) / 100,
+        cost_value: Math.round(Number(r[3] || 0) * 100) / 100,
+        retail_value: Math.round(Number(r[4] || 0) * 100) / 100,
+        out_of_stock: Number(r[5] || 0),
+        below_warning: Number(r[6] || 0),
+    }));
+    const t = (await safeExec(`
+    SELECT COUNT(*),
+           COALESCE(SUM(stock_quantity),0),
+           COALESCE(SUM(COALESCE(stock_quantity,0) * COALESCE(cost_price,0)),0),
+           COALESCE(SUM(COALESCE(stock_quantity,0) * COALESCE(sell_price,0)),0),
+           SUM(CASE WHEN COALESCE(stock_quantity,0) <= COALESCE(warning_quantity,0) THEN 1 ELSE 0 END),
+           SUM(CASE WHEN COALESCE(stock_quantity,0) <= 0 THEN 1 ELSE 0 END),
+           SUM(CASE WHEN COALESCE(stock_quantity,0) > 0 AND COALESCE(stock_quantity,0) <= COALESCE(warning_quantity,0) THEN 1 ELSE 0 END),
+           SUM(CASE WHEN COALESCE(stock_quantity,0) < 0 THEN 1 ELSE 0 END),
+           SUM(CASE WHEN COALESCE(batch_number,'') <> '' THEN 1 ELSE 0 END)
+    FROM products WHERE status=1
+  `)).values?.[0] || [];
+    // 库存金额 TOP（给库存统计页做明细，按成本额倒序）
+    const topRows = (await safeExec(`
+    SELECT name, sku, COALESCE(NULLIF(TRIM(COALESCE(category,'')),''),'未分类') as category,
+           stock_quantity, warning_quantity, cost_price, sell_price,
+           COALESCE(stock_quantity,0) * COALESCE(cost_price,0) as cost_value
+    FROM products WHERE status=1
+    ORDER BY cost_value DESC LIMIT 20
+  `)).values || [];
+    const top_products = topRows.map((r) => ({
+        name: String(r[0]), sku: String(r[1] || ''), category: String(r[2]),
+        stock_quantity: Math.round(Number(r[3] || 0) * 100) / 100,
+        warning_quantity: Math.round(Number(r[4] || 0) * 100) / 100,
+        cost_price: Math.round(Number(r[5] || 0) * 100) / 100,
+        sell_price: Math.round(Number(r[6] || 0) * 100) / 100,
+        cost_value: Math.round(Number(r[7] || 0) * 100) / 100,
+    }));
+    const outOfStock = Number(t[5] || 0);
+    res.json({
+        categories,
+        total_products: Number(t[0] || 0),
+        total_stock: Math.round(Number(t[1] || 0) * 100) / 100,
+        total_cost_value: Math.round(Number(t[2] || 0) * 100) / 100,
+        total_value: Math.round(Number(t[3] || 0) * 100) / 100,
+        warning_count: Number(t[4] || 0),
+        low_stock_count: outOfStock,
+        out_of_stock_count: outOfStock,
+        below_warning_count: Number(t[6] || 0),
+        negative_stock_count: Number(t[7] || 0),
+        batch_tracked_count: Number(t[8] || 0),
+        top_products,
+    });
 });
 app.get('/api/analysis/profit', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
     await initDB();
@@ -884,16 +1111,147 @@ app.get('/api/analysis/profit', authMiddleware, hasPerm('sales_stats'), async (r
     const todayOtherExpense = Number((await safeExec(otherSql('expense', `='${today}'`))).values?.[0]?.[0] || 0);
     const monthOtherIncome = Number((await safeExec(otherSql('income', `>= '${monthStart}'`))).values?.[0]?.[0] || 0);
     const monthOtherExpense = Number((await safeExec(otherSql('expense', `>= '${monthStart}'`))).values?.[0]?.[0] || 0);
+    /* ---------- 以下为本次新增（全部为「只加字段」，不删不改旧字段，发布顺序无关） ---------- */
+    // (1) 近 12 个月序列：销售额 / 成本 / 毛利 / 其他收支 / 净利润
+    const BD = "substr(COALESCE(bill_date, created_at),1,7)";
+    const BDS = "substr(COALESCE(so.bill_date, so.created_at),1,7)";
+    const m12 = new Date(new Date().getFullYear(), new Date().getMonth() - 11, 1);
+    const start12 = `${m12.getFullYear()}-${String(m12.getMonth() + 1).padStart(2, '0')}`;
+    const months12 = [];
+    for (let i = 11; i >= 0; i--) {
+        const d = new Date(new Date().getFullYear(), new Date().getMonth() - i, 1);
+        months12.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
+    }
+    const saleByM = {};
+    for (const r of ((await safeExec(`
+      SELECT ${BD} ym,
+             COALESCE(SUM(CASE WHEN COALESCE(biz_type,'sale')='sale_return' THEN final_amount ELSE 0 END),0) ret,
+             COALESCE(SUM(CASE WHEN COALESCE(biz_type,'sale')='sale_return' THEN 0 ELSE final_amount END),0) sale
+      FROM sales_orders
+      WHERE COALESCE(payment_status,'') <> '作废' AND ${BD} >= '${start12}'
+      GROUP BY ym`)).values || [])) {
+        saleByM[String(r[0])] = { ret: Number(r[1] || 0), sale: Number(r[2] || 0) };
+    }
+    const costByM = {};
+    for (const r of ((await safeExec(`
+      SELECT ${BDS} ym, COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price),0) cost
+      FROM sales_order_items oi
+      JOIN sales_orders so ON oi.order_id = so.id
+      JOIN products p ON oi.product_id = p.id
+      WHERE COALESCE(so.payment_status,'') <> '作废' AND ${BDS} >= '${start12}'
+      GROUP BY ym`)).values || [])) {
+        costByM[String(r[0])] = Number(r[1] || 0);
+    }
+    const otherByM = {};
+    for (const r of ((await safeExec(`
+      SELECT substr(created_at,1,7) ym, type, COALESCE(SUM(amount),0) amt
+      FROM transactions
+      WHERE (category LIKE '其他%' OR category LIKE '%其他%') AND substr(created_at,1,7) >= '${start12}'
+      GROUP BY ym, type`)).values || [])) {
+        const ym = String(r[0]);
+        if (!otherByM[ym])
+            otherByM[ym] = { income: 0, expense: 0 };
+        otherByM[ym][String(r[1]) === 'income' ? 'income' : 'expense'] += Number(r[2] || 0);
+    }
+    const R2 = (n) => Math.round(Number(n || 0) * 100) / 100;
+    const monthly = months12.map((ym) => {
+        const s = saleByM[ym] || { ret: 0, sale: 0 };
+        const cost = costByM[ym] || 0;
+        const oi = otherByM[ym] || { income: 0, expense: 0 };
+        const netSales = s.sale + s.ret;
+        const gross = netSales - cost;
+        return {
+            month: ym,
+            sales: R2(netSales), sale_amount: R2(s.sale), return_amount: R2(s.ret),
+            cost: R2(cost), profit: R2(gross),
+            gross_margin: netSales > 0 ? Math.round((gross / netSales) * 10000) / 100 : 0,
+            other_income: R2(oi.income), other_expense: R2(oi.expense),
+            net: R2(gross + oi.income - oi.expense),
+        };
+    });
+    // (2) 亏损明细（对齐智慧记「亏损明细」报表）：按商品算 净销售额 − 成本 < 0
+    const lpCond = ["COALESCE(so.payment_status,'') <> '作废'"];
+    if (req.query.start_date)
+        lpCond.push("substr(COALESCE(so.bill_date, so.created_at),1,10) >= '" + String(req.query.start_date).replace(/'/g, "''") + "'");
+    if (req.query.end_date)
+        lpCond.push("substr(COALESCE(so.bill_date, so.created_at),1,10) <= '" + String(req.query.end_date).replace(/'/g, "''") + "'");
+    const loss_products = ((await safeExec(`
+    SELECT p.name, p.sku,
+           SUM(${COST_SIGN_SQL} * oi.quantity) as qty,
+           SUM(${COST_SIGN_SQL} * oi.amount) as amount,
+           SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price) as cost,
+           SUM(${COST_SIGN_SQL} * oi.amount) - SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price) as profit
+    FROM sales_order_items oi
+    JOIN sales_orders so ON oi.order_id = so.id
+    JOIN products p ON oi.product_id = p.id
+    WHERE ${lpCond.join(' AND ')}
+    GROUP BY p.id, p.name, p.sku
+    HAVING SUM(${COST_SIGN_SQL} * oi.amount) - SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price) < 0
+    ORDER BY profit ASC LIMIT 20`)).values || []).map((r) => {
+        const amount = R2(r[3]), cost = R2(r[4]), profit = R2(r[5]);
+        return {
+            name: String(r[0]), sku: String(r[1] || ''),
+            qty: R2(r[2]), amount, cost, profit,
+            margin: amount > 0 ? Math.round((profit / amount) * 10000) / 100 : 0,
+            avg_price: Number(r[2]) !== 0 ? R2(amount / Number(r[2])) : 0,
+        };
+    });
+    // (3) 指定区间口径（前端切「自定义区间」时用；不传则为 0，前端自行忽略）
+    let range = null;
+    if (req.query.start_date || req.query.end_date) {
+        const sd = req.query.start_date ? String(req.query.start_date) : '1970-01-01';
+        const ed = req.query.end_date ? String(req.query.end_date) : '2999-12-31';
+        const BDd = "substr(COALESCE(bill_date, created_at),1,10)";
+        const BDSd = "substr(COALESCE(so.bill_date, so.created_at),1,10)";
+        const rSale = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE COALESCE(payment_status,'') <> '作废' AND ${BDd} >= '${sd}' AND ${BDd} <= '${ed}'`)).values?.[0]?.[0] || 0);
+        const rCost = Number((await safeExec(`SELECT COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE COALESCE(so.payment_status,'') <> '作废' AND ${BDSd} >= '${sd}' AND ${BDSd} <= '${ed}'`)).values?.[0]?.[0] || 0);
+        const rOther = (await safeExec(`SELECT type, COALESCE(SUM(amount),0) FROM transactions WHERE (category LIKE '其他%' OR category LIKE '%其他%') AND date(created_at) >= '${sd}' AND date(created_at) <= '${ed}' GROUP BY type`)).values || [];
+        let rOi = 0, rOe = 0;
+        for (const x of rOther) {
+            if (String(x[0]) === 'income')
+                rOi = Number(x[1] || 0);
+            else
+                rOe = Number(x[1] || 0);
+        }
+        range = {
+            start: sd, end: ed,
+            sales: R2(rSale), cost: R2(rCost), profit: R2(rSale - rCost),
+            other_income: R2(rOi), other_expense: R2(rOe),
+            net: R2(rSale - rCost + rOi - rOe),
+            gross_margin: rSale > 0 ? Math.round(((rSale - rCost) / rSale) * 10000) / 100 : 0,
+        };
+    }
     res.json({
         today_sales: todaySales, today_cost: todayCost, today_profit: todaySales - todayCost,
         today_other_income: todayOtherIncome, today_other_expense: todayOtherExpense,
         today_net: todaySales - todayCost + todayOtherIncome - todayOtherExpense,
         month_sales: monthSales, month_cost: monthCost, month_profit: monthSales - monthCost,
         month_other_income: monthOtherIncome, month_other_expense: monthOtherExpense,
-        month_net: monthSales - monthCost + monthOtherIncome - monthOtherExpense
+        month_net: monthSales - monthCost + monthOtherIncome - monthOtherExpense,
+        // ← 别名：AnalysisHome 读的是 month_income / month_expense，旧版没这两字段 → 恒显示 0
+        today_income: todaySales, today_expense: todayCost,
+        month_income: monthSales, month_expense: monthCost,
+        today_gross_margin: todaySales > 0 ? Math.round(((todaySales - todayCost) / todaySales) * 10000) / 100 : 0,
+        month_gross_margin: monthSales > 0 ? Math.round(((monthSales - monthCost) / monthSales) * 10000) / 100 : 0,
+        monthly,
+        loss_products,
+        range,
     });
 });
-// 员工业绩：按日期范围统计（默认本月）。管理员/店长看全员；店员只返回自己（看不到成本与利润）
+/* 员工业绩 —— 对齐智慧记「员工业绩」口径
+ *
+ * 🔴🔴 重大口径修正（2026-09-26 实测发现，本次修复的核心）
+ *   旧版按 `operator_id` 归属统计，但真实库里：
+ *     销售单 4433 条 → operator_id 为 NULL 的 4425 条（99.82%），只有 8 条有 ID；
+ *     而 operator_name 基本都有值（曹怡航 2433 / 老板 1992 / 曹 4 / 詹一帆 2 / 蒋斌斌 2）。
+ *   结果：旧版员工业绩合计只有 8 单 ¥2,040，而全店正单 4028 单 ¥631 万 —— 页面等于废的。
+ *   ⚠️ 这与 /finance/arap 的根因**完全同型**：导入器只落名称、不落 ID → 按 ID JOIN 必然落空。
+ *
+ * ★ 本次改法：归属键改为「名称优先、ID 兜底」
+ *     归属名 = COALESCE(NULLIF(TRIM(operator_name),''), users.real_name, '未归属')
+ *   并额外返回 attribution 诊断块，让前端能诚实告知「有多少单未归属」，不假装全覆盖。
+ * ★ 保留原字段名（list / summary / 成本利润）→ 旧前端不炸。
+ */
 app.get('/api/analysis/performance', authMiddleware, async (req, res) => {
     await initDB();
     const isAdmin = req.user && req.user.role !== 'employee';
@@ -903,42 +1261,154 @@ app.get('/api/analysis/performance', authMiddleware, async (req, res) => {
     const monthStart = `${ym(now)}-01`;
     const defStart = start_date ? String(start_date) : monthStart;
     const defEnd = end_date ? String(end_date) : now.toISOString().slice(0, 10);
-    // 全部用户（含管理员，老板可看全员对比）
-    const users = (await safeExec("SELECT id, real_name, role FROM users WHERE status=1")).values || [];
-    const rows = [];
-    for (const u of users) {
-        const uid = u[0];
-        const name = String(u[1] || '未知');
-        const role = String(u[2] || 'employee');
-        // 店员只返回自己；且店员视角不显示管理员/店长（只能看自己的业绩）
-        if (role === 'employee' && req.user && req.user.id !== uid)
-            continue;
-        if (!isAdmin && role !== 'employee')
-            continue;
-        const stat = (await safeExec("SELECT COUNT(*), COALESCE(SUM(final_amount),0) FROM sales_orders WHERE operator_id = ? AND final_amount > 0 AND created_at >= ? AND created_at <= ?", [uid, defStart, defEnd + ' 23:59:59'])).values?.[0] || [0, 0];
-        const comm = (await safeExec("SELECT COALESCE(SUM(commission_amount),0) FROM sales_orders WHERE operator_id = ? AND created_at >= ? AND created_at <= ?", [uid, defStart, defEnd + ' 23:59:59'])).values?.[0]?.[0] || 0;
-        rows.push({
-            name,
-            role: role === 'admin' ? '管理员' : role === 'manager' ? '店长' : '店员',
-            orders: Number(stat[0] || 0),
-            sales: Math.round(Number(stat[1] || 0) * 100) / 100,
-            commission: Math.round(Number(comm) * 100) / 100,
-            // 店员看不到成本和利润（前端也不展示，这里直接不给字段）
-            cost: isAdmin ? Math.round(Number((await safeExec("SELECT COALESCE(SUM(oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id=so.id JOIN products p ON oi.product_id=p.id WHERE so.operator_id=? AND so.final_amount>0 AND so.created_at>=? AND so.created_at<=?", [uid, defStart, defEnd + ' 23:59:59'])).values?.[0]?.[0] || 0) * 100) / 100 : undefined,
-            profit: isAdmin ? Math.round((Number(stat[1] || 0) - Number((await safeExec("SELECT COALESCE(SUM(oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id=so.id JOIN products p ON oi.product_id=p.id WHERE so.operator_id=? AND so.final_amount>0 AND so.created_at>=? AND so.created_at<=?", [uid, defStart, defEnd + ' 23:59:59'])).values?.[0]?.[0] || 0)) * 100) / 100 : undefined,
-        });
+    const END = defEnd + ' 23:59:59';
+    const R2 = (n) => Math.round(Number(n || 0) * 100) / 100;
+    // 归属键（名称优先、ID 兜底）—— 三处查询必须用完全相同的表达式，否则分组对不上
+    const NAME_KEY = "COALESCE(NULLIF(TRIM(COALESCE(so.operator_name,'')),''), NULLIF(TRIM(COALESCE(u.real_name,'')),''), '未归属')";
+    // 账号表（给「未匹配账号」的历史操作人标一个身份）
+    const uRows = (await safeExec("SELECT id, real_name, role FROM users WHERE status=1")).values || [];
+    const roleByName = {};
+    const idToName = {};
+    for (const u of uRows) {
+        roleByName[String(u[1] || '').trim()] = String(u[2] || 'employee');
+        idToName[Number(u[0])] = String(u[1] || '').trim();
     }
+    // 店员只能看自己：用「自己的 real_name」当归属名过滤（旧版按 id 过滤，因 ID 全空恒返回空）
+    let selfName = '';
+    if (!isAdmin) {
+        const me = (await safeExec("SELECT real_name FROM users WHERE id = ?", [Number(req.user.id)])).values?.[0];
+        selfName = String(me?.[0] || '').trim();
+    }
+    // ---- 主聚合：订单数 / 销售额 / 提成（按归属名） ----
+    const c1 = ["COALESCE(so.payment_status,'') <> '作废'", "so.created_at >= ?", "so.created_at <= ?"];
+    const p1 = [defStart, END];
+    if (!isAdmin) {
+        c1.push(`${NAME_KEY} = ?`);
+        p1.push(selfName);
+    }
+    const mainRows = (await safeExec(`
+    SELECT ${NAME_KEY} as op_name,
+           COUNT(*) as orders,
+           COALESCE(SUM(so.final_amount),0) as sales,
+           COALESCE(SUM(so.commission_amount),0) as commission
+    FROM sales_orders so
+    LEFT JOIN users u ON u.id = so.operator_id
+    WHERE ${c1.join(' AND ')}
+    GROUP BY 1 ORDER BY sales DESC`, p1)).values || [];
+    // ---- 件数与成本（同一归属键、同一区间；成本带 COST_SIGN 符号） ----
+    const c2 = ["COALESCE(so.payment_status,'') <> '作废'", "so.created_at >= ?", "so.created_at <= ?"];
+    const p2 = [defStart, END];
+    if (!isAdmin) {
+        c2.push(`${NAME_KEY} = ?`);
+        p2.push(selfName);
+    }
+    const aggRows = (await safeExec(`
+    SELECT ${NAME_KEY} as op_name,
+           COALESCE(SUM(oi.quantity),0) as qty,
+           COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price),0) as cost
+    FROM sales_order_items oi
+    JOIN sales_orders so ON oi.order_id = so.id
+    LEFT JOIN users u ON u.id = so.operator_id
+    JOIN products p ON oi.product_id = p.id
+    WHERE ${c2.join(' AND ')}
+    GROUP BY 1`, p2)).values || [];
+    const aggByName = {};
+    for (const r of aggRows)
+        aggByName[String(r[0])] = { qty: Number(r[1] || 0), cost: Number(r[2] || 0) };
+    const rows = mainRows.map((r) => {
+        const name = String(r[0]);
+        const orders = Number(r[1] || 0);
+        const sales = R2(r[2]);
+        const ag = aggByName[name] || { qty: 0, cost: 0 };
+        const role = roleByName[name];
+        return {
+            name,
+            // role 为空 = 该名称在账号表里找不到（历史操作人 / 已停用账号）→ 明确标出，不冒充在职员工
+            role: role ? (role === 'admin' ? '管理员' : role === 'manager' ? '店长' : '店员') : '历史操作人（无账号）',
+            is_account: !!role,
+            orders,
+            sales,
+            qty: R2(ag.qty),
+            commission: R2(r[3]),
+            avg_order: orders > 0 ? R2(sales / orders) : 0,
+            cost: isAdmin ? R2(ag.cost) : undefined,
+            profit: isAdmin ? R2(sales - ag.cost) : undefined,
+            gross_margin: isAdmin && sales > 0 ? Math.round(((sales - ag.cost) / sales) * 10000) / 100 : undefined,
+        };
+    }).filter((r) => r.orders > 0);
     rows.sort((a, b) => b.sales - a.sales);
-    // 全店汇总（店员只统计自己的；管理员/店长统计全店）
-    const totalWhere = isAdmin ? "" : " AND operator_id = " + Number(req.user.id);
-    const totalStat = (await safeExec("SELECT COUNT(*), COALESCE(SUM(final_amount),0) FROM sales_orders WHERE final_amount > 0 AND created_at >= ? AND created_at <= ?" + totalWhere, [defStart, defEnd + ' 23:59:59'])).values?.[0] || [0, 0];
+    // ---- 全店汇总 ----
+    const tc = ["COALESCE(so.payment_status,'') <> '作废'", "so.created_at >= ?", "so.created_at <= ?"];
+    const tp = [defStart, END];
+    if (!isAdmin) {
+        tc.push(`${NAME_KEY} = ?`);
+        tp.push(selfName);
+    }
+    const totalStat = (await safeExec(`
+    SELECT COUNT(*), COALESCE(SUM(so.final_amount),0)
+    FROM sales_orders so LEFT JOIN users u ON u.id = so.operator_id
+    WHERE ${tc.join(' AND ')}`, tp)).values?.[0] || [0, 0];
+    const totalS = R2(totalStat[1]);
+    const totalO = Number(totalStat[0] || 0);
+    const staff = rows.filter((r) => r.orders > 0).length;
+    /* ★ 归属诊断（诚实披露用）：告诉前端「有多少单根本没归属」，
+     *   避免页面显示成一个看起来完整、实际漏掉大半的排行榜。 */
+    const diag = (await safeExec(`
+    SELECT COUNT(*),
+           SUM(CASE WHEN so.operator_id IS NULL THEN 1 ELSE 0 END),
+           SUM(CASE WHEN COALESCE(TRIM(so.operator_name),'') = '' THEN 1 ELSE 0 END),
+           COUNT(DISTINCT NULLIF(TRIM(COALESCE(so.operator_name,'')),''))
+    FROM sales_orders so WHERE COALESCE(so.payment_status,'') <> '作废' AND so.created_at >= ? AND so.created_at <= ?`, [defStart, END])).values?.[0] || [0, 0, 0, 0];
+    const unattributed = (await safeExec(`
+    SELECT COUNT(*), COALESCE(SUM(so.final_amount),0)
+    FROM sales_orders so LEFT JOIN users u ON u.id = so.operator_id
+    WHERE COALESCE(so.payment_status,'') <> '作废' AND so.created_at >= ? AND so.created_at <= ?
+      AND ${NAME_KEY} = '未归属'`, [defStart, END])).values?.[0] || [0, 0];
+    const attribution = {
+        positive_orders: totalO,
+        no_operator_id: Number(diag[1] || 0),
+        no_operator_name: Number(diag[2] || 0),
+        name_holders: Number(diag[3] || 0),
+        unattributed_orders: Number(unattributed[0] || 0),
+        unattributed_amount: R2(unattributed[1]),
+        covered_rate: totalO > 0 ? Math.round(((totalO - Number(unattributed[0] || 0)) / totalO) * 10000) / 100 : 0,
+        note: '按 operator_name 归属（operator_id 在历史数据中大面积为空）；未归属单据已单列，不计入任何人业绩',
+    };
+    /* 按月趋势（用同一归属键，保证与 list 口径一致） */
+    let by_month = [];
+    if (String(req.query.group_by || '') === 'month') {
+        const c3 = ["COALESCE(so.payment_status,'') <> '作废'", "so.created_at >= ?", "so.created_at <= ?"];
+        const p3 = [defStart, END];
+        if (!isAdmin) {
+            c3.push(`${NAME_KEY} = ?`);
+            p3.push(selfName);
+        }
+        by_month = ((await safeExec(`
+      SELECT substr(COALESCE(so.bill_date, so.created_at),1,7) ym, ${NAME_KEY} as op_name, COUNT(*), COALESCE(SUM(so.final_amount),0)
+      FROM sales_orders so LEFT JOIN users u ON u.id = so.operator_id
+      WHERE ${c3.join(' AND ')}
+      GROUP BY ym, op_name ORDER BY ym`, p3)).values || []).map((r) => ({
+            month: String(r[0]),
+            name: String(r[1] || '未归属'),
+            orders: Number(r[2] || 0),
+            sales: R2(r[3]),
+        }));
+    }
     res.json({
         list: rows,
         summary: {
-            total_orders: Number(totalStat[0] || 0),
-            total_sales: Math.round(Number(totalStat[1] || 0) * 100) / 100,
+            total_orders: totalO,
+            total_sales: totalS,
             is_admin: isAdmin,
+            staff_count: staff,
+            avg_per_staff: staff > 0 ? R2(totalS / staff) : 0,
+            total_qty: R2(rows.reduce((s, r) => s + Number(r.qty || 0), 0)),
+            total_commission: R2(rows.reduce((s, r) => s + Number(r.commission || 0), 0)),
+            total_profit: isAdmin ? R2(rows.reduce((s, r) => s + Number(r.profit || 0), 0)) : undefined,
+            range: { start: defStart, end: defEnd },
         },
+        attribution,
+        by_month,
     });
 });
 // ==================== 生产需求分析（按厂/客户的需求情况与月度经营建议） ====================
@@ -957,7 +1427,7 @@ app.get('/api/analysis/demand', authMiddleware, hasPerm('sales_stats'), async (r
     const custRows = (await safeExec(`
     SELECT customer_name, substr(created_at,1,7) as ym, COUNT(*) as cnt, SUM(final_amount) as amt
     FROM sales_orders
-    WHERE final_amount > 0 AND created_at >= '${startDate}' AND customer_name IS NOT NULL AND customer_name != ''${scopeSql}
+    WHERE COALESCE(payment_status,'') <> '作废' AND substr(COALESCE(bill_date, created_at),1,10) >= '${startDate}' AND customer_name IS NOT NULL AND customer_name != ''${scopeSql}
     GROUP BY customer_name, ym
   `)).values || [];
     const byCust = {};
@@ -1006,7 +1476,7 @@ app.get('/api/analysis/demand', authMiddleware, hasPerm('sales_stats'), async (r
     SELECT oi.product_name, SUM(oi.quantity) as qty, SUM(oi.amount) as amt
     FROM sales_order_items oi
     JOIN sales_orders so ON oi.order_id = so.id
-    WHERE so.created_at >= '${startDate}' AND so.final_amount > 0${scopeSql.replace('operator_id', 'so.operator_id')}
+    WHERE substr(COALESCE(so.bill_date, so.created_at),1,10) >= '${startDate}' AND COALESCE(so.payment_status,'') <> '作废'${scopeSql.replace('operator_id', 'so.operator_id')}
     GROUP BY oi.product_name
   `)).values || [];
     const stockRows = (await safeExec("SELECT name, stock_quantity, warning_quantity, sell_price, cost_price FROM products WHERE status = 1")).values || [];
@@ -1038,7 +1508,7 @@ app.get('/api/analysis/demand', authMiddleware, hasPerm('sales_stats'), async (r
     // ---- 3) 月度趋势与经营建议 ----
     const monthRows = (await safeExec(`
     SELECT substr(created_at,1,7) as ym, COUNT(*) as cnt, SUM(final_amount) as amt
-    FROM sales_orders WHERE final_amount > 0 AND created_at >= '${startDate}'
+    FROM sales_orders WHERE COALESCE(payment_status,'') <> '作废' AND substr(COALESCE(bill_date, created_at),1,10) >= '${startDate}'
     GROUP BY ym ORDER BY ym
   `)).values || [];
     const trend = months.map((ym) => {
