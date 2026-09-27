@@ -194,7 +194,7 @@ function generateOrderNumber(prefix) {
 }
 const app = express();
 app.use(helmet());
-app.use(cors());
+app.use(cors({ exposedHeaders: ['X-Sensitive-Filtered'] }));
 app.use(morgan('dev'));
 app.use(express.json());
 // ==================== 权限体系 ====================
@@ -267,13 +267,111 @@ const checkSensitivePerm = (category, permId) => {
     };
 };
 
-// 过滤敏感数据（根据权限返回 null 或脱敏值）
+// 过滤敏感数据（根据权限返回 null 或脱敏值）—— 单字段版（保留，供逐字段调用）
 const filterSensitiveData = (data, user, category, field) => {
     if (isAdminUser(user.role)) return data;
     const sensitivePerms = JSON.parse(user.sensitive_permissions || '{}');
     if (sensitivePerms[category]?.includes(field)) return data;
     return null;
 };
+
+/* ==================== 敏感字段统一脱敏：成本 / 毛利 ====================
+ * 【可见性规则】（与前端 src/utils/perms.ts 的 canSeeCost / canSeeProfit 同源，两端一致）
+ *   · 成本类字段 → admin / manager，或 sensitive_permissions.price 含 'cost_price'
+ *   · 利润类字段 → admin / manager，或 sensitive_permissions.price 含 'profit'
+ *   · 销售额 / 单数 / 欠款 / 库存数量 / 零售额 → 全店可见（沿用既有"数据全店可见"决策）
+ *
+ * 【为什么用全局响应脱敏，而不是逐个 handler 过滤】
+ *   本项目历史上的真实缺陷正是"同一条规则只有部分接口落实"（/analysis/purchase|demand|performance
+ *   做了过滤，另外 6 个接口漏了）。全局出口脱敏 ⇒ 新增接口 / 新增字段自动受保护，不会再漏。
+ *
+ * 【为什么置 null 而不是删键】
+ *   老前端拿到 undefined 会抛错或渲染成 ¥0.00；置 null + 前端按权限隐藏，才既安全又不会误导。
+ *   页面必须用 canSeeCost/canSeeProfit 判断后隐藏，否则会显示成"看起来是真的 0"。
+ */
+const KEY_COST = /cost/i;
+const KEY_PROFIT = /(profit|margin)/i;
+/* ★ 成本"派生字段"：名字里没有 cost，但值 = 数量 × 成本价，同样会泄露成本。
+ * 例：/analysis/demand 的 est_amount = 建议补货 × (cost_price || sell_price)
+ *     /analysis/demand 的 suggested_purchase_amount 同理
+ * 用**精确键名白名单**而不是正则：正则 "est_amount" 会误伤 month_est_amount（销售折算，非成本）。
+ * ⚠️ 新增任何"成本×数量"类派生字段时，必须同步登记到这里（或改名带上 cost）。 */
+const COST_DERIVED_KEYS = new Set(['est_amount', 'suggested_purchase_amount']);
+
+function sensitiveFlags(user) {
+    if (!user) return { cost: false, profit: false };
+    const admin = isAdminUser(user.role);
+    let price = [];
+    try {
+        const sp = typeof user.sensitive_permissions === 'string'
+            ? JSON.parse(user.sensitive_permissions || '{}')
+            : (user.sensitive_permissions || {});
+        price = Array.isArray(sp?.price) ? sp.price : [];
+    } catch { price = []; }
+    return {
+        cost: admin || price.includes('cost_price'),
+        profit: admin || price.includes('profit'),
+    };
+}
+
+function scrubSensitive(payload, flags, seen) {
+    if (payload === null || payload === undefined) return payload;
+    if (typeof payload !== 'object') return payload;
+    if (payload instanceof Date) return payload;
+    if (seen.has(payload)) return payload; // 防循环引用
+    seen.add(payload);
+    if (Array.isArray(payload)) return payload.map((v) => scrubSensitive(v, flags, seen));
+    const out = {};
+    for (const k of Object.keys(payload)) {
+        if (!flags.cost && (KEY_COST.test(k) || COST_DERIVED_KEYS.has(k))) { out[k] = null; continue; }
+        if (!flags.profit && KEY_PROFIT.test(k)) { out[k] = null; continue; }
+        out[k] = scrubSensitive(payload[k], flags, seen);
+    }
+    return out;
+}
+
+// 全局出口脱敏器：注册在业务路由之前，覆盖全部接口（含未来新增）
+// 同时写 X-Sensitive-Filtered 响应头：数组形态的响应没法带 body 标记，前端靠这个头判断
+// （配合 cors({ exposedHeaders }) 才能在跨域下被前端读到）
+app.use((req, res, next) => {
+    const orig = res.json.bind(res);
+    res.json = (payload) => {
+        try {
+            if (req.user) { // 未登录请求（login/verify）没有敏感数据，不加工、不加标记
+                const flags = sensitiveFlags(req.user);
+                const hidden = [
+                    ...(flags.cost ? [] : ['cost']),
+                    ...(flags.profit ? [] : ['profit']),
+                ];
+                // 头只在"确实做了脱敏"时出现 → 前端语义：有头=已脱敏(隐藏)，无头=未脱敏(可见)
+                if (hidden.length) res.setHeader('X-Sensitive-Filtered', hidden.join(','));
+                else res.setHeader('X-Sensitive-Filtered', '');
+                if (hidden.length) {
+                    const out = scrubSensitive(payload, flags, new WeakSet());
+                    if (out && typeof out === 'object' && !Array.isArray(out)) {
+                        out._sensitive_filtered = hidden;
+                    }
+                    return orig(out);
+                }
+            }
+        } catch (e) {
+            console.error('[sensitive] 脱敏失败，已按原样返回并在前端隐藏:', req.path, e?.message);
+        }
+        return orig(payload);
+    };
+    next();
+});
+
+// 允许「任一权限命中」的守卫：用于跨模块共用的只读接口
+// 例：打印小票/进货单需要店铺名称，开单页(sales) 与 系统设置(settings) 都得能取到
+function requireAnyPerm(perms) {
+    return (req, res, next) => {
+        if (!req.user) return res.status(401).json({ error: '未授权' });
+        const p = parsePerms(req.user);
+        if (perms.some((x) => p.includes(x))) return next();
+        return res.status(403).json({ error: '无权限：该功能未开放给当前账号' });
+    };
+}
 
 // ==================== AUTH ====================
 app.get('/api/auth/verify', async (_req, res) => {
@@ -305,7 +403,11 @@ app.post('/api/auth/login', async (req, res) => {
             return res.status(401).json({ error: '用户名或密码错误' });
         await run("UPDATE users SET last_login = datetime('now','localtime') WHERE id = ?", [id]);
         saveDB();
-        const permissions = user[10] || '[]';
+        // [修复 2026-09-27] permissions 统一为数组形态。
+        // 原实现把 DB 里的 JSON 字符串原样放进 token 与响应体，而 /api/auth/me 返回的是数组
+        // （parsePerms）⇒ 同一字段两种类型，前端两处消费行为不一致。
+        let permissions = [];
+        try { const _p = JSON.parse(user[10] || '[]'); permissions = Array.isArray(_p) ? _p : []; } catch { permissions = []; }
         const payload = { id, username, real_name: realName, role, permissions };
         const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '7d' });
         res.json({ token, user: { ...payload, status } });
@@ -527,26 +629,41 @@ app.post('/api/inventory/checks/:checkId/items', authMiddleware, adminOnly, asyn
     await initDB();
     const { checkId } = req.params;
     const { product_id, actual_quantity, remark } = req.body;
-    const diff = actual_quantity - req.body.system_quantity || 0;
+    // [修复 2026-09-27] system_quantity 以数据库为准。
+    // 原实现取 req.body.system_quantity：前端不传时为 undefined → NaN → `|| 0` ⇒ 差异恒为 0（错误）。
+    // 改为缺省时从库里读该项的 system_quantity；实际数量未录入时差异存 NULL（配合 complete 的跳过逻辑）。
+    let sysQty = req.body.system_quantity;
+    if (sysQty === undefined || sysQty === null) {
+        const row = await safeExec("SELECT system_quantity FROM inventory_check_items WHERE check_id = ? AND product_id = ?", [checkId, product_id]);
+        sysQty = row.values?.[0]?.[0];
+    }
+    const diff = (actual_quantity === null || actual_quantity === undefined || sysQty === null || sysQty === undefined)
+        ? null
+        : (Number(actual_quantity) - Number(sysQty));
     await run("UPDATE inventory_check_items SET actual_quantity=?, difference=?, remark=? WHERE check_id=? AND product_id=?", [actual_quantity, diff, remark, checkId, product_id]);
-    saveDB();
     saveDB();
     res.json({ ok: true });
 });
 app.put('/api/inventory/checks/:id/complete', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
     const { id } = req.params;
-    // Update product stock based on check items
-    const items = await safeExec("SELECT product_id, actual_quantity FROM inventory_check_items WHERE check_id = ?", [id]);
+    // [修复 2026-09-27] 只回写「已录入实际数量」的项。
+    // 原实现 SELECT 全部明细后无条件 UPDATE：未录入项(actual_quantity IS NULL)会把
+    // products.stock_quantity 直接写成 NULL = 清空库存。
+    // 实测本库盘点单 #2（PD202609271812）有 119 项全部未录入 ⇒ 一点「完成」即清空 119 个商品库存。
+    const items = await safeExec("SELECT product_id, actual_quantity FROM inventory_check_items WHERE check_id = ? AND actual_quantity IS NOT NULL", [id]);
+    let applied = 0;
     if (items.values) {
         for (const item of items.values) {
             await run("UPDATE products SET stock_quantity = ?, updated_at=datetime('now','localtime') WHERE id = ?", [item[1], item[0]]);
+            applied++;
         }
     }
+    const skippedRow = await safeExec("SELECT count(*) FROM inventory_check_items WHERE check_id = ? AND actual_quantity IS NULL", [id]);
+    const skipped = Number(skippedRow.values?.[0]?.[0] || 0);
     await run("UPDATE inventory_checks SET status='completed', completed_at=datetime('now','localtime') WHERE id=?", [id]);
     saveDB();
-    saveDB();
-    res.json({ ok: true });
+    res.json({ ok: true, applied, skipped });
 });
 // Assembly and Split
 app.post('/api/inventory/assemblies', authMiddleware, adminOnly, async (req, res) => {
@@ -1252,7 +1369,7 @@ app.get('/api/analysis/profit', authMiddleware, hasPerm('sales_stats'), async (r
  *   并额外返回 attribution 诊断块，让前端能诚实告知「有多少单未归属」，不假装全覆盖。
  * ★ 保留原字段名（list / summary / 成本利润）→ 旧前端不炸。
  */
-app.get('/api/analysis/performance', authMiddleware, async (req, res) => {
+app.get('/api/analysis/performance', authMiddleware, hasPerm('performance'), async (req, res) => {
     await initDB();
     const isAdmin = req.user && req.user.role !== 'employee';
     const { start_date, end_date } = req.query;
@@ -1558,7 +1675,9 @@ app.get('/api/analysis/demand', authMiddleware, hasPerm('sales_stats'), async (r
     });
 });
 // ==================== STORE ====================
-app.get('/api/store/info', authMiddleware, async (_req, res) => {
+// 店铺信息：只读，返回店名/地址/电话/联系人（无成本毛利）。开单打印小票与采购单都要用，
+// 因此放行 settings | sales | purchase 任一权限；无权限者不再能匿名式读取
+app.get('/api/store/info', authMiddleware, requireAnyPerm(['settings', 'sales', 'purchase']), async (_req, res) => {
     await initDB();
     const result = await safeExec("SELECT * FROM store_info WHERE id=1");
     const info = result.values?.[0];
