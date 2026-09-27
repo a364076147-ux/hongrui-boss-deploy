@@ -294,9 +294,17 @@ const KEY_PROFIT = /(profit|margin)/i;
 /* ★ 成本"派生字段"：名字里没有 cost，但值 = 数量 × 成本价，同样会泄露成本。
  * 例：/analysis/demand 的 est_amount = 建议补货 × (cost_price || sell_price)
  *     /analysis/demand 的 suggested_purchase_amount 同理
+ *     /analysis/profit 的 net / today_net / month_net
+ *       = 净销售额 − 成本 + 其他收入 − 其他支出
+ *       虽然叫"净利润"看起来像另一回事，但它 = 毛利润 +（其他收入 − 其他支出），
+ *       而其他收入/其他支出/净销售额三个字段**都是可见的** ⇒ 子账户可用
+ *       profit = net − other_income + other_expense、cost = sales − profit 精确还原成本。
+ *       （线上实测：子账户拿到 month_net=23212.09，与老板侧 month_profit 一字不差；
+ *         net=17317.94 反推出 cost=318963.06，与老板侧完全一致。）
  * 用**精确键名白名单**而不是正则：正则 "est_amount" 会误伤 month_est_amount（销售折算，非成本）。
- * ⚠️ 新增任何"成本×数量"类派生字段时，必须同步登记到这里（或改名带上 cost）。 */
-const COST_DERIVED_KEYS = new Set(['est_amount', 'suggested_purchase_amount']);
+ * ⚠️ 新增任何"成本×数量"或"含成本加减"的派生字段时，必须同步登记到这里（或改名带上 cost）。
+ * ⚠️ 注意 `net_amount`（= 销售额 + 退货额，**不含成本**）刻意不在本名单内，勿加。 */
+const COST_DERIVED_KEYS = new Set(['est_amount', 'suggested_purchase_amount', 'net', 'today_net', 'month_net']);
 
 function sensitiveFlags(user) {
     if (!user) return { cost: false, profit: false };
