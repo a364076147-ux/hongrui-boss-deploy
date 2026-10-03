@@ -145,6 +145,10 @@ async function _runMigrations() {
             `CREATE TABLE IF NOT EXISTS quote_items (id BIGSERIAL PRIMARY KEY, quote_id BIGINT, product_id BIGINT, product_name TEXT, sku TEXT, quantity DOUBLE PRECISION DEFAULT 0, unit_price DOUBLE PRECISION DEFAULT 0, amount DOUBLE PRECISION DEFAULT 0)`,
             `CREATE TABLE IF NOT EXISTS product_specs (id BIGSERIAL PRIMARY KEY, name TEXT, remark TEXT, created_at TEXT DEFAULT to_char(now() AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI:SS'))`,
             `CREATE TABLE IF NOT EXISTS units (id BIGSERIAL PRIMARY KEY, name TEXT, remark TEXT, created_at TEXT DEFAULT to_char(now() AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI:SS'))`,
+            // 往来单位调整科目（对齐智慧记）：优惠 preferential / 抹零 trim
+            // 智慧记口径：期末 = 期初 + 应收合计 − 回款 − 优惠 + 抹零（73 家客户 + 5 家供应商真源数据反解，100% 命中）
+            `CREATE TABLE IF NOT EXISTS party_adjustments (id SERIAL PRIMARY KEY, party_name TEXT NOT NULL, party_type TEXT NOT NULL DEFAULT 'customer', adj_type TEXT NOT NULL, amount DOUBLE PRECISION DEFAULT 0, source TEXT, note TEXT, created_at TEXT DEFAULT to_char(now() AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI:SS'))`,
+            `CREATE UNIQUE INDEX IF NOT EXISTS uq_party_adj ON party_adjustments (party_name, party_type, adj_type, source)`,
         ];
         for (const sql of ddl) {
             try { await client.query(sql); } catch (e) { console.log('DDL skip:', e.message); }
@@ -2462,7 +2466,8 @@ app.get('/api/finance/arap', authMiddleware, hasPerm('finance_view'), async (_re
     const CANON_S = canonSQL('s.name');
     // 客户：先按现名合并同单位多档案（pid 取「档案名就是现名」那条的 id，保证对账单跳转到主档）
     const custRows = (await safeExec(`SELECT cg.nm, cg.pid, cg.ib,
-        COALESCE(u.cnt,0) uc, COALESCE(u.amt,0) ua, COALESCE(p.amt,0) pa
+        COALESCE(u.cnt,0) uc, COALESCE(u.amt,0) ua, COALESCE(p.amt,0) pa,
+        COALESCE(adj.pref,0) pref, COALESCE(adj.trim,0) trim
         FROM (
             SELECT ${CANON_C} nm,
                    COALESCE(MIN(c.id) FILTER (WHERE ${CANON_C} = TRIM(c.name)), MIN(c.id)) pid,
@@ -2477,24 +2482,35 @@ app.get('/api/finance/arap', authMiddleware, hasPerm('finance_view'), async (_re
         LEFT JOIN (SELECT ${canonSQL('party_name')} nm, SUM(amount) amt
                    FROM transactions
                    WHERE type='income' AND party_name IS NOT NULL AND TRIM(party_name) <> ''
-                   GROUP BY 1) p ON p.nm = cg.nm`)).values || [];
+                   GROUP BY 1) p ON p.nm = cg.nm
+        LEFT JOIN (SELECT ${canonSQL('party_name')} nm,
+                          SUM(CASE WHEN adj_type='preferential' THEN amount ELSE 0 END) pref,
+                          SUM(CASE WHEN adj_type='trim' THEN amount ELSE 0 END) trim
+                   FROM party_adjustments WHERE party_type='customer'
+                   GROUP BY 1) adj ON adj.nm = cg.nm`)).values || [];
     const receivables = custRows.map((r) => {
         const initial = Number(r[2]) || 0;
         const unpaidAmt = Number(r[4]) || 0;
         const received = Number(r[5]) || 0;
-        const balance = Math.round((initial + unpaidAmt - received) * 100) / 100;
+        const preferential = Number(r[6]) || 0;
+        const trim = Number(r[7]) || 0;
+        const balance = Math.round((initial + unpaidAmt - received - preferential + trim) * 100) / 100;
         return {
             party_id: Number(r[1]), name: String(r[0] || ''),
             initial_balance: Math.round(initial * 100) / 100,
             unpaid_orders: Number(r[3]) || 0, unpaid_amount: Math.round(unpaidAmt * 100) / 100,
-            received: Math.round(received * 100) / 100, balance,
+            received: Math.round(received * 100) / 100,
+            preferential: Math.round(preferential * 100) / 100,
+            trim: Math.round(trim * 100) / 100,
+            balance,
         };
     }).filter((x) => !SANKE_NAMES.includes(x.name))
       .filter((x) => Math.abs(x.balance) > 0.001 || x.unpaid_orders > 0)
       .sort((a, b) => b.balance - a.balance);
     // 供应商：同一套按名称归集。赵明义等「既是客户又是供应商」的单位，两侧各自独立计入（老板 10-03 定性：两个都算）
     const supRows = (await safeExec(`SELECT sg.nm, sg.pid, sg.ib,
-        COALESCE(u.cnt,0) uc, COALESCE(u.amt,0) ua, COALESCE(p.amt,0) pa
+        COALESCE(u.cnt,0) uc, COALESCE(u.amt,0) ua, COALESCE(p.amt,0) pa,
+        COALESCE(adj.pref,0) pref, COALESCE(adj.trim,0) trim
         FROM (
             SELECT ${CANON_S} nm,
                    COALESCE(MIN(s.id) FILTER (WHERE ${CANON_S} = TRIM(s.name)), MIN(s.id)) pid,
@@ -2509,17 +2525,27 @@ app.get('/api/finance/arap', authMiddleware, hasPerm('finance_view'), async (_re
         LEFT JOIN (SELECT ${canonSQL('party_name')} nm, SUM(amount) amt
                    FROM transactions
                    WHERE type='expense' AND party_name IS NOT NULL AND TRIM(party_name) <> ''
-                   GROUP BY 1) p ON p.nm = sg.nm`)).values || [];
+                   GROUP BY 1) p ON p.nm = sg.nm
+        LEFT JOIN (SELECT ${canonSQL('party_name')} nm,
+                          SUM(CASE WHEN adj_type='preferential' THEN amount ELSE 0 END) pref,
+                          SUM(CASE WHEN adj_type='trim' THEN amount ELSE 0 END) trim
+                   FROM party_adjustments WHERE party_type='supplier'
+                   GROUP BY 1) adj ON adj.nm = sg.nm`)).values || [];
     const payables = supRows.map((r) => {
         const initial = Number(r[2]) || 0;
         const unpaidAmt = Number(r[4]) || 0;
         const paid = Number(r[5]) || 0;
-        const balance = Math.round((initial + unpaidAmt - paid) * 100) / 100;
+        const preferential = Number(r[6]) || 0;
+        const trim = Number(r[7]) || 0;
+        const balance = Math.round((initial + unpaidAmt - paid - preferential + trim) * 100) / 100;
         return {
             party_id: Number(r[1]), name: String(r[0] || ''),
             initial_balance: Math.round(initial * 100) / 100,
             unpaid_orders: Number(r[3]) || 0, unpaid_amount: Math.round(unpaidAmt * 100) / 100,
-            paid: Math.round(paid * 100) / 100, balance,
+            paid: Math.round(paid * 100) / 100,
+            preferential: Math.round(preferential * 100) / 100,
+            trim: Math.round(trim * 100) / 100,
+            balance,
         };
     }).filter((x) => !SANKE_NAMES.includes(x.name))
       .filter((x) => Math.abs(x.balance) > 0.001 || x.unpaid_orders > 0)
