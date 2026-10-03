@@ -2429,48 +2429,100 @@ app.get('/api/finance/supplier-reconciliation', authMiddleware, hasPerm('reconci
     }));
     res.json(list);
 });
-// ==================== 应收应付对账（智慧记模型：期初欠款 + 未结清销售/进货 - 已收/已付 = 期末欠款） ====================
+// ==================== 往来单位余额口径（2026-10-03 改造） ====================
+/**
+ * 为什么改成「按名称归集」：
+ *   历史迁移只落了「名称」不落「ID」——sales_orders.customer_id 仅 9/4,434 有值、
+ *   transactions.party_id 与 party_type 全空、purchase_orders.supplier_id 仅零星。
+ *   旧实现按 ID JOIN ⇒ 两个子查询恒落空 ⇒ 应收只剩期初（线上曾长期显示 ¥44,220，
+ *   而真实应收为 ¥568,013）。故一律【按名称】归集。
+ *
+ * 余额口径 = 期初 + 全量非作废单据 − 全量收付款流水
+ *   这是「往来单位级滚动余额」，与智慧记 cur_amt 同型；【不是】「未结清单据」。
+ *   旁证：智慧记自身单据 owe_amt 合计 ¥1,961,049 而客户 cur_amt 合计 ¥460,668，
+ *   落差 ¥150 万 —— 「单据未付 ≫ 客户欠款」是行业常态，未结清单据从来不是应收。
+ */
+const SANKE_NAMES = ['零售散客', '批发散客']; // 散客为现金交易，不计应收/应付（智慧记同口径：cur_amt=0）
+const PARTY_ALIAS = { '宇辉厨卫Y': '大宇厨卫' }; // 旧名 → 现名：同一个往来单位的多份档案按现名合并计数
+const _sqlLit = (s) => "'" + String(s).replace(/'/g, "''") + "'";
+const canonName = (n) => {
+    const k = String(n === null || n === undefined ? '' : n).trim();
+    return Object.prototype.hasOwnProperty.call(PARTY_ALIAS, k) ? PARTY_ALIAS[k] : k;
+};
+/** 生成「把某列规范化到现名」的 SQL 表达式。规则必须与 canonName 完全一致。 */
+function canonSQL(col) {
+    const cases = Object.entries(PARTY_ALIAS)
+        .map(([from, to]) => `WHEN TRIM(${col}) = ${_sqlLit(from)} THEN ${_sqlLit(to)}`).join(' ');
+    return cases ? `CASE ${cases} ELSE TRIM(${col}) END` : `TRIM(${col})`;
+}
+// ==================== 应收应付对账（口径：期初欠款 + 全量销售/进货 − 全量已收/已付 = 期末欠款） ====================
 app.get('/api/finance/arap', authMiddleware, hasPerm('finance_view'), async (_req, res) => {
     await initDB();
-    // 客户：期初欠款 + 未结清销售单 - 客户收款流水（批量聚合）
-    const custRows = (await safeExec(`SELECT c.id, c.name, COALESCE(c.initial_balance,0) ib,
+    const CANON_C = canonSQL('c.name');
+    const CANON_S = canonSQL('s.name');
+    // 客户：先按现名合并同单位多档案（pid 取「档案名就是现名」那条的 id，保证对账单跳转到主档）
+    const custRows = (await safeExec(`SELECT cg.nm, cg.pid, cg.ib,
         COALESCE(u.cnt,0) uc, COALESCE(u.amt,0) ua, COALESCE(p.amt,0) pa
-        FROM customers c
-        LEFT JOIN (SELECT customer_id, COUNT(*) cnt, SUM(final_amount) amt FROM sales_orders WHERE COALESCE(payment_status,'') NOT IN ('已结清','作废') GROUP BY customer_id) u ON u.customer_id = c.id
-        LEFT JOIN (SELECT party_id, SUM(amount) amt FROM transactions WHERE type='income' AND party_type='customer' GROUP BY party_id) p ON p.party_id = c.id
-        WHERE c.status=1`)).values || [];
+        FROM (
+            SELECT ${CANON_C} nm,
+                   COALESCE(MIN(c.id) FILTER (WHERE ${CANON_C} = TRIM(c.name)), MIN(c.id)) pid,
+                   SUM(COALESCE(c.initial_balance,0)) ib
+            FROM customers c WHERE c.status=1 GROUP BY 1
+        ) cg
+        LEFT JOIN (SELECT ${canonSQL('customer_name')} nm, COUNT(*) cnt, SUM(final_amount) amt
+                   FROM sales_orders
+                   WHERE COALESCE(payment_status,'') <> '作废'
+                     AND customer_name IS NOT NULL AND TRIM(customer_name) <> ''
+                   GROUP BY 1) u ON u.nm = cg.nm
+        LEFT JOIN (SELECT ${canonSQL('party_name')} nm, SUM(amount) amt
+                   FROM transactions
+                   WHERE type='income' AND party_name IS NOT NULL AND TRIM(party_name) <> ''
+                   GROUP BY 1) p ON p.nm = cg.nm`)).values || [];
     const receivables = custRows.map((r) => {
         const initial = Number(r[2]) || 0;
         const unpaidAmt = Number(r[4]) || 0;
         const received = Number(r[5]) || 0;
         const balance = Math.round((initial + unpaidAmt - received) * 100) / 100;
         return {
-            party_id: Number(r[0]), name: String(r[1] || ''),
+            party_id: Number(r[1]), name: String(r[0] || ''),
             initial_balance: Math.round(initial * 100) / 100,
             unpaid_orders: Number(r[3]) || 0, unpaid_amount: Math.round(unpaidAmt * 100) / 100,
             received: Math.round(received * 100) / 100, balance,
         };
-    }).filter((x) => Math.abs(x.balance) > 0.001 || x.unpaid_orders > 0)
+    }).filter((x) => !SANKE_NAMES.includes(x.name))
+      .filter((x) => Math.abs(x.balance) > 0.001 || x.unpaid_orders > 0)
       .sort((a, b) => b.balance - a.balance);
-    // 供应商：期初欠款 + 未结清进货单 - 供应商付款流水
-    const supRows = (await safeExec(`SELECT s.id, s.name, COALESCE(s.initial_balance,0) ib,
+    // 供应商：同一套按名称归集。赵明义等「既是客户又是供应商」的单位，两侧各自独立计入（老板 10-03 定性：两个都算）
+    const supRows = (await safeExec(`SELECT sg.nm, sg.pid, sg.ib,
         COALESCE(u.cnt,0) uc, COALESCE(u.amt,0) ua, COALESCE(p.amt,0) pa
-        FROM suppliers s
-        LEFT JOIN (SELECT supplier_id, COUNT(*) cnt, SUM(total_amount) amt FROM purchase_orders WHERE COALESCE(payment_status,'') NOT IN ('已结清','作废') GROUP BY supplier_id) u ON u.supplier_id = s.id
-        LEFT JOIN (SELECT party_id, SUM(amount) amt FROM transactions WHERE type='expense' AND party_type='supplier' GROUP BY party_id) p ON p.party_id = s.id
-        WHERE s.status=1`)).values || [];
+        FROM (
+            SELECT ${CANON_S} nm,
+                   COALESCE(MIN(s.id) FILTER (WHERE ${CANON_S} = TRIM(s.name)), MIN(s.id)) pid,
+                   SUM(COALESCE(s.initial_balance,0)) ib
+            FROM suppliers s WHERE s.status=1 GROUP BY 1
+        ) sg
+        LEFT JOIN (SELECT ${canonSQL('supplier_name')} nm, COUNT(*) cnt, SUM(total_amount) amt
+                   FROM purchase_orders
+                   WHERE COALESCE(payment_status,'') <> '作废'
+                     AND supplier_name IS NOT NULL AND TRIM(supplier_name) <> ''
+                   GROUP BY 1) u ON u.nm = sg.nm
+        LEFT JOIN (SELECT ${canonSQL('party_name')} nm, SUM(amount) amt
+                   FROM transactions
+                   WHERE type='expense' AND party_name IS NOT NULL AND TRIM(party_name) <> ''
+                   GROUP BY 1) p ON p.nm = sg.nm`)).values || [];
     const payables = supRows.map((r) => {
         const initial = Number(r[2]) || 0;
         const unpaidAmt = Number(r[4]) || 0;
         const paid = Number(r[5]) || 0;
         const balance = Math.round((initial + unpaidAmt - paid) * 100) / 100;
         return {
-            party_id: Number(r[0]), name: String(r[1] || ''),
+            party_id: Number(r[1]), name: String(r[0] || ''),
             initial_balance: Math.round(initial * 100) / 100,
             unpaid_orders: Number(r[3]) || 0, unpaid_amount: Math.round(unpaidAmt * 100) / 100,
             paid: Math.round(paid * 100) / 100, balance,
         };
-    }).filter((x) => Math.abs(x.balance) > 0.001 || x.unpaid_orders > 0)
+    }).filter((x) => !SANKE_NAMES.includes(x.name))
+      .filter((x) => Math.abs(x.balance) > 0.001 || x.unpaid_orders > 0)
       .sort((a, b) => b.balance - a.balance);
     res.json({
         receivables,
@@ -2481,20 +2533,23 @@ app.get('/api/finance/arap', authMiddleware, hasPerm('finance_view'), async (_re
         },
     });
 });
-// 客户对账单：期初 + 销售单 + 收款流水明细
+// 客户对账单：期初 + 销售单 + 收款流水明细（口径与 /finance/arap 完全一致：按现名归集）
 app.get('/api/finance/customer-statement/:id', authMiddleware, hasPerm('finance_view'), async (req, res) => {
     await initDB();
     const cid = Number(req.params.id);
-    const cust = (await safeExec("SELECT id, name, COALESCE(initial_balance,0) FROM customers WHERE id = ?", [cid])).values?.[0];
+    const cust = (await safeExec("SELECT name FROM customers WHERE id = ?", [cid])).values?.[0];
     if (!cust) return res.status(404).json({ error: '客户不存在' });
+    // 传进来的是档案 id，但单据/流水只落了名称 ⇒ 先归一到「现名」，再把同单位多档案的期初合并
+    const cnm = canonName(cust[0]);
+    const initRow = (await safeExec(`SELECT COALESCE(SUM(initial_balance),0) FROM customers WHERE status=1 AND ${canonSQL('name')} = ?`, [cnm])).values?.[0];
     /* 单据 + 商品明细一次取全（LEFT JOIN）：前端打印模板会按 o.items 逐行渲染，
      * 未挂明细的历史单据 items 为空数组，不影响单据行本身。 */
     const stmtRows = (await safeExec(`SELECT so.id, so.order_number, so.created_at, so.final_amount, so.payment_status,
         oi.product_name, oi.quantity, oi.unit_price, oi.amount
         FROM sales_orders so
         LEFT JOIN sales_order_items oi ON oi.order_id = so.id
-        WHERE so.customer_id = ? AND COALESCE(so.payment_status,'') <> '作废'
-        ORDER BY so.id, oi.id`, [cid])).values || [];
+        WHERE ${canonSQL('so.customer_name')} = ? AND COALESCE(so.payment_status,'') <> '作废'
+        ORDER BY so.id, oi.id`, [cnm])).values || [];
     const orderMap = new Map();
     for (const r of stmtRows) {
         const oid = Number(r[0]);
@@ -2503,26 +2558,28 @@ app.get('/api/finance/customer-statement/:id', authMiddleware, hasPerm('finance_
             orderMap.get(oid).items.push({ product_name: r[5], quantity: Number(r[6]) || 0, unit_price: Number(r[7]) || 0, amount: Number(r[8]) || 0 });
         }
     }
-    const payments = (await safeExec("SELECT created_at, amount, description FROM transactions WHERE type='income' AND party_type='customer' AND party_id = ? ORDER BY id", [cid])).values || [];
+    const payments = (await safeExec(`SELECT created_at, amount, description FROM transactions WHERE type='income' AND ${canonSQL('party_name')} = ? ORDER BY id`, [cnm])).values || [];
     res.json({
-        name: cust[1], initial_balance: Number(cust[2]) || 0,
+        name: cnm, initial_balance: Number(initRow?.[0]) || 0,
         orders: [...orderMap.values()],
         payments: payments.map((p) => ({ created_at: p[0], amount: Number(p[1]), description: p[2] })),
     });
 });
-// 供应商对账单：期初 + 进货单 + 付款流水明细
+// 供应商对账单：期初 + 进货单 + 付款流水明细（口径同上）
 app.get('/api/finance/supplier-statement/:id', authMiddleware, hasPerm('finance_view'), async (req, res) => {
     await initDB();
     const sid = Number(req.params.id);
-    const sup = (await safeExec("SELECT id, name, COALESCE(initial_balance,0) FROM suppliers WHERE id = ?", [sid])).values?.[0];
+    const sup = (await safeExec("SELECT name FROM suppliers WHERE id = ?", [sid])).values?.[0];
     if (!sup) return res.status(404).json({ error: '供应商不存在' });
+    const snm = canonName(sup[0]);
+    const initRow = (await safeExec(`SELECT COALESCE(SUM(initial_balance),0) FROM suppliers WHERE status=1 AND ${canonSQL('name')} = ?`, [snm])).values?.[0];
     /* 同客户对账单：单据 + 商品明细一次取全（LEFT JOIN），未挂明细的历史单据 items 为空数组 */
     const stmtRows = (await safeExec(`SELECT po.id, po.order_number, po.created_at, po.total_amount, po.payment_status,
         oi.product_name, oi.quantity, oi.unit_price, oi.amount
         FROM purchase_orders po
         LEFT JOIN purchase_order_items oi ON oi.order_id = po.id
-        WHERE po.supplier_id = ? AND COALESCE(po.payment_status,'') <> '作废'
-        ORDER BY po.id, oi.id`, [sid])).values || [];
+        WHERE ${canonSQL('po.supplier_name')} = ? AND COALESCE(po.payment_status,'') <> '作废'
+        ORDER BY po.id, oi.id`, [snm])).values || [];
     const orderMap = new Map();
     for (const r of stmtRows) {
         const oid = Number(r[0]);
@@ -2531,9 +2588,9 @@ app.get('/api/finance/supplier-statement/:id', authMiddleware, hasPerm('finance_
             orderMap.get(oid).items.push({ product_name: r[5], quantity: Number(r[6]) || 0, unit_price: Number(r[7]) || 0, amount: Number(r[8]) || 0 });
         }
     }
-    const payments = (await safeExec("SELECT created_at, amount, description FROM transactions WHERE type='expense' AND party_type='supplier' AND party_id = ? ORDER BY id", [sid])).values || [];
+    const payments = (await safeExec(`SELECT created_at, amount, description FROM transactions WHERE type='expense' AND ${canonSQL('party_name')} = ? ORDER BY id`, [snm])).values || [];
     res.json({
-        name: sup[1], initial_balance: Number(sup[2]) || 0,
+        name: snm, initial_balance: Number(initRow?.[0]) || 0,
         orders: [...orderMap.values()],
         payments: payments.map((p) => ({ created_at: p[0], amount: Number(p[1]), description: p[2] })),
     });
