@@ -1789,6 +1789,44 @@ app.delete('/api/store/customers/:id', authMiddleware, hasPerm('customers'), asy
     saveDB();
     res.json({ ok: true });
 });
+/**
+ * 客户各商品「最近一次成交价」（开单页选中客户后自动带出上次价）
+ *
+ * 契约（与前端 src/api/index.ts → getCustomerLastPrices 严格对齐）：
+ *   入参  GET /api/store/customer-last-prices/:id   （:id = 客户 id）
+ *   返回  扁平对象 { [product_id]: unit_price }，前端 setLastPrices(res || {}) 直接用
+ *        （axios 响应拦截器已 response.data 解包 ⇒ 这里必须是裸对象，不能套 rows/data）
+ *
+ * ★ 口径（与 /store/sales-orders、/analysis/* 保持同一套，勿改）：
+ *   · 归期一律 substr(COALESCE(so.bill_date, so.created_at),1,10)
+ *   · 作废单不参与（COALESCE(payment_status,'') <> '作废'）
+ *   · 退货单不参与（biz_type='sale_return'）——退货单价不是成交价，带出来会把价格带偏
+ *   · 同商品多条 ⇒ 取归期最新的一条（ORDER BY 归期 DESC, so.id DESC, oi.id DESC 后取首条）
+ */
+app.get('/api/store/customer-last-prices/:id', authMiddleware, hasPerm('sales'), async (req, res) => {
+    await initDB();
+    const cid = Number(req.params.id);
+    if (!cid)
+        return res.json({});
+    const result = await safeExec("SELECT oi.product_id, oi.unit_price FROM sales_order_items oi " +
+        "JOIN sales_orders so ON oi.order_id = so.id " +
+        "WHERE so.customer_id = ? AND COALESCE(so.payment_status,'') <> '作废' " +
+        "AND COALESCE(so.biz_type,'sale') <> 'sale_return' AND oi.product_id IS NOT NULL " +
+        "ORDER BY substr(COALESCE(so.bill_date, so.created_at),1,10) DESC, so.id DESC, oi.id DESC", [cid]);
+    const out = {};
+    for (const row of result.values || []) {
+        const pid = row[0];
+        if (pid === null || pid === undefined)
+            continue;
+        const key = String(pid);
+        if (Object.prototype.hasOwnProperty.call(out, key))
+            continue; // 已按归期倒序 ⇒ 首条即「最近一次」
+        const price = Number(row[1]);
+        if (Number.isFinite(price) && price > 0)
+            out[key] = price;
+    }
+    res.json(out);
+});
 const PO_COLS = "id, order_number, supplier_id, supplier_name, total_amount, status, operator_id, operator_name, created_at, payment_status, bill_date, paid_amount, owe_amount, remark";
 function mapPurchaseOrder(o) {
     return {
