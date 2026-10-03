@@ -740,7 +740,7 @@ app.post('/api/finance/transactions/income', authMiddleware, hasPerm('income'), 
     await run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [amount, accId]);
     // 冲减该客户欠款：若指定客户，将其最早未结清销售单标记已结清（按金额抵扣）
     if (pid && category !== '直接收款') {
-        const unpaid = (await safeExec("SELECT id, final_amount FROM sales_orders WHERE customer_id = ? AND payment_status != '已结清' ORDER BY id LIMIT 20", [pid])).values || [];
+        const unpaid = (await safeExec("SELECT id, final_amount FROM sales_orders WHERE customer_id = ? AND COALESCE(payment_status,'') NOT IN ('已结清','作废') ORDER BY id LIMIT 20", [pid])).values || [];
         // 按金额逐单抵扣：收款金额先抵最早的欠单，不足部分保持未结清（不再一刀切全部标记已结清）
         let remain = Number(amount) || 0;
         for (const row of unpaid) {
@@ -783,7 +783,7 @@ app.post('/api/finance/transactions/expense', authMiddleware, hasPerm('expense')
     await run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name) VALUES ('expense', ?, ?, ?, ?, ?, ?, ?, ?, ?)", [accId, amount, cat, description, req.user.id, req.user.real_name, ptype, pid, pname]);
     await run("UPDATE accounts SET balance = balance - ? WHERE id = ?", [amount, accId]);
     if (pid && category !== '直接付款') {
-        const unpaid = (await safeExec("SELECT id, total_amount FROM purchase_orders WHERE supplier_id = ? AND payment_status != '已结清' ORDER BY id LIMIT 20", [pid])).values || [];
+        const unpaid = (await safeExec("SELECT id, total_amount FROM purchase_orders WHERE supplier_id = ? AND COALESCE(payment_status,'') NOT IN ('已结清','作废') ORDER BY id LIMIT 20", [pid])).values || [];
         // 按金额逐单抵扣：付款金额先抵最早的欠单，不足部分保持未结清
         let remain = Number(amount) || 0;
         for (const row of unpaid) {
@@ -2436,7 +2436,7 @@ app.get('/api/finance/arap', authMiddleware, hasPerm('finance_view'), async (_re
     const custRows = (await safeExec(`SELECT c.id, c.name, COALESCE(c.initial_balance,0) ib,
         COALESCE(u.cnt,0) uc, COALESCE(u.amt,0) ua, COALESCE(p.amt,0) pa
         FROM customers c
-        LEFT JOIN (SELECT customer_id, COUNT(*) cnt, SUM(final_amount) amt FROM sales_orders WHERE payment_status != '已结清' GROUP BY customer_id) u ON u.customer_id = c.id
+        LEFT JOIN (SELECT customer_id, COUNT(*) cnt, SUM(final_amount) amt FROM sales_orders WHERE COALESCE(payment_status,'') NOT IN ('已结清','作废') GROUP BY customer_id) u ON u.customer_id = c.id
         LEFT JOIN (SELECT party_id, SUM(amount) amt FROM transactions WHERE type='income' AND party_type='customer' GROUP BY party_id) p ON p.party_id = c.id
         WHERE c.status=1`)).values || [];
     const receivables = custRows.map((r) => {
@@ -2456,7 +2456,7 @@ app.get('/api/finance/arap', authMiddleware, hasPerm('finance_view'), async (_re
     const supRows = (await safeExec(`SELECT s.id, s.name, COALESCE(s.initial_balance,0) ib,
         COALESCE(u.cnt,0) uc, COALESCE(u.amt,0) ua, COALESCE(p.amt,0) pa
         FROM suppliers s
-        LEFT JOIN (SELECT supplier_id, COUNT(*) cnt, SUM(total_amount) amt FROM purchase_orders WHERE payment_status != '已结清' GROUP BY supplier_id) u ON u.supplier_id = s.id
+        LEFT JOIN (SELECT supplier_id, COUNT(*) cnt, SUM(total_amount) amt FROM purchase_orders WHERE COALESCE(payment_status,'') NOT IN ('已结清','作废') GROUP BY supplier_id) u ON u.supplier_id = s.id
         LEFT JOIN (SELECT party_id, SUM(amount) amt FROM transactions WHERE type='expense' AND party_type='supplier' GROUP BY party_id) p ON p.party_id = s.id
         WHERE s.status=1`)).values || [];
     const payables = supRows.map((r) => {
@@ -2487,7 +2487,7 @@ app.get('/api/finance/customer-statement/:id', authMiddleware, hasPerm('finance_
     const cid = Number(req.params.id);
     const cust = (await safeExec("SELECT id, name, COALESCE(initial_balance,0) FROM customers WHERE id = ?", [cid])).values?.[0];
     if (!cust) return res.status(404).json({ error: '客户不存在' });
-    const orders = (await safeExec("SELECT order_number, created_at, final_amount, payment_status FROM sales_orders WHERE customer_id = ? ORDER BY id", [cid])).values || [];
+    const orders = (await safeExec("SELECT order_number, created_at, final_amount, payment_status FROM sales_orders WHERE customer_id = ? AND COALESCE(payment_status,'') <> '作废' ORDER BY id", [cid])).values || [];
     const payments = (await safeExec("SELECT created_at, amount, description FROM transactions WHERE type='income' AND party_type='customer' AND party_id = ? ORDER BY id", [cid])).values || [];
     res.json({
         name: cust[1], initial_balance: Number(cust[2]) || 0,
@@ -2501,7 +2501,7 @@ app.get('/api/finance/supplier-statement/:id', authMiddleware, hasPerm('finance_
     const sid = Number(req.params.id);
     const sup = (await safeExec("SELECT id, name, COALESCE(initial_balance,0) FROM suppliers WHERE id = ?", [sid])).values?.[0];
     if (!sup) return res.status(404).json({ error: '供应商不存在' });
-    const orders = (await safeExec("SELECT order_number, created_at, total_amount, payment_status FROM purchase_orders WHERE supplier_id = ? ORDER BY id", [sid])).values || [];
+    const orders = (await safeExec("SELECT order_number, created_at, total_amount, payment_status FROM purchase_orders WHERE supplier_id = ? AND COALESCE(payment_status,'') <> '作废' ORDER BY id", [sid])).values || [];
     const payments = (await safeExec("SELECT created_at, amount, description FROM transactions WHERE type='expense' AND party_type='supplier' AND party_id = ? ORDER BY id", [sid])).values || [];
     res.json({
         name: sup[1], initial_balance: Number(sup[2]) || 0,
