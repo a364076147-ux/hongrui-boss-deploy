@@ -18,3 +18,11 @@ keepalive.log
 keepalive/
 keepalive_local.bat
 *.log
+
+# 内部治理文档：含安全缺口清单 / 攻击面 / 轮换状态，禁止进公开仓库（2026-10-03）
+# 背景：这类文件曾被提交到公开仓库，等于对外发布一份「攻击路线图」。
+DEPLOY-FREEZE.md
+DEPLOY-FREEZE*.md
+SECURITY-BASELINE.md
+ROTATION-KEYS*.txt
+*ROTATION-KEY*
