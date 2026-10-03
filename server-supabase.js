@@ -183,6 +183,58 @@ function saveDB() { }
 function todayCST() {
     return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
 }
+/* ==================== 销售单统一口径（2026-10-03 抽取，唯一真源） ====================
+ * 背景（实测缺陷）：创建销售单原有三条路径 —— ①手工开单 ②报价转单 ③预订出库。
+ *   ②③ 原先手写了一套残缺的 INSERT，只写 final_amount，漏写
+ *   receivable_amount / received_amount / owe_amount / payment_status / bill_date
+ *   ⇒ 列取默认值 0 ⇒ 造出「金额≠0 但应收=0」的不自洽单，直接打破恒等式「应收 = 实收 + 欠款」
+ *   （线上体检：全库该类不自洽单当时 0 张，属未爆的雷）。
+ * 铁律：今后任何「生成销售单」的入口都必须调用 salesOrderMoney() 取金额字段，
+ *       任何「写入 sales_order_items」的入口都必须先经 resolveProductIdForOrder() 解析商品。
+ * 判据：`_governance/_verify-sales-insert.cjs` 扫描本文件，缺字段即报错。
+ * ==================================================================================== */
+
+/**
+ * 销售单金额口径（与手工开单完全一致）
+ * @param {number} finalAmount 应收金额（= 明细合计 − 折扣 + 运费 + 税额 − 抹零）
+ * @param {*} receivedAmount 显式实收；未传（undefined/null/''）时有支付方式视为全额收讫，无支付方式（赊账）视为 0
+ * @param {string|null} paymentMethod 支付方式
+ * @param {string} [billDateIn] 显式业务日期（如前端传入）；不传则取今天（东八区）
+ * @returns {{receivable_amount:number, received_amount:number, owe_amount:number, payment_status:string, bill_date:string}}
+ */
+function salesOrderMoney(finalAmount, receivedAmount, paymentMethod, billDateIn) {
+    const fa = Math.round((Number(finalAmount) || 0) * 100) / 100;
+    const received = (receivedAmount !== undefined && receivedAmount !== null && receivedAmount !== '')
+        ? (Number(receivedAmount) || 0)
+        : (paymentMethod ? fa : 0);
+    const owe = Math.round((fa - received) * 100) / 100;
+    return {
+        receivable_amount: fa,
+        received_amount: received,
+        owe_amount: owe,
+        payment_status: owe > 0.005 ? '未结清' : '已结清',
+        bill_date: billDateIn || todayCST()
+    };
+}
+
+/**
+ * 商品解析：sales_order_items.product_id 是 NOT NULL，缺失会直接违反约束。
+ * 先认来源明细的 product_id；没有则按「归一化商品名」在 products 档案里找（不间断空格/全角/大小写均容忍）。
+ * @returns {Promise<number|null>} 命中的商品 id，找不到返回 null（调用方必须据此**在写库之前**拦截）
+ */
+async function resolveProductIdForOrder(productId, productName) {
+    if (productId) return Number(productId);
+    const norm = (s) => String(s == null ? '' : s).replace(/[\s\u00A0\u3000]+/g, '').toLowerCase();
+    const target = norm(productName);
+    if (!target) return null;
+    try {
+        const rows = (await safeExec('SELECT id, name FROM products')).values || [];
+        const hit = rows.find((r) => norm(r[1]) === target);
+        return hit ? Number(hit[0]) : null;
+    } catch (e) {
+        return null;
+    }
+}
 /**
  * 成本符号修正（关键）：智慧记里「红字冲销单」以负数销售单形式存在（实测 348 张），
  * 其单据金额为负、但明细数量与成本仍记正 → 直接 SUM(qty×cost) 会把成本虚增。
@@ -2070,19 +2122,18 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
         const cr = (await safeExec("SELECT COALESCE(commission_rate,0) FROM users WHERE id = ?", [operatorId])).values?.[0]?.[0];
         commissionAmount = Math.round((Number(cr) || 0) * finalAmount) / 100;
     } catch (e) { commissionAmount = 0; }
-    /* ---- 收款口径 ----
+    /* ---- 收款口径（★ 2026-10-03：改调唯一真源 salesOrderMoney()，与本文件另两条开单路径共用）----
      * received_amount 显式传入则用传入值；否则：有支付方式视为全额收讫，无支付方式（赊账）视为 0
      * owe_amount = 应收 - 已收（赊账单的核心字段，供欠款对账） */
-    const receivedAmount = received_amount !== undefined && received_amount !== null && received_amount !== ''
-        ? (Number(received_amount) || 0)
-        : (payment_method ? finalAmount : 0);
-    const oweAmount = Math.round((finalAmount - receivedAmount) * 100) / 100;
-    const paymentStatus = oweAmount > 0.005 ? '未结清' : '已结清';
-    const billDate = bill_date || todayCST();
+    const _money = salesOrderMoney(finalAmount, received_amount, payment_method, bill_date);
+    const receivedAmount = _money.received_amount;
+    const oweAmount = _money.owe_amount;
+    const paymentStatus = _money.payment_status;
+    const billDate = _money.bill_date;
     await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, commission_amount, payment_status, bill_date, receivable_amount, received_amount, owe_amount, small_change_amount, express_amount, tax_amount, remark, biz_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
         orderNumber, customer_id || null, customer_name || null, totalAmount, discount || 0, finalAmount,
         payment_method || null, operatorId, operatorName, commissionAmount, paymentStatus,
-        billDate, finalAmount, receivedAmount, oweAmount,
+        billDate, _money.receivable_amount, receivedAmount, oweAmount,
         Number(small_change_amount) || 0, Number(express_amount) || 0, Number(tax_amount) || 0,
         remark || '', 'sale'
     ]);
@@ -2664,15 +2715,31 @@ app.post('/api/store/reservations/:id/complete', authMiddleware, hasPerm('sales'
     if (!r) return res.status(404).json({ error: '预订不存在' });
     if (r[5] !== 'pending') return res.status(400).json({ error: '仅待处理预订可出库' });
     const items = (await safeExec("SELECT * FROM sales_reservation_items WHERE reservation_id = ?", [id])).values || [];
+    // ★ 预扫（2026-10-03）：先把明细商品全部解析成 product_id（sales_order_items.product_id 为 NOT NULL），
+    //   任一解析失败即**在写库之前**返回，绝不留下「主单进了、明细没进」的半截数据。
+    const resolved = [];
+    for (const it of items) {
+        const pid = await resolveProductIdForOrder(it[2], it[3]);
+        if (!pid) return res.status(400).json({ error: `出库失败：明细商品「${it[3]}」在商品档案中不存在（明细必须能解析到商品），本次未写入任何数据` });
+        resolved.push({ pid, name: it[3], sku: it[4] || '', qty: Number(it[5]) || 0, price: Number(it[6]) || 0, amount: Number(it[7]) || 0 });
+    }
     const orderNumber = generateOrderNumber('XS');
     const finalAmount = Number(r[4]) || 0;
-    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name) VALUES (?, ?, ?, ?, 0, ?, NULL, ?, ?)",
-        [orderNumber, r[2], r[3], finalAmount, finalAmount, req.user.id, req.user.real_name]);
+    // ★ 修复（2026-10-03）：原先只写 final_amount，漏 receivable_amount/received_amount/owe_amount/
+    //   payment_status/bill_date（列默认 0）⇒ 生成「金额≠0 但应收=0」的不自洽单。现与手工开单共用 salesOrderMoney()。
+    const M = salesOrderMoney(finalAmount, undefined, null);
+    let commissionAmount = 0;
+    try {
+        const cr = (await safeExec("SELECT COALESCE(commission_rate,0) FROM users WHERE id = ?", [req.user.id])).values?.[0]?.[0];
+        commissionAmount = Math.round((Number(cr) || 0) * finalAmount) / 100;
+    } catch (e) { commissionAmount = 0; }
+    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, commission_amount, payment_status, bill_date, receivable_amount, received_amount, owe_amount, small_change_amount, express_amount, tax_amount, remark, biz_type) VALUES (?, ?, ?, ?, 0, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, '', 'sale')",
+        [orderNumber, r[2], r[3], finalAmount, finalAmount, req.user.id, req.user.real_name, commissionAmount, M.payment_status, M.bill_date, M.receivable_amount, M.received_amount, M.owe_amount]);
     const orderId = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0];
-    for (const it of items) {
+    for (const it of resolved) {
         await run("INSERT INTO sales_order_items (order_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [orderId, it[2], it[3], it[4] || '', it[5], it[6], it[7]]);
-        if (it[2]) await run("UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?", [it[5], it[2]]);
+            [orderId, it.pid, it.name, it.sku, it.qty, it.price, it.amount]);
+        if (it.pid) await run("UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?", [it.qty, it.pid]);
     }
     await run("UPDATE sales_reservations SET status = 'done' WHERE id = ?", [id]);
     saveDB(); saveDB();
@@ -2759,15 +2826,31 @@ app.post('/api/store/quotes/:id/convert', authMiddleware, hasPerm('sales'), asyn
     const q = (await safeExec("SELECT * FROM quotes WHERE id = ?", [id])).values?.[0];
     if (!q) return res.status(404).json({ error: '报价单不存在' });
     const items = (await safeExec("SELECT * FROM quote_items WHERE quote_id = ?", [id])).values || [];
+    // ★ 预扫（2026-10-03）：先把明细商品全部解析成 product_id（sales_order_items.product_id 为 NOT NULL），
+    //   任一解析失败即**在写库之前**返回，绝不留下「主单进了、明细没进」的半截数据。
+    const resolved = [];
+    for (const it of items) {
+        const pid = await resolveProductIdForOrder(it[2], it[3]);
+        if (!pid) return res.status(400).json({ error: `转单失败：明细商品「${it[3]}」在商品档案中不存在（明细必须能解析到商品），本次未写入任何数据` });
+        resolved.push({ pid, name: it[3], sku: it[4] || '', qty: Number(it[5]) || 0, price: Number(it[6]) || 0, amount: Number(it[7]) || 0 });
+    }
     const orderNumber = generateOrderNumber('XS');
     const finalAmount = Number(q[4]) || 0;
-    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name) VALUES (?, ?, ?, ?, 0, ?, NULL, ?, ?)",
-        [orderNumber, q[2], q[3], finalAmount, finalAmount, req.user.id, req.user.real_name]);
+    // ★ 修复（2026-10-03）：原先只写 final_amount，漏 receivable_amount/received_amount/owe_amount/
+    //   payment_status/bill_date（列默认 0）⇒ 生成「金额≠0 但应收=0」的不自洽单。现与手工开单共用 salesOrderMoney()。
+    const M = salesOrderMoney(finalAmount, undefined, null);
+    let commissionAmount = 0;
+    try {
+        const cr = (await safeExec("SELECT COALESCE(commission_rate,0) FROM users WHERE id = ?", [req.user.id])).values?.[0]?.[0];
+        commissionAmount = Math.round((Number(cr) || 0) * finalAmount) / 100;
+    } catch (e) { commissionAmount = 0; }
+    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, commission_amount, payment_status, bill_date, receivable_amount, received_amount, owe_amount, small_change_amount, express_amount, tax_amount, remark, biz_type) VALUES (?, ?, ?, ?, 0, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, '', 'sale')",
+        [orderNumber, q[2], q[3], finalAmount, finalAmount, req.user.id, req.user.real_name, commissionAmount, M.payment_status, M.bill_date, M.receivable_amount, M.received_amount, M.owe_amount]);
     const orderId = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0];
-    for (const it of items) {
+    for (const it of resolved) {
         await run("INSERT INTO sales_order_items (order_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [orderId, it[2], it[3], it[4] || '', it[5], it[6], it[7]]);
-        if (it[2]) await run("UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?", [it[5], it[2]]);
+            [orderId, it.pid, it.name, it.sku, it.qty, it.price, it.amount]);
+        if (it.pid) await run("UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?", [it.qty, it.pid]);
     }
     await run("UPDATE quotes SET status = 'sent' WHERE id = ?", [id]);
     saveDB(); saveDB();
