@@ -2487,11 +2487,26 @@ app.get('/api/finance/customer-statement/:id', authMiddleware, hasPerm('finance_
     const cid = Number(req.params.id);
     const cust = (await safeExec("SELECT id, name, COALESCE(initial_balance,0) FROM customers WHERE id = ?", [cid])).values?.[0];
     if (!cust) return res.status(404).json({ error: '客户不存在' });
-    const orders = (await safeExec("SELECT order_number, created_at, final_amount, payment_status FROM sales_orders WHERE customer_id = ? AND COALESCE(payment_status,'') <> '作废' ORDER BY id", [cid])).values || [];
+    /* 单据 + 商品明细一次取全（LEFT JOIN）：前端打印模板会按 o.items 逐行渲染，
+     * 未挂明细的历史单据 items 为空数组，不影响单据行本身。 */
+    const stmtRows = (await safeExec(`SELECT so.id, so.order_number, so.created_at, so.final_amount, so.payment_status,
+        oi.product_name, oi.quantity, oi.unit_price, oi.amount
+        FROM sales_orders so
+        LEFT JOIN sales_order_items oi ON oi.order_id = so.id
+        WHERE so.customer_id = ? AND COALESCE(so.payment_status,'') <> '作废'
+        ORDER BY so.id, oi.id`, [cid])).values || [];
+    const orderMap = new Map();
+    for (const r of stmtRows) {
+        const oid = Number(r[0]);
+        if (!orderMap.has(oid)) orderMap.set(oid, { order_number: r[1], created_at: r[2], amount: Number(r[3]), status: r[4], items: [] });
+        if (r[5] !== null && r[5] !== undefined) {
+            orderMap.get(oid).items.push({ product_name: r[5], quantity: Number(r[6]) || 0, unit_price: Number(r[7]) || 0, amount: Number(r[8]) || 0 });
+        }
+    }
     const payments = (await safeExec("SELECT created_at, amount, description FROM transactions WHERE type='income' AND party_type='customer' AND party_id = ? ORDER BY id", [cid])).values || [];
     res.json({
         name: cust[1], initial_balance: Number(cust[2]) || 0,
-        orders: orders.map((o) => ({ order_number: o[0], created_at: o[1], amount: Number(o[2]), status: o[3] })),
+        orders: [...orderMap.values()],
         payments: payments.map((p) => ({ created_at: p[0], amount: Number(p[1]), description: p[2] })),
     });
 });
@@ -2501,11 +2516,25 @@ app.get('/api/finance/supplier-statement/:id', authMiddleware, hasPerm('finance_
     const sid = Number(req.params.id);
     const sup = (await safeExec("SELECT id, name, COALESCE(initial_balance,0) FROM suppliers WHERE id = ?", [sid])).values?.[0];
     if (!sup) return res.status(404).json({ error: '供应商不存在' });
-    const orders = (await safeExec("SELECT order_number, created_at, total_amount, payment_status FROM purchase_orders WHERE supplier_id = ? AND COALESCE(payment_status,'') <> '作废' ORDER BY id", [sid])).values || [];
+    /* 同客户对账单：单据 + 商品明细一次取全（LEFT JOIN），未挂明细的历史单据 items 为空数组 */
+    const stmtRows = (await safeExec(`SELECT po.id, po.order_number, po.created_at, po.total_amount, po.payment_status,
+        oi.product_name, oi.quantity, oi.unit_price, oi.amount
+        FROM purchase_orders po
+        LEFT JOIN purchase_order_items oi ON oi.order_id = po.id
+        WHERE po.supplier_id = ? AND COALESCE(po.payment_status,'') <> '作废'
+        ORDER BY po.id, oi.id`, [sid])).values || [];
+    const orderMap = new Map();
+    for (const r of stmtRows) {
+        const oid = Number(r[0]);
+        if (!orderMap.has(oid)) orderMap.set(oid, { order_number: r[1], created_at: r[2], amount: Number(r[3]), status: r[4], items: [] });
+        if (r[5] !== null && r[5] !== undefined) {
+            orderMap.get(oid).items.push({ product_name: r[5], quantity: Number(r[6]) || 0, unit_price: Number(r[7]) || 0, amount: Number(r[8]) || 0 });
+        }
+    }
     const payments = (await safeExec("SELECT created_at, amount, description FROM transactions WHERE type='expense' AND party_type='supplier' AND party_id = ? ORDER BY id", [sid])).values || [];
     res.json({
         name: sup[1], initial_balance: Number(sup[2]) || 0,
-        orders: orders.map((o) => ({ order_number: o[0], created_at: o[1], amount: Number(o[2]), status: o[3] })),
+        orders: [...orderMap.values()],
         payments: payments.map((p) => ({ created_at: p[0], amount: Number(p[1]), description: p[2] })),
     });
 });
