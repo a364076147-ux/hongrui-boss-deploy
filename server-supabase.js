@@ -794,20 +794,33 @@ app.post('/api/finance/transactions/income', authMiddleware, hasPerm('income'), 
     const cat = category || (pname ? '收欠款' : '直接收款');
     await run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name) VALUES ('income', ?, ?, ?, ?, ?, ?, ?, ?, ?)", [accId, amount, cat, description, req.user.id, req.user.real_name, ptype, pid, pname]);
     await run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [amount, accId]);
-    // 冲减该客户欠款：若指定客户，将其最早未结清销售单标记已结清（按金额抵扣）
+    // 冲减该客户欠款（2026-10-04 修复）：按金额逐单抵扣，并【同步三个金额字段】。
+    //   原实现只改 payment_status，不动 received_amount / owe_amount ⇒ 造出「已结清但欠款仍在」的
+    //   不自洽单；而界面状态只看 owe_amount（OrderManagement 的 isUnpaid = owe > 0.005）
+    //   ⇒ 少收的钱会被前台显示成「已收款」。故必须三字段一起改。
     if (pid && category !== '直接收款') {
-        const unpaid = (await safeExec("SELECT id, final_amount FROM sales_orders WHERE customer_id = ? AND COALESCE(payment_status,'') NOT IN ('已结清','作废') ORDER BY id LIMIT 20", [pid])).values || [];
-        // 按金额逐单抵扣：收款金额先抵最早的欠单，不足部分保持未结清（不再一刀切全部标记已结清）
+        const unpaid = (await safeExec(`SELECT id, COALESCE(receivable_amount, final_amount, 0) due,
+                COALESCE(received_amount, 0) rec
+            FROM sales_orders
+            WHERE customer_id = ? AND COALESCE(payment_status,'') NOT IN ('已结清','作废')
+            ORDER BY id LIMIT 20`, [pid])).values || [];
         let remain = Number(amount) || 0;
         for (const row of unpaid) {
-            if (remain <= 0) break;
+            if (remain <= 0.005) break;
             const due = Number(row[1]) || 0;
-            if (remain >= due) {
+            const rec0 = Number(row[2]) || 0;
+            const gap = Math.round((due - rec0) * 100) / 100;
+            if (gap <= 0.005) {
+                // 金额其实已够、只是状态没更新 ⇒ 仅补状态，避免重复加钱
                 await run("UPDATE sales_orders SET payment_status = '已结清' WHERE id = ?", [row[0]]);
-                remain -= due;
-            } else {
-                remain = 0;
+                continue;
             }
+            const pay = Math.min(remain, gap);
+            const newRec = Math.round((rec0 + pay) * 100) / 100;
+            const newOwe = Math.round(Math.max(0, due - newRec) * 100) / 100;
+            await run("UPDATE sales_orders SET received_amount = ?, owe_amount = ?, payment_status = ? WHERE id = ?",
+                [newRec, newOwe, newOwe <= 0.005 ? '已结清' : '未结清', row[0]]);
+            remain = Math.round((remain - pay) * 100) / 100;
         }
     }
     saveDB(); saveDB();
@@ -2500,15 +2513,25 @@ app.get('/api/finance/supplier-reconciliation', authMiddleware, hasPerm('reconci
 const SANKE_NAMES = ['零售散客', '批发散客']; // 散客为现金交易，不计应收/应付（智慧记同口径：cur_amt=0）
 const PARTY_ALIAS = { '宇辉厨卫Y': '大宇厨卫' }; // 旧名 → 现名：同一个往来单位的多份档案按现名合并计数
 const _sqlLit = (s) => "'" + String(s).replace(/'/g, "''") + "'";
+/**
+ * ★ 空白折叠（2026-10-04，以智慧记为准）：NBSP(U+00A0) / 全角空格(U+3000) / Tab / 换行
+ *   一律折成【单个半角空格】并去首尾。
+ * 为什么必须：PostgreSQL 的 TRIM() 不去 NBSP，而库内名可能带 NBSP、外部系统导出用半角空格
+ *   ⇒ 同一往来单位被拆成两组：真身拿不到调整额（优惠/抹零静默失效）、前台多出「倒欠」幽灵客户，
+ *   而【总合计不变】——只看总数永远发现不了。
+ * 规则必须与 JS 侧 canonName 完全一致（单一真源）。
+ */
+const FOLD_SQL = (col) => `btrim(regexp_replace(translate(${col}, chr(160)||chr(12288)||chr(9)||chr(10)||chr(13), '     '), ' +', ' ', 'g'))`;
 const canonName = (n) => {
-    const k = String(n === null || n === undefined ? '' : n).trim();
+    const k = String(n === null || n === undefined ? '' : n).replace(/[\s\u00A0\u3000]+/g, ' ').trim();
     return Object.prototype.hasOwnProperty.call(PARTY_ALIAS, k) ? PARTY_ALIAS[k] : k;
 };
 /** 生成「把某列规范化到现名」的 SQL 表达式。规则必须与 canonName 完全一致。 */
 function canonSQL(col) {
+    const base = FOLD_SQL(col);
     const cases = Object.entries(PARTY_ALIAS)
-        .map(([from, to]) => `WHEN TRIM(${col}) = ${_sqlLit(from)} THEN ${_sqlLit(to)}`).join(' ');
-    return cases ? `CASE ${cases} ELSE TRIM(${col}) END` : `TRIM(${col})`;
+        .map(([from, to]) => `WHEN ${base} = ${_sqlLit(from)} THEN ${_sqlLit(to)}`).join(' ');
+    return cases ? `CASE ${cases} ELSE ${base} END` : base;
 }
 // ==================== 应收应付对账（口径：期初欠款 + 全量销售/进货 − 全量已收/已付 = 期末欠款） ====================
 app.get('/api/finance/arap', authMiddleware, hasPerm('finance_view'), async (_req, res) => {
@@ -2516,24 +2539,46 @@ app.get('/api/finance/arap', authMiddleware, hasPerm('finance_view'), async (_re
     const CANON_C = canonSQL('c.name');
     const CANON_S = canonSQL('s.name');
     // 客户：先按现名合并同单位多档案（pid 取「档案名就是现名」那条的 id，保证对账单跳转到主档）
+    /* ★ 口径（2026-10-04 以智慧记为准，逐家预演已对齐 ¥0 差异）：
+     *   balance = 期初 + 单据发生额 − 收支流水净额 − 优惠 + 抹零
+     *   ① 单据发生额取【双向净额】= Σ销售单 − Σ采购单
+     *      —— 智慧记对「同时有销售与采购」的单位只按其档案主类型归一侧，且两侧互抵。
+     *      实测：赵明义 Σ采 608,327.80 − Σ销 88,040.80 ⇒ 只出现在应付侧 33,866.60（应收侧完全不出现）。
+     *   ② 应收侧【排除】「在 suppliers(status=1) 里同名的单位」
+     *      —— 智慧记 29 家 type=2 供应商曾被宏瑞一并建成客户档案 ⇒ 应收虚增 ¥94,297.80 的真正根因。
+     *   ③ 流水取【收支净额】= Σ(income) − Σ(expense)
+     *      —— 智慧记 back_tamt 即净额（实测佳研新材料：−3,960 − 10,080 = −14,040，与其 back 完全一致）。
+     *   ④ 归集一律走 FOLD_SQL 折叠空白，杜绝 NBSP 撕裂。 */
     const custRows = (await safeExec(`SELECT cg.nm, cg.pid, cg.ib,
-        COALESCE(u.cnt,0) uc, COALESCE(u.amt,0) ua, COALESCE(p.amt,0) pa,
+        COALESCE(u.cnt,0) uc, COALESCE(u.amt,0) ua,
+        COALESCE(pu.cnt,0) puc, COALESCE(pu.amt,0) pua,
+        COALESCE(t.amt,0) ta,
         COALESCE(adj.pref,0) pref, COALESCE(adj.trim,0) trim
         FROM (
             SELECT ${CANON_C} nm,
-                   COALESCE(MIN(c.id) FILTER (WHERE ${CANON_C} = TRIM(c.name)), MIN(c.id)) pid,
+                   COALESCE(MIN(c.id) FILTER (WHERE ${CANON_C} = ${FOLD_SQL('c.name')}), MIN(c.id)) pid,
                    SUM(COALESCE(c.initial_balance,0)) ib
-            FROM customers c WHERE c.status=1 GROUP BY 1
+            FROM customers c
+            WHERE c.status=1
+              AND NOT EXISTS (SELECT 1 FROM suppliers s
+                              WHERE s.status=1 AND ${FOLD_SQL('s.name')} = ${FOLD_SQL('c.name')})
+            GROUP BY 1
         ) cg
         LEFT JOIN (SELECT ${canonSQL('customer_name')} nm, COUNT(*) cnt, SUM(final_amount) amt
                    FROM sales_orders
                    WHERE COALESCE(payment_status,'') <> '作废'
-                     AND customer_name IS NOT NULL AND TRIM(customer_name) <> ''
+                     AND customer_name IS NOT NULL AND ${FOLD_SQL('customer_name')} <> ''
                    GROUP BY 1) u ON u.nm = cg.nm
-        LEFT JOIN (SELECT ${canonSQL('party_name')} nm, SUM(amount) amt
+        LEFT JOIN (SELECT ${canonSQL('supplier_name')} nm, COUNT(*) cnt, SUM(total_amount) amt
+                   FROM purchase_orders
+                   WHERE COALESCE(payment_status,'') <> '作废'
+                     AND supplier_name IS NOT NULL AND ${FOLD_SQL('supplier_name')} <> ''
+                   GROUP BY 1) pu ON pu.nm = cg.nm
+        LEFT JOIN (SELECT ${canonSQL('party_name')} nm,
+                          SUM(CASE WHEN type='income' THEN amount ELSE -amount END) amt
                    FROM transactions
-                   WHERE type='income' AND party_name IS NOT NULL AND TRIM(party_name) <> ''
-                   GROUP BY 1) p ON p.nm = cg.nm
+                   WHERE party_name IS NOT NULL AND ${FOLD_SQL('party_name')} <> ''
+                   GROUP BY 1) t ON t.nm = cg.nm
         LEFT JOIN (SELECT ${canonSQL('party_name')} nm,
                           SUM(CASE WHEN adj_type='preferential' THEN amount ELSE 0 END) pref,
                           SUM(CASE WHEN adj_type='trim' THEN amount ELSE 0 END) trim
@@ -2541,42 +2586,54 @@ app.get('/api/finance/arap', authMiddleware, hasPerm('finance_view'), async (_re
                    GROUP BY 1) adj ON adj.nm = cg.nm`)).values || [];
     const receivables = custRows.map((r) => {
         const initial = Number(r[2]) || 0;
-        const unpaidAmt = Number(r[4]) || 0;
-        const received = Number(r[5]) || 0;
-        const preferential = Number(r[6]) || 0;
-        const trim = Number(r[7]) || 0;
+        const saleAmt = Number(r[4]) || 0;      // Σ销售单
+        const purchAmt = Number(r[6]) || 0;     // Σ采购单
+        const received = Number(r[7]) || 0;     // 收支净额
+        const preferential = Number(r[8]) || 0;
+        const trim = Number(r[9]) || 0;
+        const unpaidAmt = Math.round((saleAmt - purchAmt) * 100) / 100; // ★ 双向净额
         const balance = Math.round((initial + unpaidAmt - received - preferential + trim) * 100) / 100;
         return {
             party_id: Number(r[1]), name: String(r[0] || ''),
             initial_balance: Math.round(initial * 100) / 100,
-            unpaid_orders: Number(r[3]) || 0, unpaid_amount: Math.round(unpaidAmt * 100) / 100,
+            unpaid_orders: Number(r[3]) || 0, unpaid_amount: unpaidAmt,
             received: Math.round(received * 100) / 100,
             preferential: Math.round(preferential * 100) / 100,
             trim: Math.round(trim * 100) / 100,
             balance,
         };
     }).filter((x) => !SANKE_NAMES.includes(x.name))
-      .filter((x) => Math.abs(x.balance) > 0.001 || x.unpaid_orders > 0)
+      .filter((x) => Math.abs(x.balance) > 0.001 || x.unpaid_orders > 0 || x.received !== 0)
       .sort((a, b) => b.balance - a.balance);
     // 供应商：同一套按名称归集。赵明义等「既是客户又是供应商」的单位，两侧各自独立计入（老板 10-03 定性：两个都算）
+    /* ★ 供应商侧同口径（2026-10-04）：docAmt = Σ采购单 − Σ销售单；paid = 收支净额(expense − income)。
+     *   双向单位（赵明义/伟岸中科）在智慧记里只出现在应付侧，且与销售侧互抵 ⇒ 本侧【不】做排除。 */
     const supRows = (await safeExec(`SELECT sg.nm, sg.pid, sg.ib,
-        COALESCE(u.cnt,0) uc, COALESCE(u.amt,0) ua, COALESCE(p.amt,0) pa,
+        COALESCE(u.cnt,0) uc, COALESCE(u.amt,0) ua,
+        COALESCE(su.cnt,0) suc, COALESCE(su.amt,0) sua,
+        COALESCE(t.amt,0) ta,
         COALESCE(adj.pref,0) pref, COALESCE(adj.trim,0) trim
         FROM (
             SELECT ${CANON_S} nm,
-                   COALESCE(MIN(s.id) FILTER (WHERE ${CANON_S} = TRIM(s.name)), MIN(s.id)) pid,
+                   COALESCE(MIN(s.id) FILTER (WHERE ${CANON_S} = ${FOLD_SQL('s.name')}), MIN(s.id)) pid,
                    SUM(COALESCE(s.initial_balance,0)) ib
             FROM suppliers s WHERE s.status=1 GROUP BY 1
         ) sg
         LEFT JOIN (SELECT ${canonSQL('supplier_name')} nm, COUNT(*) cnt, SUM(total_amount) amt
                    FROM purchase_orders
                    WHERE COALESCE(payment_status,'') <> '作废'
-                     AND supplier_name IS NOT NULL AND TRIM(supplier_name) <> ''
+                     AND supplier_name IS NOT NULL AND ${FOLD_SQL('supplier_name')} <> ''
                    GROUP BY 1) u ON u.nm = sg.nm
-        LEFT JOIN (SELECT ${canonSQL('party_name')} nm, SUM(amount) amt
+        LEFT JOIN (SELECT ${canonSQL('customer_name')} nm, COUNT(*) cnt, SUM(final_amount) amt
+                   FROM sales_orders
+                   WHERE COALESCE(payment_status,'') <> '作废'
+                     AND customer_name IS NOT NULL AND ${FOLD_SQL('customer_name')} <> ''
+                   GROUP BY 1) su ON su.nm = sg.nm
+        LEFT JOIN (SELECT ${canonSQL('party_name')} nm,
+                          SUM(CASE WHEN type='expense' THEN amount ELSE -amount END) amt
                    FROM transactions
-                   WHERE type='expense' AND party_name IS NOT NULL AND TRIM(party_name) <> ''
-                   GROUP BY 1) p ON p.nm = sg.nm
+                   WHERE party_name IS NOT NULL AND ${FOLD_SQL('party_name')} <> ''
+                   GROUP BY 1) t ON t.nm = sg.nm
         LEFT JOIN (SELECT ${canonSQL('party_name')} nm,
                           SUM(CASE WHEN adj_type='preferential' THEN amount ELSE 0 END) pref,
                           SUM(CASE WHEN adj_type='trim' THEN amount ELSE 0 END) trim
@@ -2584,22 +2641,24 @@ app.get('/api/finance/arap', authMiddleware, hasPerm('finance_view'), async (_re
                    GROUP BY 1) adj ON adj.nm = sg.nm`)).values || [];
     const payables = supRows.map((r) => {
         const initial = Number(r[2]) || 0;
-        const unpaidAmt = Number(r[4]) || 0;
-        const paid = Number(r[5]) || 0;
-        const preferential = Number(r[6]) || 0;
-        const trim = Number(r[7]) || 0;
+        const purchAmt = Number(r[4]) || 0;     // Σ采购单
+        const saleAmt = Number(r[6]) || 0;      // Σ销售单
+        const paid = Number(r[7]) || 0;         // 收支净额
+        const preferential = Number(r[8]) || 0;
+        const trim = Number(r[9]) || 0;
+        const unpaidAmt = Math.round((purchAmt - saleAmt) * 100) / 100; // ★ 双向净额
         const balance = Math.round((initial + unpaidAmt - paid - preferential + trim) * 100) / 100;
         return {
             party_id: Number(r[1]), name: String(r[0] || ''),
             initial_balance: Math.round(initial * 100) / 100,
-            unpaid_orders: Number(r[3]) || 0, unpaid_amount: Math.round(unpaidAmt * 100) / 100,
+            unpaid_orders: Number(r[3]) || 0, unpaid_amount: unpaidAmt,
             paid: Math.round(paid * 100) / 100,
             preferential: Math.round(preferential * 100) / 100,
             trim: Math.round(trim * 100) / 100,
             balance,
         };
     }).filter((x) => !SANKE_NAMES.includes(x.name))
-      .filter((x) => Math.abs(x.balance) > 0.001 || x.unpaid_orders > 0)
+      .filter((x) => Math.abs(x.balance) > 0.001 || x.unpaid_orders > 0 || x.paid !== 0)
       .sort((a, b) => b.balance - a.balance);
     res.json({
         receivables,

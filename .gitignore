@@ -26,3 +26,6 @@ DEPLOY-FREEZE*.md
 SECURITY-BASELINE.md
 ROTATION-KEYS*.txt
 *ROTATION-KEY*
+
+# 本地联调用的依赖联接（Render 侧自行 npm install），禁止提交
+node_modules/
