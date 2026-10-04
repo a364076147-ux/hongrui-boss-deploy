@@ -370,7 +370,14 @@ app.use(express.json());
 /* 健康探针（免鉴权）—— 保活脚本与前端「唤醒」都用它：
  *   · 只做 1 次极轻查询，不碰业务表，成本 ≈ 1 次往返
  *   · 刻意不缓存，CDN/代理必须回源，否则保活打不到源站
- *   · 返回 db 字段用于区分「进程活着」与「进程活着但连不上库」 */
+ *   · 返回 db 字段用于区分「进程活着」与「进程活着但连不上库」
+ * ★ 2026-10-04 增补 commit/bootAt：起因是一次「部署验证通过」其实是**假通过** ——
+ *   我拿「/api/health 存在」「有 cache-control」当判据，可这两个标记在**上一个 commit 里也有**，
+ *   于是无法区分「新代码上线」还是「旧代码还在」。教训：判据必须能唯一指认被部署的那份代码。
+ *   Render 会注入 RENDER_GIT_COMMIT ⇒ 直接把它读出来，commit 号即可判定，不再靠推理。
+ *   bootAt = 进程启动时刻，作为 commit 取不到时的兜底（比对是否晚于触发部署的时间）。 */
+const BOOT_AT = new Date().toISOString();
+const BUILD_COMMIT = process.env.RENDER_GIT_COMMIT || null;
 app.get('/api/health', async (_req, res) => {
     const t0 = Date.now();
     let db = false;
@@ -379,7 +386,7 @@ app.get('/api/health', async (_req, res) => {
         db = !!(r.values && r.values.length);
     } catch (e) { db = false; }
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-    res.json({ ok: true, db, ms: Date.now() - t0, at: new Date().toISOString() });
+    res.json({ ok: true, db, ms: Date.now() - t0, at: new Date().toISOString(), commit: BUILD_COMMIT, bootAt: BOOT_AT });
 });
 // ==================== 权限体系 ====================
 // 细粒度功能权限：管理员/店长默认拥有全部；店员按 permissions 数组控制
