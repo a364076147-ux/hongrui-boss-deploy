@@ -1,14 +1,57 @@
 name: Keep Render Alive
+
+# 目的：Render 免费实例 15 分钟无入站流量会休眠，下次访问要付 30~60 秒冷启动。
+# 本机那条保活（C:\temp\keepalive_local.bat，每 2 分钟）是主力；
+# 这里只做**兜底**：老板电脑关机/断网时顶上。
+#
+# ★ 2026-10-04 重写，修掉三个既有缺陷（均已实测）：
+#   ① 旧版 `--max-time 30` **短于冷启动时间** ⇒ 实例正在唤醒时必然判失败，等于没兜底；
+#   ② 旧版只看单次结果、**不重试** ⇒ 一次网络抖动就整轮白跑；
+#   ③ 旧版 GitHub 免费档对 schedule 有**限流**（实测实际间隔 2~5 小时，远不是 5 分钟）
+#      ⇒ 单靠它保不住 15 分钟窗口。故本版把「单次运行」做成**自愈式**：
+#         一旦发现这次是冷启动（响应 >5s），就在本次运行内接着养热几分钟，
+#         让被限流后偶尔才跑的那一次也能把实例真正拉起来。
+#
+# 端点换成 /api/health：免鉴权、只做 1 次极轻查询，且会真正校验「进程活着 + 连得上库」。
+
 on:
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
+concurrency:
+  group: keep-alive
+  cancel-in-progress: false
+
 jobs:
   ping:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Ping backend API
+      - name: Ping health (cold-start tolerant, self-healing)
         run: |
-          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 https://hongrui-boss-erp-api.onrender.com/api/auth/me)
-          echo "HTTP $code (401 属正常，说明服务器已响应请求)"
+          set +e
+          URL="https://hongrui-boss-erp-api.onrender.com/api/health"
+          ok=0
+          for i in 1 2 3 4 5 6; do
+            t0=$(date +%s%3N)
+            code=$(curl -s -o /tmp/h.json -w "%{http_code}" --connect-timeout 20 --max-time 90 "$URL")
+            t1=$(date +%s%3N)
+            ms=$((t1 - t0))
+            echo "try#$i  HTTP=$code  ${ms}ms  body=$(head -c 200 /tmp/h.json 2>/dev/null)"
+            if [ "$code" = "200" ]; then
+              ok=1
+              # 冷启动特征：响应很慢 ⇒ 这次把它养热，别让它马上又睡回去
+              if [ "$ms" -gt 5000 ]; then
+                echo "检测到冷启动（${ms}ms）=> 追加两次热身"
+                sleep 60; curl -s -o /dev/null --max-time 60 "$URL"; echo "warm+60s done"
+                sleep 60; curl -s -o /dev/null --max-time 60 "$URL"; echo "warm+120s done"
+              fi
+              break
+            fi
+            sleep 45
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::warning::6 次健康检查均未成功 —— 可能实例正在冷启动或链路异常（本步不失败，避免刷失败邮件）"
+          fi
+          exit 0
