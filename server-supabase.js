@@ -9,7 +9,6 @@ import path from 'path';
 import fs from 'fs';
 import multer from 'multer';
 import XLSX from 'xlsx';
-import zlib from 'node:zlib';
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 const PORT = Number(process.env.PORT || 3001);
 // ===== 安全加固：凭据必须来自环境变量（Render 控制台 Secret 注入），禁止明文 fallback =====
@@ -145,31 +144,16 @@ async function scalars(specs) {
     return out;
 }
 
-/* ==================== 传输层：零依赖 gzip 压缩 ====================
- * 为什么不用 compression 包：后端镜像每次部署都要 npm install，
- * 少一个依赖 = 少一次构建失败面。此处只用 Node 内置 zlib。
- * 只压 JSON 文本、只压 ≥1KB 的响应（小响应压了反而更慢）。 */
-function gzipMiddleware(req, res, next) {
-    const ae = String(req.headers['accept-encoding'] || '');
-    if (!/\bgzip\b/.test(ae)) return next();
-    if (req.method === 'HEAD') return next();
-    const origJson = res.json.bind(res);
-    res.json = function (body) {
-        let buf;
-        try { buf = Buffer.from(JSON.stringify(body)); } catch (e) { return origJson(body); }
-        if (buf.length < 1024) return origJson(body);
-        zlib.gzip(buf, { level: 5 }, (err, gz) => {
-            if (err) return origJson(body);
-            res.setHeader('Content-Encoding', 'gzip');
-            res.setHeader('Content-Type', 'application/json; charset=utf-8');
-            res.setHeader('Content-Length', gz.length);
-            res.setHeader('Vary', 'Accept-Encoding');
-            res.end(gz);
-        });
-    };
-    res.json.__gzipWrapped = true;
-    next();
-}
+/* ==================== 传输压缩：**不自己压**（2026-10-04 实测结论） ====================
+ * 曾有 `gzipMiddleware`（用 node:zlib 压 ≥1KB 的 JSON），实测后**已移除**。理由（_probe-gzip-reality.cjs）：
+ *   Render 的响应头是 `server: cloudflare` —— 边缘代理**本来就在压缩**，而且比我还积极：
+ *     · /analysis/dashboard           231B → 159B（我压它也是这个量级）
+ *     · /store/settings                75B →  88B ← **平台连 75 字节都压**（此时压缩是负收益）
+ *     · /inventory/products?pageSize=50  17,919B → 1,731B（9.7%）
+ *   拿这些数在**部署前**测的 ⇒ 压缩与我的代码无关。
+ *   自建中间件的后果只有：多一层要维护的代码、多一个出错面、**收益为 0**。
+ * ⚠️ 后来者勿再加：除非换了不带边缘压缩的托管，否则这里不需要压缩层。
+ * ==================================================================================== */
 
 /* ==================== 传输层：只读参考数据的短缓存 ====================
  * 这些数据一天之内几乎不变，但每次进页面都要拉一次。
@@ -381,7 +365,6 @@ const app = express();
 app.use(helmet());
 app.use(cors({ exposedHeaders: ['X-Sensitive-Filtered'] }));
 app.use(morgan('dev'));
-app.use(gzipMiddleware);        // 零依赖 gzip（≥1KB 的 JSON 才压）
 app.use(cacheHeaderMiddleware); // 只读参考数据的私有短缓存
 app.use(express.json());
 /* 健康探针（免鉴权）—— 保活脚本与前端「唤醒」都用它：
