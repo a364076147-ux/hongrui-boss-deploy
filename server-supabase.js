@@ -239,19 +239,28 @@ async function _runMigrations() {
             `CREATE INDEX IF NOT EXISTS idx_customers_name ON customers (name)`,
             `CREATE INDEX IF NOT EXISTS idx_suppliers_name ON suppliers (name)`,
             `CREATE INDEX IF NOT EXISTS idx_products_name ON products (name)`,
-            /* ============ 单据号对齐智慧记（2026-10-05）============
-             * 智慧记全站单据都有号：销售 XSD / 进货 JHD / 收款 SKD / 付款 FKD。
+            /* ============ 单据号对齐智慧记（2026-10-05，2026-10-08 修订）============
+             * 智慧记全站单据都有号：销售 XSD / 进货 JHD / 收款 SKD / 付款 FKD / 其他收支 SZD。
              * 宏瑞原本只有销售/进货有号，**收付款完全没有单据号** ⇒ 客户拿收款单来对账时
              * 无法指认（只能靠金额+日期猜），这是对账环节的真实断点。
-             * 这里给 transactions 补一列；老数据为 NULL 不回填（历史单据号已不可复原，
-             *   强行回填等于伪造凭证号，比留空更坏）。 */
+             *
+             * ★ 2026-10-08 事实更正：原注释写「历史单据号已不可复原」**是错的**。
+             *   智慧记 `fund_flow.code` 就是每条资金流水对应的真实单据号（实测 3435 条里
+             *   只有 1 条为空），已由 import-zhj-to-supabase.cjs 按 reference_id 逐条回填。
+             *   这是「从权威源回填」，不是伪造：值就是智慧记自己的 code。 */
             `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS order_number TEXT`,
             `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS party_type TEXT`,
             `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS party_id BIGINT`,
             `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS party_name TEXT`,
-            /* 唯一索引只约束「非空值」：老单据 order_number 为 NULL 不受影响（PG 唯一索引天然允许
-             * 多行 NULL）。写成部分索引是为了让"老数据留空"与"新数据不重复"同时成立。 */
-            `CREATE UNIQUE INDEX IF NOT EXISTS uq_transactions_number ON transactions (order_number) WHERE order_number IS NOT NULL`,
+            /* ★ 2026-10-08 口径修正：撤掉「单据号全局唯一」。
+             *   根因（实测）：智慧记**一张收付款单可以对应多条资金流水** ——
+             *   `SZD202503180001` 对应 2 笔（¥2100 / ¥2000）、`SKD202505090001` 对应 2 笔。
+             *   原索引 `uq_transactions_number (order_number)` 会让第 2 笔撞键，而
+             *   PostgREST 返回 409 被导入器静默吞掉 ⇒ 单号只补上一半（3434/3435）。
+             *   改为 (order_number, reference_id) 复合唯一：同一单据号**允许**出现在多条
+             *   流水上（与智慧记一致），但同一来源流水（reference_id）不可能重复入账。 */
+            `DROP INDEX IF EXISTS uq_transactions_number`,
+            `CREATE UNIQUE INDEX IF NOT EXISTS uq_transactions_number_ref ON transactions (order_number, reference_id) WHERE order_number IS NOT NULL AND reference_id IS NOT NULL`,
             `CREATE INDEX IF NOT EXISTS idx_transactions_number ON transactions (order_number)`,
             `CREATE INDEX IF NOT EXISTS idx_transactions_party ON transactions (party_type, party_id)`,
         ];
