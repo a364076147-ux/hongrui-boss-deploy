@@ -197,6 +197,13 @@ async function _runMigrations() {
             `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS tax_amount DOUBLE PRECISION DEFAULT 0`,
             `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS remark TEXT`,
             `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS biz_type TEXT DEFAULT 'sale'`,
+            /* ★ 2026-10-08 补「制单人」：智慧记单据里「业务员」与「制单人」是**两个不同的人**，
+             *   实测销售单 4527 条：制单人 曹怡航 3202 / 老板 1325；业务员 曹怡航 2464 / 老板 2063
+             *   —— 两者对不上 738 条。宏瑞此前只有 operator_name（=业务员/业绩归属），
+             *   没有「谁录的这张单」⇒ 单据详情无法与智慧记逐字对齐。
+             *   历史行留 NULL（老数据没有这个信息，不回填、不猜测），展示层显「—」。 */
+            `ALTER TABLE sales_orders ADD COLUMN IF NOT EXISTS maker_name TEXT`,
+            `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS maker_name TEXT`,
             `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS bill_date TEXT`,
             `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS paid_amount DOUBLE PRECISION DEFAULT 0`,
             `ALTER TABLE purchase_orders ADD COLUMN IF NOT EXISTS owe_amount DOUBLE PRECISION DEFAULT 0`,
@@ -2283,7 +2290,7 @@ app.get('/api/store/customer-last-prices/:id', authMiddleware, hasPerm('sales'),
     }
     res.json(out);
 });
-const PO_COLS = "id, order_number, supplier_id, supplier_name, total_amount, status, operator_id, operator_name, created_at, payment_status, bill_date, paid_amount, owe_amount, remark";
+const PO_COLS = "id, order_number, supplier_id, supplier_name, total_amount, status, operator_id, operator_name, created_at, payment_status, bill_date, paid_amount, owe_amount, remark, maker_name";
 function mapPurchaseOrder(o) {
     const owe = Number(o[12] || 0);
     return {
@@ -2293,7 +2300,7 @@ function mapPurchaseOrder(o) {
         // 结算状态一律走唯一判据（owe ≤ 0 ⇒ 已结清），不再 `|| '已结清'` 静默兜底
         payment_status: purchasePaymentStatus(o[9], owe),
         bill_date: o[10] || (o[8] ? String(o[8]).slice(0, 10) : null),
-        paid_amount: Number(o[11] || 0), owe_amount: owe, remark: o[13] || ''
+        paid_amount: Number(o[11] || 0), owe_amount: owe, remark: o[13] || '', maker_name: o[14] || null
     };
 }
 app.get('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), async (req, res) => {
@@ -2420,7 +2427,7 @@ app.get('/api/store/sales-staff', authMiddleware, hasPerm('sales'), async (_req,
     res.json((result.values || []).map((u) => ({ id: u[0], real_name: u[1], role: u[2] })));
 });
 // 销售单列清单（含财务口径字段），统一在此维护，避免各处 SELECT 漏字段
-const SO_COLS = "id, order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, created_at, payment_status, commission_amount, bill_date, receivable_amount, received_amount, owe_amount, small_change_amount, express_amount, tax_amount, remark, biz_type";
+const SO_COLS = "id, order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, created_at, payment_status, commission_amount, bill_date, receivable_amount, received_amount, owe_amount, small_change_amount, express_amount, tax_amount, remark, biz_type, maker_name";
 function mapSalesOrder(o) {
     return {
         id: o[0], order_number: o[1], customer_id: Number(o[2]) || null, customer_name: o[3],
@@ -2430,7 +2437,7 @@ function mapSalesOrder(o) {
         bill_date: o[13] || (o[10] ? String(o[10]).slice(0, 10) : null),
         receivable_amount: Number(o[14] || 0), received_amount: Number(o[15] || 0), owe_amount: Number(o[16] || 0),
         small_change_amount: Number(o[17] || 0), express_amount: Number(o[18] || 0), tax_amount: Number(o[19] || 0),
-        remark: o[20] || '', biz_type: o[21] || 'sale'
+        remark: o[20] || '', biz_type: o[21] || 'sale', maker_name: o[22] || null
     };
 }
 app.get('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req, res) => {
@@ -2562,12 +2569,12 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
     const oweAmount = _money.owe_amount;
     const paymentStatus = _money.payment_status;
     const billDate = _money.bill_date;
-    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, commission_amount, payment_status, bill_date, receivable_amount, received_amount, owe_amount, small_change_amount, express_amount, tax_amount, remark, biz_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, commission_amount, payment_status, bill_date, receivable_amount, received_amount, owe_amount, small_change_amount, express_amount, tax_amount, remark, biz_type, maker_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
         orderNumber, customer_id || null, customer_name || null, totalAmount, discount || 0, finalAmount,
         payment_method || null, operatorId, operatorName, commissionAmount, paymentStatus,
         billDate, _money.receivable_amount, receivedAmount, oweAmount,
         Number(small_change_amount) || 0, Number(express_amount) || 0, Number(tax_amount) || 0,
-        remark || '', 'sale'
+        remark || '', 'sale', req.user.real_name || null
     ]);
     saveDB();
     // Get the inserted order ID by finding the max id
