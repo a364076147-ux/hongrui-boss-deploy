@@ -413,10 +413,12 @@ const ORDER_PREFIX = {
     quote: 'BJD',           // 报价单
     check: 'PDD',           // 盘点单
     transfer: 'DBD',        // 转账/调拨
+    assembly: 'ZZD',        // 组装单（2026-10-08 补：原为 TODO 空壳，无单号可发）
+    split: 'CFD',           // 拆分单（同上）
     XS: 'XSD', JH: 'JHD', SK: 'SKD', FK: 'FKD', TH: 'THD', HS: 'HSD',
-    YD: 'YDD', BJ: 'BJD', PD: 'PDD', DB: 'DBD',
+    YD: 'YDD', BJ: 'BJD', PD: 'PDD', DB: 'DBD', ZZ: 'ZZD', CF: 'CFD',
     XSD: 'XSD', JHD: 'JHD', SKD: 'SKD', FKD: 'FKD', THD: 'THD', HSD: 'HSD',
-    YDD: 'YDD', BJD: 'BJD', PDD: 'PDD', DBD: 'DBD',
+    YDD: 'YDD', BJD: 'BJD', PDD: 'PDD', DBD: 'DBD', ZZD: 'ZZD', CFD: 'CFD',
 };
 /** 把各种写法的前缀归一化成 3 位大写口径。
  *
@@ -1051,20 +1053,295 @@ app.put('/api/inventory/checks/:id/complete', authMiddleware, adminOnly, async (
     saveDB();
     res.json({ ok: true, applied, skipped });
 });
-// Assembly and Split
+/* ══════════════ 组装 / 拆分（2026-10-08 补实现；此前是 TODO 空壳） ══════════════
+ * 旧实现（两个端点一模一样）：
+ *     const { items, operator_id } = req.body;
+ *     // TODO: implement assembly logic
+ *     saveDB();  res.json({ ok: true });
+ *   ⇒ 只回成功、**不扣组件、不加成品、不落表**。
+ *   前端靠「提交后回读库存前后对比」自检并把缺口实情说出来（不说假成功），
+ *   但对任何直接调接口的调用方（脚本 / 自动化 / 以后的导入器）仍是**假成功**。
+ *
+ * 三条必须守住的点：
+ *   ① **先全量校验、再写库**：校验不过一律 400 且一行都不写 ⇒ 不留半成品；
+ *   ② **写库禁use run()**：run() 会把异常吞掉（只打日志，接口照样回 200）——
+ *      这正是本项目反复踩过的「静默失败」。这里统一用 safeExec + RETURNING
+ *      显式确认落库；返回 0 行即视为写入失败。
+ *   ③ **中途失败补偿回滚**：把已改过的库存按反向量改回去再回 500；宁可全退，
+ *      也不留「组件扣了、成品没加」的半截状态。
+ *
+ * 库存增减一律写 `stock_quantity = stock_quantity ± ?`（Postgres 原子读改写），
+ * 不用「先 SELECT 再 UPDATE」，避免并发下丢更新。
+ * 扣减用条件更新 `WHERE id = ? AND stock_quantity >= ?` 并校验影响行数：
+ * 0 行即库存不足 ⇒ 中止。判据与前端 problems 完全一致，两端不各说各话。
+ * ============================================================================ */
+
+/** 库存表统一时间戳（translateSQL 会转成 PG 的 to_char(now() AT TIME ZONE 'Asia/Shanghai'...)） */
+const STOCK_TS = "datetime('now','localtime')";
+
+/** 读若干商品的名称与当前库存 ⇒ Map<id, { name, stock }> */
+async function loadStockMap(ids) {
+    const uniq = [...new Set(ids.map((n) => Number(n)).filter((n) => Number.isInteger(n) && n > 0))];
+    if (!uniq.length) return new Map();
+    const r = await safeExec(
+        `SELECT id, name, stock_quantity FROM products WHERE id IN (${uniq.map(() => '?').join(',')})`,
+        uniq
+    );
+    const m = new Map();
+    for (const row of (r.values || [])) {
+        m.set(Number(row[0]), { name: row[1], stock: Number(row[2]) || 0 });
+    }
+    return m;
+}
+/* 返回值的三种含义必须分清（本项目「假通过」教训）：
+ *   number  = 成功，列为改后的库存
+ *   null    = **业务性失败**（库存不足 / 商品不存在）⇒ 中止并回 400，不要重试
+ *   抛异常  = 基础设施失败（连不上库等）⇒ 走补偿回滚并回 500
+ * safeExec 自身吞异常返回空数组，所以这里把「空结果」也当成异常抛出，
+ * 否则基础设施故障会被误判成「库存不足」，给出一个错误的业务解释。 */
+async function decStock(productId, qty) {
+    const r = await safeExec(
+        `UPDATE products SET stock_quantity = stock_quantity - ?, updated_at = ${STOCK_TS} WHERE id = ? AND stock_quantity >= ? RETURNING stock_quantity`,
+        [qty, productId, qty]
+    );
+    if (!r.values) throw new Error('库存更新未返回结果（疑似数据库连接失败）');
+    if (!r.values.length) return null;
+    return Number(r.values[0][0]);
+}
+async function incStock(productId, qty) {
+    const r = await safeExec(
+        `UPDATE products SET stock_quantity = stock_quantity + ?, updated_at = ${STOCK_TS} WHERE id = ? RETURNING stock_quantity`,
+        [qty, productId]
+    );
+    if (!r.values) throw new Error('库存更新未返回结果（疑似数据库连接失败）');
+    if (!r.values.length) return null;
+    return Number(r.values[0][0]);
+}
+/** 把已生效的库存改动按反向量改回去（回滚）。返回未能复原的条数。 */
+async function rollbackStocks(applied) {
+    let failed = 0;
+    for (const a of applied.slice().reverse()) {
+        try {
+            const r = await safeExec(
+                `UPDATE products SET stock_quantity = stock_quantity + ?, updated_at = ${STOCK_TS} WHERE id = ? RETURNING stock_quantity`,
+                [-a.delta, a.product_id]     // delta 为负⇒反向加回去
+            );
+            if (!r.values || !r.values.length) failed++;
+        } catch { failed++; }
+    }
+    return failed;
+}
+/** 明细数量：必须是大于 0 的整数。
+ *  quantity 列在 assemblies/assembly_items/splits/split_items 里都是 bigint，
+ *  小数会被 Postgres 直接拒绝（500）⇒ 在校验阶段就说清楚，而不是让它变成数据库报错。 */
+function parseQtyIn(raw, label, errs) {
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) { errs.push(`${label}数量必须为大于 0 的数字`); return null; }
+    if (!Number.isInteger(n)) { errs.push(`${label}数量必须为整数（数量列为整数列，小数会被数据库拒绝）`); return null; }
+    return n;
+}
+/** 按 product_id 合并重复行（同商品多行相加），保持首次出现顺序 */
+function mergeByPid(rows) {
+    const idx = new Map(), out = [];
+    for (const r of rows) {
+        if (idx.has(r.product_id)) out[idx.get(r.product_id)].quantity += r.quantity;
+        else { idx.set(r.product_id, out.length); out.push({ ...r }); }
+    }
+    return out;
+}
+
 app.post('/api/inventory/assemblies', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
-    const { items, operator_id } = req.body;
-    // TODO: implement assembly logic
-    saveDB();
-    res.json({ ok: true });
+    const operatorId = Number(req.body?.operator_id) || req.user.id;
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    const errs = [];
+    if (!items.length) errs.push('items 不能为空');
+
+    const compsRaw = [], prodsRaw = [];
+    for (const it of items) {
+        const pid = Number(it?.product_id);
+        if (!Number.isInteger(pid) || pid <= 0) { errs.push('明细中存在无效的 product_id'); continue; }
+        const isComp = Number(it?.is_component) === 1;
+        const q = parseQtyIn(it?.quantity, isComp ? '组件' : '成品', errs);
+        if (q === null) continue;
+        (isComp ? compsRaw : prodsRaw).push({ product_id: pid, quantity: q, is_component: isComp ? 1 : 0 });
+    }
+    const comps = mergeByPid(compsRaw);
+    const prods = mergeByPid(prodsRaw);
+    if (!prods.length) errs.push('必须指定一个成品（is_component=0）');
+    if (!comps.length) errs.push('至少需要一个组件（is_component=1）');
+    const compIds = new Set(comps.map((c) => c.product_id));
+    for (const p of prods) {
+        if (compIds.has(p.product_id)) errs.push(`商品 #${p.product_id} 不能同时作为成品和组件`);
+    }
+
+    const stock = await loadStockMap([...comps, ...prods].map((x) => x.product_id));
+    for (const x of [...comps, ...prods]) {
+        if (!stock.has(x.product_id)) errs.push(`商品 #${x.product_id} 不存在或已停用`);
+    }
+    // 组件库存必须充足（与前端 problems 同一判据）
+    for (const c of comps) {
+        const s = stock.get(c.product_id);
+        if (s && s.stock < c.quantity) {
+            errs.push(`组件「${s.name}」库存不足（需 ${c.quantity}，现有 ${s.stock}）`);
+        }
+    }
+    if (errs.length) return res.status(400).json({ error: errs.join('；'), errors: errs });
+
+    // ── 落库（先写头、再写明细、最后动库存；任何一步失败都回滚） ──
+    const number = await generateOrderNumber('ZZD');
+    const insHead = await safeExec(
+        `INSERT INTO assemblies (assembly_number, operator_id, created_at) VALUES (?, ?, ${STOCK_TS}) RETURNING id`,
+        [number, operatorId]
+    );
+    const assemblyId = insHead.values?.[0]?.[0];
+    if (!assemblyId) return res.status(500).json({ error: '组装单头写入失败' });
+
+    const applied = [];
+    try {
+        for (const x of [...comps, ...prods]) {
+            const r = await safeExec(
+                "INSERT INTO assembly_items (assembly_id, product_id, quantity, is_component) VALUES (?, ?, ?, ?) RETURNING id",
+                [assemblyId, x.product_id, x.quantity, x.is_component]
+            );
+            if (!r.values || !r.values.length) throw new Error(`明细写入失败（商品 #${x.product_id}）`);
+        }
+        const changes = [];
+        for (const c of comps) {
+            const after = await decStock(c.product_id, c.quantity);
+            if (after === null) {
+                const s = stock.get(c.product_id);
+                throw Object.assign(new Error(`组件「${s ? s.name : '#' + c.product_id}」库存不足（需 ${c.quantity}，现有 ${s ? s.stock : 0}）`), { biz: true });
+            }
+            applied.push({ product_id: c.product_id, delta: -c.quantity });
+            changes.push({ product_id: c.product_id, name: stock.get(c.product_id)?.name, before: stock.get(c.product_id)?.stock, after });
+        }
+        for (const p of prods) {
+            const after = await incStock(p.product_id, p.quantity);
+            if (after === null) throw new Error(`成品写入库存失败（商品 #${p.product_id}）`);
+            applied.push({ product_id: p.product_id, delta: p.quantity });
+            changes.push({ product_id: p.product_id, name: stock.get(p.product_id)?.name, before: stock.get(p.product_id)?.stock, after });
+        }
+        saveDB();
+        return res.json({ ok: true, assembly_id: assemblyId, assembly_number: number, changes });
+    } catch (e) {
+        const failed = await rollbackStocks(applied);
+        // 明细行也清掉，避免留下「有明细没库存变动」的孤儿单据
+        await safeExec("DELETE FROM assembly_items WHERE assembly_id = ?", [assemblyId]);
+        await safeExec("DELETE FROM assemblies WHERE id = ?", [assemblyId]);
+        const code = e.biz ? 400 : 500;
+        return res.status(code).json({
+            error: e.message + (applied.length ? `（已回滚 ${applied.length - failed} 项库存改动${failed ? `，${failed} 项复原失败，请人工核对` : ''}）` : ''),
+        });
+    }
 });
 app.post('/api/inventory/splits', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
-    const { items, operator_id } = req.body;
-    // TODO: implement split logic
-    saveDB();
-    res.json({ ok: true });
+    const operatorId = Number(req.body?.operator_id) || req.user.id;
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    const errs = [];
+    /* 契约（由前端 Split.tsx 明确给出，split_items 表无 role 列，故按数组顺序定角色）：
+     *   items[0]    = 母件（扣库存）
+     *   items[1..n] = 子件（加库存，可带 batch_number / expiry_date）
+     * 兼容写法：若调用方每条都带 role='source'|'child' 亦识别（显式优先）。 */
+    if (items.length < 2) errs.push('至少需要 1 个母件和 1 个子件');
+
+    let srcItem = null;
+    const explicitRole = items.some((it) => it && (it.role === 'source' || it.role === 'child'));
+    const childRaw = [];
+    if (explicitRole) {
+        for (const it of items) {
+            const pid = Number(it?.product_id);
+            if (!Number.isInteger(pid) || pid <= 0) { errs.push('明细中存在无效的 product_id'); continue; }
+            const q = parseQtyIn(it?.quantity, it.role === 'source' ? '母件' : '子件', errs);
+            if (q === null) continue;
+            if (it.role === 'source') {
+                if (srcItem) errs.push('只能有一个母件');
+                else srcItem = { product_id: pid, quantity: q };
+            } else childRaw.push({ product_id: pid, quantity: q, batch_number: it?.batch_number ?? null, expiry_date: it?.expiry_date ?? null });
+        }
+        if (!srcItem) errs.push('未指定母件（role=source）');
+    } else {
+        const head = items[0] || {};
+        const pid = Number(head.product_id);
+        if (!Number.isInteger(pid) || pid <= 0) errs.push('母件的 product_id 无效');
+        else {
+            const q = parseQtyIn(head.quantity, '母件', errs);
+            if (q !== null) srcItem = { product_id: pid, quantity: q };
+        }
+        for (const it of items.slice(1)) {
+            const cid = Number(it?.product_id);
+            if (!Number.isInteger(cid) || cid <= 0) { errs.push('明细中存在无效的 product_id'); continue; }
+            const q = parseQtyIn(it?.quantity, '子件', errs);
+            if (q === null) continue;
+            childRaw.push({ product_id: cid, quantity: q, batch_number: it?.batch_number ?? null, expiry_date: it?.expiry_date ?? null });
+        }
+    }
+    const children = mergeByPid(childRaw);
+    if (!children.length) errs.push('至少需要一个子件');
+    if (srcItem) {
+        const childIds = new Set(children.map((c) => c.product_id));
+        if (childIds.has(srcItem.product_id)) errs.push('子件不能与母件相同（如需拆成同商品的不同批次，请把母子件拆到两张单）');
+        /* 数量守恒：母件扣多少、子件就必须加多少。
+         * 不守恒会**凭空增减库存**，是这类单据最容易造成的静默数据损坏 ⇒ 直接拒绝，
+         * 并把两侧数字都写进报错，便于当场核对。 */
+        const totalChild = children.reduce((s, c) => s + c.quantity, 0);
+        if (totalChild !== srcItem.quantity) {
+            errs.push(`拆分的数量不守恒：母件 ${srcItem.quantity}，子件合计 ${totalChild}（两者必须相等，否则会凭空增减库存）`);
+        }
+    }
+
+    const allIds = [...(srcItem ? [srcItem.product_id] : []), ...children.map((c) => c.product_id)];
+    const stock = await loadStockMap(allIds);
+    for (const id of new Set(allIds)) if (!stock.has(id)) errs.push(`商品 #${id} 不存在或已停用`);
+    if (srcItem) {
+        const s = stock.get(srcItem.product_id);
+        if (s && s.stock < srcItem.quantity) errs.push(`母件「${s.name}」库存不足（需 ${srcItem.quantity}，现有 ${s.stock}）`);
+    }
+    if (errs.length) return res.status(400).json({ error: errs.join('；'), errors: errs });
+
+    const number = await generateOrderNumber('CFD');
+    const insHead = await safeExec(
+        `INSERT INTO splits (split_number, operator_id, created_at) VALUES (?, ?, ${STOCK_TS}) RETURNING id`,
+        [number, operatorId]
+    );
+    const splitId = insHead.values?.[0]?.[0];
+    if (!splitId) return res.status(500).json({ error: '拆分单头写入失败' });
+
+    const applied = [];
+    try {
+        for (const row of [{ ...srcItem, batch_number: null, expiry_date: null }, ...children]) {
+            const r = await safeExec(
+                "INSERT INTO split_items (split_id, product_id, quantity, batch_number, expiry_date) VALUES (?, ?, ?, ?, ?) RETURNING id",
+                [splitId, row.product_id, row.quantity, row.batch_number ?? null, row.expiry_date ?? null]
+            );
+            if (!r.values || !r.values.length) throw new Error(`明细写入失败（商品 #${row.product_id}）`);
+        }
+        const changes = [];
+        const afterSrc = await decStock(srcItem.product_id, srcItem.quantity);
+        if (afterSrc === null) {
+            const s = stock.get(srcItem.product_id);
+            throw Object.assign(new Error(`母件「${s ? s.name : '#' + srcItem.product_id}」库存不足（需 ${srcItem.quantity}，现有 ${s ? s.stock : 0}）`), { biz: true });
+        }
+        applied.push({ product_id: srcItem.product_id, delta: -srcItem.quantity });
+        changes.push({ product_id: srcItem.product_id, name: stock.get(srcItem.product_id)?.name, before: stock.get(srcItem.product_id)?.stock, after: afterSrc });
+        for (const c of children) {
+            const after = await incStock(c.product_id, c.quantity);
+            if (after === null) throw new Error(`子件写入库存失败（商品 #${c.product_id}）`);
+            applied.push({ product_id: c.product_id, delta: c.quantity });
+            changes.push({ product_id: c.product_id, name: stock.get(c.product_id)?.name, before: stock.get(c.product_id)?.stock, after });
+        }
+        saveDB();
+        return res.json({ ok: true, split_id: splitId, split_number: number, changes });
+    } catch (e) {
+        const failed = await rollbackStocks(applied);
+        await safeExec("DELETE FROM split_items WHERE split_id = ?", [splitId]);
+        await safeExec("DELETE FROM splits WHERE id = ?", [splitId]);
+        const code = e.biz ? 400 : 500;
+        return res.status(code).json({
+            error: e.message + (applied.length ? `（已回滚 ${applied.length - failed} 项库存改动${failed ? `，${failed} 项复原失败，请人工核对` : ''}）` : ''),
+        });
+    }
 });
 // ==================== FINANCE ====================
 app.get('/api/finance/accounts', authMiddleware, adminOnly, async (_req, res) => {
@@ -1233,18 +1510,34 @@ app.get('/api/finance/transactions', authMiddleware, (req, res, next) => {
     return res.status(403).json({ error: '无权限：该功能未开放给当前账号' });
 }, async (req, res) => {
     await initDB();
-    const { type, account_id, page = 1, pageSize = 50 } = req.query;
+    /* ★ 2026-10-08 改造：原来只回一个数组，且前端写死 pageSize=50 又无翻页控件
+     *   ⇒「收款/付款记录」页**永远只能看到最近 50 笔**（线上流水 3435 条）。
+     *   智慧记的同一页有日期筛选 + 完整翻页，这是实打实的功能不对齐。
+     *   现按本仓库既有约定（/products、/store/*-orders 同款）追加 `withTotal=1`：
+     *     带 withTotal ⇒ { rows, total, page, pageSize, sum_amount }
+     *     不带      ⇒ 仍回数组（老调用方零影响）
+     *   同时补上智慧记已有的 startDate / endDate / keyword 筛选（不传即不生效）。 */
+    const { type, account_id, page = 1, pageSize = 50, startDate, endDate, keyword, withTotal } = req.query;
     // 显式列名（不用 SELECT *），保证下标稳定；新增列只追加在末尾
-    let sql = "SELECT id, type, account_id, amount, category, description, reference_id, operator_id, operator_name, created_at, order_number, party_type, party_id, party_name FROM transactions WHERE 1=1";
-    const params = [];
+    const COLS = "id, type, account_id, amount, category, description, reference_id, operator_id, operator_name, created_at, order_number, party_type, party_id, party_name";
+    let where = " WHERE 1=1";
     if (type) {
-        sql += " AND type = '" + String(type).replace(/'/g, "''") + "'";
+        where += " AND type = '" + String(type).replace(/'/g, "''") + "'";
     }
     if (account_id) {
-        sql += " AND account_id = " + Number(account_id);
+        where += " AND account_id = " + Number(account_id);
     }
-    sql += " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?";
-    params.push(Number(pageSize), (Number(page) - 1) * Number(pageSize));
+    // 日期口径与全站一致：transactions 无 bill_date，取 created_at 前 10 位
+    if (startDate) where += " AND substr(created_at,1,10) >= '" + String(startDate).replace(/'/g, "''") + "'";
+    if (endDate) where += " AND substr(created_at,1,10) <= '" + String(endDate).replace(/'/g, "''") + "'";
+    if (keyword) {
+        const kw = String(keyword).replace(/'/g, "''");
+        where += " AND (COALESCE(order_number,'') LIKE '%" + kw + "%' OR COALESCE(description,'') LIKE '%" + kw + "%' OR COALESCE(category,'') LIKE '%" + kw + "%' OR COALESCE(party_name,'') LIKE '%" + kw + "%')";
+    }
+    const pg = Math.max(1, Number(page) || 1);
+    const ps = Math.min(2000, Math.max(1, Number(pageSize) || 50));
+    const params = [ps, (pg - 1) * ps];
+    const sql = "SELECT " + COLS + " FROM transactions" + where + " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?";
     /* ★ 改用显式列名（2026-10-05）：原为 SELECT * + 下标取值，
      *   加一列就会让下标整体错位（t[9] 不再是 created_at）——是个定时炸弹。
      *   显式列名 + 具名取值后，后续再加列不会再影响已有字段。 */
@@ -1255,6 +1548,17 @@ app.get('/api/finance/transactions', authMiddleware, (req, res, next) => {
         created_at: t[9], order_number: t[10] || null,
         party_type: t[11] || null, party_id: t[12] || null, party_name: t[13] || null,
     }));
+    if (withTotal) {
+        // COUNT 与 SUM 合并为 1 次往返（与本仓库 po/so 列表同款做法）
+        const A = await scalars([
+            { key: 'total', sql: "SELECT COUNT(*) FROM transactions" + where },
+            { key: 'sum_amount', sql: "SELECT COALESCE(SUM(amount),0) FROM transactions" + where },
+        ]);
+        return res.json({
+            rows: transactions, total: Number(A.total || 0), page: pg, pageSize: ps,
+            sum_amount: Number(A.sum_amount || 0),
+        });
+    }
     res.json(transactions);
 });
 app.get('/api/finance/overview', authMiddleware, hasPerm('finance_view'), async (_req, res) => {
