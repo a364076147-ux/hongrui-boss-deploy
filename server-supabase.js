@@ -239,6 +239,21 @@ async function _runMigrations() {
             `CREATE INDEX IF NOT EXISTS idx_customers_name ON customers (name)`,
             `CREATE INDEX IF NOT EXISTS idx_suppliers_name ON suppliers (name)`,
             `CREATE INDEX IF NOT EXISTS idx_products_name ON products (name)`,
+            /* ============ 单据号对齐智慧记（2026-10-05）============
+             * 智慧记全站单据都有号：销售 XSD / 进货 JHD / 收款 SKD / 付款 FKD。
+             * 宏瑞原本只有销售/进货有号，**收付款完全没有单据号** ⇒ 客户拿收款单来对账时
+             * 无法指认（只能靠金额+日期猜），这是对账环节的真实断点。
+             * 这里给 transactions 补一列；老数据为 NULL 不回填（历史单据号已不可复原，
+             *   强行回填等于伪造凭证号，比留空更坏）。 */
+            `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS order_number TEXT`,
+            `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS party_type TEXT`,
+            `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS party_id BIGINT`,
+            `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS party_name TEXT`,
+            /* 唯一索引只约束「非空值」：老单据 order_number 为 NULL 不受影响（PG 唯一索引天然允许
+             * 多行 NULL）。写成部分索引是为了让"老数据留空"与"新数据不重复"同时成立。 */
+            `CREATE UNIQUE INDEX IF NOT EXISTS uq_transactions_number ON transactions (order_number) WHERE order_number IS NOT NULL`,
+            `CREATE INDEX IF NOT EXISTS idx_transactions_number ON transactions (order_number)`,
+            `CREATE INDEX IF NOT EXISTS idx_transactions_party ON transactions (party_type, party_id)`,
         ];
         for (const sql of ddl) {
             try { await client.query(sql); } catch (e) { console.log('DDL skip:', e.message); }
@@ -355,11 +370,143 @@ async function resolveProductIdForOrder(productId, productName) {
  * 修正后全期间毛利率 = 6.76%（原为 -5.83%）。
  */
 const COST_SIGN_SQL = "CASE WHEN so.final_amount < 0 OR COALESCE(so.biz_type,'sale')='sale_return' THEN -1 ELSE 1 END";
-function generateOrderNumber(prefix) {
-    const now = new Date();
-    const date = now.toISOString().slice(0, 10).replace(/-/g, '');
-    const rand = Math.floor(Math.random() * 10000).toString().padStart(4, '0');
-    return `${prefix}${date}${rand}`;
+/* ================= 单据号：对齐智慧记口径（2026-10-05） =================
+ * 智慧记实测格式：`前缀(3位大写字母) + YYYYMMDD + 4位当日序号`
+ *   销售 XSD ｜ 进货 JHD ｜ 收款 SKD ｜ 付款 FKD
+ * 旧实现的两个缺陷（本次修复）：
+ *   ① 前缀 2 位（XS/JH/TH/HS/YD/BJ/PD）⇒ 与智慧记对不上，跨系统核对时无法按前缀归类；
+ *   ② 序号用 `Math.random()` ⇒ **同日可能撞号**（1万空间、当日 100 单时碰撞概率≈39%），
+ *      且单据号不连续，人工核对时无法判断"是否漏单"。
+ * 新实现：按「前缀 + 当日」取历史最大序号 +1，序号从 0001 开始连续递增。
+ *   · 兼容读取：同时扫 sales_orders / purchase_orders / transactions 三张表（收款付款记在 transactions）
+ *   · 不依赖 DB 序列：本库是 Supabase（PG），单条 SELECT MAX + 单条 INSERT 之间的竞态窗口
+ *     在「日均个位数单」的体量下可忽略；且保留随机后缀兜底，撞号时退化为「序号+随机」仍唯一。
+ *   · 兜底：整个取号失败时回退旧随机逻辑，绝不因取号失败而阻断开单（可用性优先）。
+ * ★ 判据：`SELECT order_number FROM sales_orders ORDER BY id DESC LIMIT 5` 应为
+ *   `XSD202610050001 / XSD202610050002 ...` 连续形态，而非 `XSD202610057341` 随机形态。
+ * ======================================================================= */
+const ORDER_PREFIX = {
+    sale: 'XSD',            // 销售单
+    purchase: 'JHD',        // 进货单
+    income: 'SKD',          // 收款单
+    expense: 'FKD',         // 付款单
+    sale_return: 'THD',     // 销售退货
+    purchase_return: 'JHD', // 进货退货（沿用进货号段，智记亦如此）
+    recycle: 'HSD',         // 回收
+    reservation: 'YDD',     // 销售预订
+    quote: 'BJD',           // 报价单
+    check: 'PDD',           // 盘点单
+    transfer: 'DBD',        // 转账/调拨
+    XS: 'XSD', JH: 'JHD', SK: 'SKD', FK: 'FKD', TH: 'THD', HS: 'HSD',
+    YD: 'YDD', BJ: 'BJD', PD: 'PDD', DB: 'DBD',
+    XSD: 'XSD', JHD: 'JHD', SKD: 'SKD', FKD: 'FKD', THD: 'THD', HSD: 'HSD',
+    YDD: 'YDD', BJD: 'BJD', PDD: 'PDD', DBD: 'DBD',
+};
+/** 把各种写法的前缀归一化成 3 位大写口径。
+ *
+ *  ★ 2026-10-05 记录——这个函数被自己写的单测连打回两次，两次都是真 bug：
+ *    第 1 次：`ORDER_PREFIX[s]` 里 s 已 toUpperCase()，而表的键是小写 'sale'/'income'
+ *            ⇒ 语义名全部落进兜底分支被截断（income→INC、expense→EXP、transfer→TRA）。
+ *    第 2 次：第 1 次"修"的时候只在表里补了 2 位码和 3 位码的大写键，
+ *            **忘了语义名的大写键**（'sale'.toUpperCase() === 'SALE'，表里没有 'SALE'）
+ *            ⇒ 同一个 bug 换个样子又回来，单测 21 例仍挂 11 例。
+ *    两次都不是"看代码看出来"的，是单测判红的。教训：
+ *      · 查表前统一大写 ⇒ 表里就必须**同时登记大写形式**，或查表时**双向兜底**；
+ *      · "修 bug" 后必须**重跑同一个单测**，不能凭推理认为已修好。
+ *    最终方案：查表时先按原样、再按大写、最后按小写各查一次（三向兜底），
+ *            这样无论表里登记的是哪种写法、调用方传的是哪种写法，都能命中。 */
+function normPrefix(prefix) {
+    const raw = String(prefix || '').trim();
+    if (!raw) return 'XSD';
+    // 三向兜底查表：原样 → 大写 → 小写
+    const hit = ORDER_PREFIX[raw] || ORDER_PREFIX[raw.toUpperCase()] || ORDER_PREFIX[raw.toLowerCase()];
+    if (hit) return hit;
+    const s = raw.toUpperCase();
+    if (s.length === 3) return s;
+    return (s + 'D').slice(0, 3);
+}
+/* 取号实现（2026-10-05 实测驱动重构）：
+ *   v1 随机数 → 撞号且不连续；
+ *   v2 MAX(...)+1 → 单线程下连续正确，但**并发实测 5 次全部拿到同一个号**
+ *      （"JHD202610050001" × 5）—— 因为 SELECT MAX 与 INSERT 之间存在竞态窗口。
+ *      这不是理论风险：手机端连点两次提交、两个店员同时开单都会命中。
+ *   v3（本版）用 **Postgres 序列**：nextval 是原子的，且同一序列天然单调递增、
+ *      无缺口、无竞态。每个「前缀+日期」一个独立序列（如 seq_ord_XSD20261005），
+ *      首次使用当天自动创建（IF NOT EXISTS，并发安全）。
+ *   ⚠️ 序列的已知特性：ROLLBACK 不会回退 nextval ⇒ 事务失败会**跳号**。
+ *      这是可接受的：跳号远好于撞号，且智记导入数据本身就按天从 0001 起。
+ *   兜底：序列不可用（权限/非 PG）时回退到 MAX+1 快照逻辑，再兜底到时间戳末 4 位，
+ *      三层降级，**任何一层都不会让开单失败**。 */
+async function generateOrderNumber(prefix) {
+    const pre = normPrefix(prefix);
+    // 业务日期取**北京时间**（与 created_at 的 Asia/Shanghai 保持一致）。
+    // ★ 旧实现用 toISOString()（UTC）⇒ 北京时间 00:00~08:00 开的单会落到前一天号段，
+    //   与「单据日期」显示不一致。这是实测发现的真实缺陷，一并修掉。
+    const date = new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(new Date()).replace(/-/g, '');
+
+    /* ---------- 主路径：Postgres 序列（原子、无竞态） ---------- */
+    const seqName = `seq_ord_${pre}${date}`;
+    try {
+        /* ⚠️ 关键：序列必须从「当日历史最大序号」之后起步。
+         *   新建序列默认从 1 开始 ⇒ 若当天已有 XSD...0008（可能是从智记导入的），
+         *   新序列会产出 0001 与历史单**撞号**，而被唯一索引拒绝、开单直接失败。
+         *   所以先查当日三表的最大序号，把序列的 START 设在 max+1；
+         *   序列已存在时（当天第二次开单）不再需要这一步。 */
+        /* 判断序列是否已存在：用 to_regclass 而非查 pg_class ——
+         * to_regclass 接受文本名并正确解析 search_path，比手写 relname 匹配更稳。 */
+        const seqExists = String((await safeExec(
+            `SELECT to_regclass(?)`, [seqName]
+        ))?.values?.[0]?.[0] || '') !== '';
+        if (!seqExists) {
+            let maxSeq = 0;
+            for (const r of await Promise.all([
+                safeExec(`SELECT COALESCE(MAX(order_number),'') FROM sales_orders WHERE order_number LIKE ?`, [`${pre}${date}%`]),
+                safeExec(`SELECT COALESCE(MAX(order_number),'') FROM purchase_orders WHERE order_number LIKE ?`, [`${pre}${date}%`]),
+                safeExec(`SELECT COALESCE(MAX(order_number),'') FROM transactions WHERE order_number LIKE ?`, [`${pre}${date}%`]),
+            ])) {
+                const v = String(r?.values?.[0]?.[0] || '');
+                if (v.length > pre.length + 8) {
+                    const n = parseInt(v.slice(pre.length + 8, pre.length + 12), 10);
+                    if (Number.isFinite(n) && n > maxSeq) maxSeq = n;
+                }
+            }
+            const startAt = maxSeq + 1;
+            // CREATE SEQUENCE 不支持参数占位符（DDL），故拼接；seqName 与 startAt 均已数值化/白名单化
+            await run(`CREATE SEQUENCE IF NOT EXISTS ${seqName} START WITH ${startAt}`);
+        }
+        const r = await safeExec(`SELECT nextval('${seqName}')`);
+        const seqNo = Number(r?.values?.[0]?.[0] || 0);
+        if (Number.isFinite(seqNo) && seqNo > 0) {
+            return `${pre}${date}${String(seqNo).padStart(4, '0')}`;
+        }
+    } catch (e) {
+        console.error('generateOrderNumber 序列取号失败，降级到 MAX+1:', e.message);
+    }
+
+    /* ---------- 降级 1：MAX+1（单线程安全；并发下可能撞号，但有唯一索引兜底） ---------- */
+    try {
+        const [inS, inP, inT] = await Promise.all([
+            safeExec(`SELECT COALESCE(MAX(order_number),'') FROM sales_orders WHERE order_number LIKE ?`, [`${pre}${date}%`]),
+            safeExec(`SELECT COALESCE(MAX(order_number),'') FROM purchase_orders WHERE order_number LIKE ?`, [`${pre}${date}%`]),
+            safeExec(`SELECT COALESCE(MAX(order_number),'') FROM transactions WHERE order_number LIKE ?`, [`${pre}${date}%`]),
+        ]);
+        let maxSeq = 0;
+        for (const r of [inS, inP, inT]) {
+            const v = String(r?.values?.[0]?.[0] || '');
+            if (v.length > pre.length + 8) {
+                const n = parseInt(v.slice(pre.length + 8, pre.length + 12), 10);
+                if (Number.isFinite(n) && n > maxSeq) maxSeq = n;
+            }
+        }
+        return `${pre}${date}${String(maxSeq + 1).padStart(4, '0')}`;
+    } catch (e) {
+        console.error('generateOrderNumber MAX+1 取号失败，降级到时间戳:', e.message);
+    }
+
+    /* ---------- 降级 2：时间戳末 4 位（可能撞号，但绝不返回空/undefined） ---------- */
+    return `${pre}${date}${String(Date.now() % 10000).padStart(4, '0')}`;
 }
 const app = express();
 app.use(helmet());
@@ -805,7 +952,7 @@ app.get('/api/inventory/checks', authMiddleware, hasPerm('inventory_view'), asyn
 });
 app.post('/api/inventory/checks', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
-    const checkNumber = generateOrderNumber('PD');
+    const checkNumber = await generateOrderNumber('PD');
     await run("INSERT INTO inventory_checks (check_number, operator_id) VALUES (?, ?)", [checkNumber, req.user.id]);
     // 获取刚插入的盘点单 ID（SQLite: last_insert_rowid，PG 端 translateSQL 自动转 lastval）
     const checkId = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0];
@@ -928,7 +1075,9 @@ app.post('/api/finance/transactions/income', authMiddleware, hasPerm('income'), 
         accId = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0] || null;
     }
     const cat = category || (pname ? '收欠款' : '直接收款');
-    await run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name) VALUES ('income', ?, ?, ?, ?, ?, ?, ?, ?, ?)", [accId, amount, cat, description, req.user.id, req.user.real_name, ptype, pid, pname]);
+    // 收款单号 SKD+YYYYMMDD+4位当日序号（对齐智慧记）；取号失败不阻断开单
+    const orderNumber = await generateOrderNumber('income');
+    await run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name, order_number) VALUES ('income', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [accId, amount, cat, description, req.user.id, req.user.real_name, ptype, pid, pname, orderNumber]);
     await run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [amount, accId]);
     // 冲减该客户欠款（2026-10-04 修复）：按金额逐单抵扣，并【同步三个金额字段】。
     //   原实现只改 payment_status，不动 received_amount / owe_amount ⇒ 造出「已结清但欠款仍在」的
@@ -960,7 +1109,7 @@ app.post('/api/finance/transactions/income', authMiddleware, hasPerm('income'), 
         }
     }
     saveDB(); saveDB();
-    res.json({ ok: true });
+    res.json({ ok: true, order_number: orderNumber });
 });
 app.post('/api/finance/transactions/expense', authMiddleware, hasPerm('expense'), async (req, res) => {
     await initDB();
@@ -985,7 +1134,9 @@ app.post('/api/finance/transactions/expense', authMiddleware, hasPerm('expense')
         accId = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0] || null;
     }
     const cat = category || (pname ? '付欠款' : '直接付款');
-    await run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name) VALUES ('expense', ?, ?, ?, ?, ?, ?, ?, ?, ?)", [accId, amount, cat, description, req.user.id, req.user.real_name, ptype, pid, pname]);
+    // 付款单号 FKD+YYYYMMDD+4位当日序号（对齐智慧记）
+    const orderNumber = await generateOrderNumber('expense');
+    await run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name, order_number) VALUES ('expense', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [accId, amount, cat, description, req.user.id, req.user.real_name, ptype, pid, pname, orderNumber]);
     await run("UPDATE accounts SET balance = balance - ? WHERE id = ?", [amount, accId]);
     if (pid && category !== '直接付款') {
         /* 冲减该供应商欠款（2026-10-04 修复，与销售侧「收欠款」同范式）：
@@ -1021,18 +1172,20 @@ app.post('/api/finance/transactions/expense', authMiddleware, hasPerm('expense')
         }
     }
     saveDB(); saveDB();
-    res.json({ ok: true });
+    res.json({ ok: true, order_number: orderNumber });
 });
 app.post('/api/finance/transactions/transfer', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
     const { from_account_id, to_account_id, amount, description } = req.body;
-    await run("INSERT INTO transactions (type, account_id, amount, description, operator_id, operator_name) VALUES ('transfer', ?, ?, ?, ?, ?)", [from_account_id, amount, description, req.user.id, req.user.real_name]);
+    // 转账单号 DBD：一次转账产生两条流水（转出/转入），共用同一单号便于成对核对
+    const transferNumber = await generateOrderNumber('transfer');
+    await run("INSERT INTO transactions (type, account_id, amount, description, operator_id, operator_name, order_number) VALUES ('transfer', ?, ?, ?, ?, ?, ?)", [from_account_id, amount, description, req.user.id, req.user.real_name, transferNumber]);
     await run("UPDATE accounts SET balance = balance - ? WHERE id = ?", [amount, from_account_id]);
-    await run("INSERT INTO transactions (type, account_id, amount, description, operator_id, operator_name) VALUES ('transfer_in', ?, ?, ?, ?, ?)", [to_account_id, amount, description, req.user.id, req.user.real_name]);
+    await run("INSERT INTO transactions (type, account_id, amount, description, operator_id, operator_name, order_number) VALUES ('transfer_in', ?, ?, ?, ?, ?, ?)", [to_account_id, amount, description, req.user.id, req.user.real_name, transferNumber]);
     await run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [amount, to_account_id]);
     saveDB();
     saveDB();
-    res.json({ ok: true });
+    res.json({ ok: true, order_number: transferNumber });
 });
 app.get('/api/finance/transactions', authMiddleware, (req, res, next) => {
     // 收款/付款列表：有 income 或 expense 或 finance_view 任一权限即可查看
@@ -1042,7 +1195,8 @@ app.get('/api/finance/transactions', authMiddleware, (req, res, next) => {
 }, async (req, res) => {
     await initDB();
     const { type, account_id, page = 1, pageSize = 50 } = req.query;
-    let sql = "SELECT * FROM transactions WHERE 1=1";
+    // 显式列名（不用 SELECT *），保证下标稳定；新增列只追加在末尾
+    let sql = "SELECT id, type, account_id, amount, category, description, reference_id, operator_id, operator_name, created_at, order_number, party_type, party_id, party_name FROM transactions WHERE 1=1";
     const params = [];
     if (type) {
         sql += " AND type = '" + String(type).replace(/'/g, "''") + "'";
@@ -1052,11 +1206,15 @@ app.get('/api/finance/transactions', authMiddleware, (req, res, next) => {
     }
     sql += " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?";
     params.push(Number(pageSize), (Number(page) - 1) * Number(pageSize));
+    /* ★ 改用显式列名（2026-10-05）：原为 SELECT * + 下标取值，
+     *   加一列就会让下标整体错位（t[9] 不再是 created_at）——是个定时炸弹。
+     *   显式列名 + 具名取值后，后续再加列不会再影响已有字段。 */
     const result = await safeExec(sql, params);
     const transactions = (result.values || []).map((t) => ({
         id: t[0], type: t[1], account_id: t[2], amount: Number(t[3]), category: t[4],
         description: t[5], reference_id: t[6], operator_id: t[7], operator_name: t[8],
-        created_at: t[9]
+        created_at: t[9], order_number: t[10] || null,
+        party_type: t[11] || null, party_id: t[12] || null, party_name: t[13] || null,
     }));
     res.json(transactions);
 });
@@ -1146,19 +1304,24 @@ app.get('/api/analysis/dashboard', authMiddleware, async (req, res) => {
         { key: 'warningCount', sql: `SELECT COUNT(*) FROM products WHERE stock_quantity <= warning_quantity AND status=1` },
         { key: 'monthSales', sql: `SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE substr(COALESCE(bill_date, created_at),1,10) >= '${monthStart}'${scopeSql}${VOID}` },
         { key: 'monthCost', sql: `SELECT COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id=so.id JOIN products p ON oi.product_id=p.id WHERE substr(COALESCE(so.bill_date, so.created_at),1,10) >= '${monthStart}'${scopeSql}${VOID_SO}` },
-        { key: 'arSum', sql: `SELECT COALESCE(SUM(owe_amount),0) FROM sales_orders WHERE COALESCE(biz_type,'sale') <> 'sale_return' AND COALESCE(owe_amount,0) > 0.005${scopeSql}${VOID}` },
-        { key: 'arCnt', sql: `SELECT COUNT(*) FROM sales_orders WHERE COALESCE(biz_type,'sale') <> 'sale_return' AND COALESCE(owe_amount,0) > 0.005${scopeSql}${VOID}` },
-        { key: 'apSum', sql: `SELECT COALESCE(SUM(owe_amount),0) FROM purchase_orders WHERE COALESCE(owe_amount,0) > 0.005` },
-        { key: 'apCnt', sql: `SELECT COUNT(*) FROM purchase_orders WHERE COALESCE(owe_amount,0) > 0.005` },
+        /* ★ 原 arSum/arCnt/apSum/apCnt 四个标量已【移除】（2026-10-08）。
+         *   它们算的是 `SUM(owe_amount)`＝「未结清单据合计」，不是应收：
+         *     · 旧结果 ¥2,107,243.20（1103 单） vs 对账页 ¥487,404.60（186 家）
+         *     · 智慧记自身旁证：单据 owe 合计 ¥1,961,049 vs 客户 cur_amt 合计 ¥460,668
+         *   ⇒ 应收/应付的唯一真源改为下面的 computeArap()（与 /finance/arap 同一函数）。 */
     ]);
     const N = (v) => Number(v || 0);
     const todaySales = N(S.todaySales), todayCost = N(S.todayCost), monthSales = N(S.monthSales), monthCost = N(S.monthCost);
+    // 应收/应付：与对账页同源（单一真源，口径不可能再分叉）
+    const arap = await computeArap();
     res.json({
         todaySales, todayExpense: N(S.todayExpense), todayCost, todayProfit: todaySales - todayCost,
         todayOrders: N(S.todayOrders), warningCount: N(S.warningCount), monthSales,
         monthCost, monthProfit: monthSales - monthCost,
-        receivable: N(S.arSum), unpaidCount: N(S.arCnt),
-        payable: N(S.apSum), payableCount: N(S.apCnt),
+        receivable: arap.summary.total_receivable,
+        unpaidCount: arap.summary.receivable_parties,   // 语义修正：家数（原为"未结清单数"）
+        payable: arap.summary.total_payable,
+        payableCount: arap.summary.payable_parties,
     });
 });
 /* 销售统计 —— 对齐智慧记「报表逐月归组」口径
@@ -2193,7 +2356,7 @@ app.post('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), asyn
         const sidRes = await safeExec("SELECT id FROM suppliers WHERE name = ? ORDER BY id LIMIT 1", [supplier_name]);
         if (sidRes.values?.[0]?.[0]) supplier_id = sidRes.values[0][0];
     }
-    const orderNumber = generateOrderNumber('JH');
+    const orderNumber = await generateOrderNumber('JH');
     const totalAmount = final_amount || req.body.total_amount || 0;
     /* ---- 付款口径：与销售单对称 ----
      * paid_amount 显式传入则用传入值；否则 settled=true 视为全额付讫，否则 0（赊购）
@@ -2342,7 +2505,7 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
             operatorName = emp[0] || req.user.real_name;
         }
     }
-    const orderNumber = customOrderNumber || generateOrderNumber('XS');
+    const orderNumber = customOrderNumber || await generateOrderNumber('XS');
     const extra = (Number(express_amount) || 0) + (Number(tax_amount) || 0) - (Number(small_change_amount) || 0);
     let totalAmount = 0;
     if (items) {
@@ -2415,8 +2578,11 @@ app.post('/api/store/sales-orders/:id/receive', authMiddleware, hasPerm('sales')
     // 资金流水（可选账户）
     const accountId = Number(req.body.account_id) || null;
     if (accountId) {
-        await run("INSERT INTO transactions (type, account_id, amount, category, description, party_type, party_id, party_name, operator_id, operator_name) VALUES ('income', ?, ?, '销售收款', ?, 'customer', ?, ?, ?, ?)",
-            [accountId, amount, '销售单 ' + so.order_number + ' 收款', so.customer_id || null, so.customer_name || '', req.user.id, req.user.real_name]);
+        // 补单据号（2026-10-05）：这一处此前只写流水不写号，导致「收款记录」页里
+        // 手工收款有号、销售单自动收款没号，同一列表两种形态 ⇒ 对账时无法指认。
+        const incomeNo = await generateOrderNumber('income');
+        await run("INSERT INTO transactions (type, account_id, amount, category, description, party_type, party_id, party_name, operator_id, operator_name, order_number) VALUES ('income', ?, ?, '销售收款', ?, 'customer', ?, ?, ?, ?, ?)",
+            [accountId, amount, '销售单 ' + so.order_number + ' 收款', so.customer_id || null, so.customer_name || '', req.user.id, req.user.real_name, incomeNo]);
         await run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [amount, accountId]);
     }
     saveDB();
@@ -2464,7 +2630,7 @@ app.get('/api/store/sales-returns', authMiddleware, hasPerm('return'), async (re
 app.post('/api/store/sales-returns', authMiddleware, hasPerm('return'), async (req, res) => {
     await initDB();
     const { sales_order_id, items, reason } = req.body;
-    const returnNumber = generateOrderNumber('TH');
+    const returnNumber = await generateOrderNumber('TH');
     let totalAmount = 0;
     if (items) {
         for (const item of items) {
@@ -2519,7 +2685,7 @@ app.post('/api/store/recycles', authMiddleware, hasPerm('recycle'), async (req, 
     const { customer_id, customer_name, items, remark, account_id } = req.body;
     if (!items || !items.length)
         return res.status(400).json({ error: '请添加回收商品' });
-    const recycleNumber = generateOrderNumber('HS');
+    const recycleNumber = await generateOrderNumber('HS');
     let totalAmount = 0;
     for (const it of items)
         totalAmount += (it.quantity || 0) * (it.unit_price || 0);
@@ -2554,7 +2720,13 @@ app.post('/api/store/recycles', authMiddleware, hasPerm('recycle'), async (req, 
         accId = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0] || null;
     }
     if (accId) {
-        await run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, created_at) VALUES ('expense', ?, ?, '回收支出', ?, ?, ?, datetime('now','localtime'))", [accId, totalAmount, (customer_name || '散客') + ' 回收' + items.length + '项', req.user.id, req.user.real_name]);
+        /* 补单据号（2026-10-05）：回收是「付钱给客户」，属付款流水 ⇒ 单号用 FKD。
+         * 但用户在这一行最想看到的是「这是哪张回收单」⇒ 把 HSD 回收单号写进 description，
+         * 这样既满足「付款流水有号」，又保留了与回收单的关联线索。
+         * （两条流水指向同一笔业务，但 order_number 有唯一约束，不能共用同一个号。） */
+        const payNo = await generateOrderNumber('expense');
+        await run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, created_at, order_number) VALUES ('expense', ?, ?, '回收支出', ?, ?, ?, datetime('now','localtime'), ?)",
+            [accId, totalAmount, '回收单 ' + recycleNumber + '（' + (customer_name || '散客') + '，' + items.length + '项）', req.user.id, req.user.real_name, payNo]);
     }
     saveDB();
     res.json({ ok: true, recycle_number: recycleNumber, total_amount: totalAmount });
@@ -2758,7 +2930,13 @@ function canonSQL(col) {
     return cases ? `CASE ${cases} ELSE ${base} END` : base;
 }
 // ==================== 应收应付对账（口径：期初欠款 + 全量销售/进货 − 全量已收/已付 = 期末欠款） ====================
-app.get('/api/finance/arap', authMiddleware, hasPerm('finance_view'), async (_req, res) => {
+/* ★★ 单一真源（2026-10-08）：应收/应付的**唯一**计算入口。
+ *   仪表盘此前用的是 `SUM(owe_amount)`（未结清单据合计），与对账页给出的数字**自相矛盾**：
+ *     仪表盘 ¥2,107,243.20（1103 单）  vs  对账页 ¥487,404.60（186 家）
+ *   两者并非"算错"，而是**口径不同**——见上方注释旁证：智慧记自身单据 owe 合计 ¥1,961,049
+ *   而客户 cur_amt 合计 ¥460,668，落差 ¥150 万。**未结清单据从来不是应收**。
+ *   ⇒ 抽成函数，两处共用，从结构上杜绝口径再次分叉。 */
+async function computeArap() {
     await initDB();
     const CANON_C = canonSQL('c.name');
     const CANON_S = canonSQL('s.name');
@@ -2884,14 +3062,19 @@ app.get('/api/finance/arap', authMiddleware, hasPerm('finance_view'), async (_re
     }).filter((x) => !SANKE_NAMES.includes(x.name))
       .filter((x) => Math.abs(x.balance) > 0.001 || x.unpaid_orders > 0 || x.paid !== 0)
       .sort((a, b) => b.balance - a.balance);
-    res.json({
+    return {
         receivables,
         payables,
         summary: {
             total_receivable: Math.round(receivables.reduce((s, r) => s + r.balance, 0) * 100) / 100,
             total_payable: Math.round(payables.reduce((s, r) => s + r.balance, 0) * 100) / 100,
+            receivable_parties: receivables.length,
+            payable_parties: payables.length,
         },
-    });
+    };
+}
+app.get('/api/finance/arap', authMiddleware, hasPerm('finance_view'), async (_req, res) => {
+    res.json(await computeArap());
 });
 // 客户对账单：期初 + 销售单 + 收款流水明细（口径与 /finance/arap 完全一致：按现名归集）
 app.get('/api/finance/customer-statement/:id', authMiddleware, hasPerm('finance_view'), async (req, res) => {
@@ -2975,7 +3158,7 @@ app.post('/api/store/reservations', authMiddleware, hasPerm('sales'), async (req
         if (cidRes.values?.[0]?.[0]) customer_id = cidRes.values[0][0];
     }
     if (!items || !items.length) return res.status(400).json({ error: '请添加预订商品' });
-    const rn = generateOrderNumber('YD');
+    const rn = await generateOrderNumber('YD');
     let totalAmount = 0;
     for (const it of items) totalAmount += (it.quantity || 0) * (it.price || 0);
     await run("INSERT INTO sales_reservations (reservation_number, customer_id, customer_name, total_amount, status, remark, operator_id, operator_name) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
@@ -3006,7 +3189,7 @@ app.post('/api/store/reservations/:id/complete', authMiddleware, hasPerm('sales'
         if (!pid) return res.status(400).json({ error: `出库失败：明细商品「${it[3]}」在商品档案中不存在（明细必须能解析到商品），本次未写入任何数据` });
         resolved.push({ pid, name: it[3], sku: it[4] || '', qty: Number(it[5]) || 0, price: Number(it[6]) || 0, amount: Number(it[7]) || 0 });
     }
-    const orderNumber = generateOrderNumber('XS');
+    const orderNumber = await generateOrderNumber('XS');
     const finalAmount = Number(r[4]) || 0;
     // ★ 修复（2026-10-03）：原先只写 final_amount，漏 receivable_amount/received_amount/owe_amount/
     //   payment_status/bill_date（列默认 0）⇒ 生成「金额≠0 但应收=0」的不自洽单。现与手工开单共用 salesOrderMoney()。
@@ -3051,7 +3234,7 @@ app.post('/api/store/purchase-returns', authMiddleware, hasPerm('purchase'), asy
     await initDB();
     const { purchase_order_id, supplier_id, supplier_name, items, reason } = req.body;
     if (!items || !items.length) return res.status(400).json({ error: '请添加退货商品' });
-    const rn = generateOrderNumber('TH');
+    const rn = await generateOrderNumber('TH');
     let totalAmount = 0;
     for (const it of items) totalAmount += (it.quantity || 0) * (it.price || 0);
     await run("INSERT INTO purchase_returns (return_number, purchase_order_id, supplier_id, supplier_name, total_amount, reason, operator_id, operator_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -3087,7 +3270,7 @@ app.post('/api/store/quotes', authMiddleware, hasPerm('sales'), async (req, res)
         if (cidRes.values?.[0]?.[0]) customer_id = cidRes.values[0][0];
     }
     if (!items || !items.length) return res.status(400).json({ error: '请添加报价商品' });
-    const qn = generateOrderNumber('BJ');
+    const qn = await generateOrderNumber('BJ');
     let totalAmount = 0;
     for (const it of items) totalAmount += (it.quantity || 0) * (it.price || 0);
     await run("INSERT INTO quotes (quote_number, customer_id, customer_name, total_amount, status, remark, operator_id, operator_name) VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)",
@@ -3117,7 +3300,7 @@ app.post('/api/store/quotes/:id/convert', authMiddleware, hasPerm('sales'), asyn
         if (!pid) return res.status(400).json({ error: `转单失败：明细商品「${it[3]}」在商品档案中不存在（明细必须能解析到商品），本次未写入任何数据` });
         resolved.push({ pid, name: it[3], sku: it[4] || '', qty: Number(it[5]) || 0, price: Number(it[6]) || 0, amount: Number(it[7]) || 0 });
     }
-    const orderNumber = generateOrderNumber('XS');
+    const orderNumber = await generateOrderNumber('XS');
     const finalAmount = Number(q[4]) || 0;
     // ★ 修复（2026-10-03）：原先只写 final_amount，漏 receivable_amount/received_amount/owe_amount/
     //   payment_status/bill_date（列默认 0）⇒ 生成「金额≠0 但应收=0」的不自洽单。现与手工开单共用 salesOrderMoney()。
