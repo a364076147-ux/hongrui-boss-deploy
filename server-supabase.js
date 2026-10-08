@@ -2893,11 +2893,46 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
             }
         }
     }
-    // Update account balance if payment
-    if (payment_method && ['cash', 'alipay', 'wechat', 'bank'].includes(payment_method) && receivedAmount > 0) {
-        const accResult = await safeExec("SELECT id FROM accounts WHERE type = ? LIMIT 1", [payment_method]);
-        if (accResult.values?.[0]) {
-            await run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [receivedAmount, accResult.values[0][0]]);
+    /* ---- 收款落账（★★ 2026-10-09 真机实测修复：两处缺陷，一处错账一处漏记）----
+     * 缺陷实证（真机 APK 操作 + 直连生产库回读，非推断）：
+     *   在「销售开单」页选 **微信** 账户、本次实收 ¥100 开单 ⇒
+     *     · 后台：**支付宝**账户 +100.00，微信账户 +0.00（钱进了另一个账户）
+     *     · 单据 payment_method 存成 'bank'（丢失了用户实际选的是哪个账户）
+     *     · transactions 里**查不到这笔收款**（资金流水页永远看不到它）
+     *
+     * 根因①（错账）：用 `SELECT id FROM accounts WHERE type = ? LIMIT 1` 找落账账户。
+     *   · 本库三个账户的 type 实际**全是 'bank'**（见 accounts 表；「现金」也是 bank）
+     *     ⇒ LIMIT 1 命中「id 最小的 bank 账户」，与用户所选毫无关系；
+     *   · 而前端早已把「所选的账户 id」放在 `account_id` 里传上来了，这里**却没用它**。
+     *   · 同一个文件里 `POST /:id/receive`（收款登记）用的是 account_id —— 同一系统
+     *     的两条收款路径口径相反，本身就是这个 bug 长期没被发现的土壤。
+     * 根因②（漏记）：只加余额、不写流水。而开单页文案明写
+     *   「收款开单＝写收款流水 ＋ 加账户余额 ＋ 标记结清（动账、不可随手点）」
+     *   ⇒ 实现与对用户的承诺不符，对账时这笔钱**在流水里不存在**。
+     *
+     * 修法：① 以 `account_id` 为准（"用户选的那个账户"只能由它唯一指认）；
+     *       旧版前端没传时才退回按 type 匹配；两者都拿不到就**不落账并留日志**，
+     *       绝不静默地把钱塞进"第一个账户"。
+     *       ② 补写资金流水（category=销售收款，description 统一为「销售单 <单号> 收款」，
+     *       与 /:id/receive 同格式，便于日后按单号精确回溯/冲销）。
+     *       写流水失败不阻断开单（钱已落账，流水可补），但必须留下服务端日志。 */
+    if (receivedAmount > 0) {
+        let accId = Number(req.body.account_id) || null;
+        if (!accId && payment_method) {
+            accId = (await safeExec("SELECT id FROM accounts WHERE type = ? ORDER BY id LIMIT 1", [payment_method])).values?.[0]?.[0] || null;
+        }
+        if (accId) {
+            await run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [receivedAmount, accId]);
+            try {
+                const incomeNo = await generateOrderNumber('income');
+                await run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name, order_number) VALUES ('income', ?, ?, '销售收款', ?, ?, ?, 'customer', ?, ?, ?)",
+                    [accId, receivedAmount, '销售单 ' + orderNumber + ' 收款', req.user.id, req.user.real_name, customer_id || null, customer_name || '', incomeNo]);
+            } catch (e) {
+                console.error('[sales-orders] 收款流水写入失败（不阻断开单，钱已落账）:', e.message);
+            }
+        } else {
+            console.error('[sales-orders] 收款 ¥%s 未能落账：account_id=%s payment_method=%s 都匹配不到账户',
+                receivedAmount, req.body.account_id, payment_method);
         }
     }
     saveDB();
@@ -3011,20 +3046,72 @@ app.post('/api/store/sales-orders/:id/receive', authMiddleware, hasPerm('sales')
     saveDB();
     res.json({ ok: true, received_amount: newReceived, owe_amount: newOwe, payment_status: newStatus });
 });
-// 作废销售单（仅管理员）：标记作废 + 冲回库存，保留记录与明细（对齐智慧记 invalid，不做物理删除）
+/* 作废销售单（仅管理员）：标记作废 + 冲回库存 + **回滚已收资金**；
+ * 保留记录与明细（对齐智慧记 invalid，不做物理删除）。
+ *
+ * ★★ 2026-10-09 真机实测修复：原实现只回冲库存、把状态改成"作废"，
+ *   **已收的钱仍留在账户里** ⇒ 作废一张已收款单，账面资金虚高，
+ *   而且流水里没有任何痕迹可以追（不知道钱去哪了、该从哪个账户扣）。
+ *   作废的语义是「这笔生意不成立」⇒ 库存要回来、钱也要退回去，缺一不可。
+ *
+ * 回滚方式（可审计）：
+ *   ① 按单号找出该单的全部收款流水 —— 开单收款与收款登记两处都写
+ *      `销售单 <单号> 收款`（格式统一，便于精确匹配，不用模糊 LIKE 误伤他单）；
+ *   ② 逐条把金额从**当时落账的那个账户**扣回（account_id 来自流水本身，不是猜的）；
+ *   ③ **另记一条负数冲销流水**（不删原流水）—— 资金变动必须留痕，可审计、可复算；
+ *   ④ 若单据标着已收却找不到对应流水（旧版写入/外部导入），**不回滚但打日志**，
+ *      绝不静默假装回滚成功。
+ */
 app.delete('/api/store/sales-orders/:id', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
     const id = Number(req.params.id);
-    const o = (await safeExec("SELECT * FROM sales_orders WHERE id = ?", [id])).values?.[0];
-    if (!o) return res.status(404).json({ error: '订单不存在' });
-    if (o[11] === '作废') return res.status(400).json({ error: '该单已作废，无需重复操作' });
-    const items = (await safeExec("SELECT * FROM sales_order_items WHERE order_id = ?", [id])).values || [];
+    const row = (await safeExec("SELECT " + SO_COLS + " FROM sales_orders WHERE id = ?", [id])).values?.[0];
+    if (!row) return res.status(404).json({ error: '订单不存在' });
+    const so = mapSalesOrder(row);
+    if (so.payment_status === '作废') return res.status(400).json({ error: '该单已作废，无需重复操作' });
+
+    // ① 回冲库存
+    const items = (await safeExec("SELECT product_id, quantity FROM sales_order_items WHERE order_id = ?", [id])).values || [];
     for (const it of items) {
-        if (it[2]) await run("UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?", [Number(it[5]) || 0, it[2]]);
+        if (it[0]) await run("UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?", [Number(it[1]) || 0, it[0]]);
     }
-    await run("UPDATE sales_orders SET payment_status='作废' WHERE id = ?", [id]);
+
+    // ② 回滚已收资金（账户 + 冲销流水）
+    let rolledBack = 0;
+    const recv = Number(so.received_amount) || 0;
+    if (recv > 0.005) {
+        const desc = '销售单 ' + so.order_number + ' 收款';
+        const txs = (await safeExec("SELECT id, account_id, amount FROM transactions WHERE type = 'income' AND description = ?", [desc])).values || [];
+        const touched = [];
+        for (const t of txs) {
+            const accId = t[1], amt = Number(t[2]) || 0;
+            if (accId && amt > 0) {
+                await run("UPDATE accounts SET balance = balance - ? WHERE id = ?", [amt, accId]);
+                rolledBack = Math.round((rolledBack + amt) * 100) / 100;
+                touched.push({ account_id: accId, amount: amt });
+            }
+        }
+        if (rolledBack > 0) {
+            /* 冲销流水**逐账户各记一条**：一张单的收款有可能分多次落进不同账户
+             * （先微信后支付宝）。若只按 touched[0] 记一条，金额对得上但账户指认是错的，
+             * 日后按账户核账会对不上。 */
+            for (const t of touched) {
+                try {
+                    const no = await generateOrderNumber('income');
+                    await run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name, order_number) VALUES ('income', ?, ?, '销售单作废冲销', ?, ?, ?, 'customer', ?, ?, ?)",
+                        [t.account_id, -t.amount, '销售单 ' + so.order_number + ' 作废冲销', req.user.id, req.user.real_name, so.customer_id || null, so.customer_name || '', no]);
+                } catch (e) {
+                    console.error('[sales-orders] 作废冲销流水写入失败（账户已扣回，仅缺留痕）:', e.message);
+                }
+            }
+        } else {
+            console.error('[sales-orders] 单 %s 标记已收 ¥%s，但未匹配到收款流水 ⇒ 账户未回滚，需人工核对', so.order_number, recv);
+        }
+    }
+
+    await run("UPDATE sales_orders SET payment_status = '作废' WHERE id = ?", [id]);
     saveDB();
-    res.json({ ok: true });
+    res.json({ ok: true, rolled_back: rolledBack, stock_restored: items.length });
 });
 // Sales Return APIs
 app.get('/api/store/sales-returns', authMiddleware, hasPerm('return'), async (req, res) => {
