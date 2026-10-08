@@ -842,8 +842,11 @@ app.put('/api/auth/password', authMiddleware, async (req, res) => {
 // ==================== INVENTORY ====================
 app.get('/api/inventory/products', authMiddleware, hasPerm('inventory_view'), async (req, res) => {
     await initDB();
-    const { category, keyword, page = 1, pageSize = 50, withTotal } = req.query;
-    let where = " WHERE status = 1";
+    const { category, keyword, page = 1, pageSize = 50, withTotal, include_stopped } = req.query;
+    // ★ 与智慧记同口径（2026-10-08）：默认隐藏已停用档（智慧记接口参数名 hide_stop）。
+    //   宏瑞 status 取值：1=在用，2=停用（对齐智慧记），0=历史软删除标记（旧版「删除商品」遗留）。
+    //   显式 include_stopped=1 时不叠加状态过滤，全部返回，由前端标注「已停用」并给「启用」入口。
+    let where = include_stopped === '1' ? " WHERE 1=1" : " WHERE status = 1";
     if (category) {
         where += " AND category = '" + String(category).replace(/'/g, "''") + "'";
     }
@@ -931,6 +934,26 @@ app.put('/api/inventory/products/:id', authMiddleware, hasPerm('inventory_full')
     saveDB();
     saveDB();
     res.json({ ok: true });
+});
+// 商品 停用 / 启用（对齐智慧记的「停用商品」语义，2026-10-08）
+//   · 智慧记：status 1=在用 / 2=停用，其商品列表接口默认 hide_stop=1（隐藏停用档）
+//   · 宏瑞原「删除商品」实为软删除 status=0，但**没有任何界面能看到或恢复** ⇒ 误删即失联
+//   · 本接口把「停用」变成可逆动作：1↔2；且历史 status=0 的档也一并在「显示已停用」视图出现并可用 1 恢复
+app.put('/api/inventory/products/:id/status', authMiddleware, hasPerm('inventory_full'), async (req, res) => {
+    await initDB();
+    const { id } = req.params;
+    const next = Number((req.body || {}).status);
+    // ★ 只接受 1（在用）/ 2（停用）。0 是历史软删除标记，不作为可写值对外暴露。
+    if (![1, 2].includes(next)) {
+        return res.status(400).json({ error: 'status 只允许 1（在用）或 2（停用）' });
+    }
+    const row = (await safeExec("SELECT id FROM products WHERE id = ?", [id])).values?.[0];
+    if (!row) {
+        return res.status(404).json({ error: '商品不存在' });
+    }
+    await run("UPDATE products SET status = ?, updated_at = datetime('now','localtime') WHERE id = ?", [next, id]);
+    saveDB();
+    res.json({ ok: true, id: Number(id), status: next });
 });
 // 删除商品（软删除：status=0，保留历史订单引用）
 app.delete('/api/inventory/products/:id', authMiddleware, hasPerm('inventory_full'), async (req, res) => {
