@@ -2600,6 +2600,86 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
     res.json({ ok: true, order_number: orderNumber, id: orderId, final_amount: finalAmount, received_amount: receivedAmount, owe_amount: oweAmount, payment_status: paymentStatus });
 });
 // 销售单收款登记（收欠款 / 收尾款）：累加已收、重算欠款与结算状态，并记一笔资金流水
+/* ★ 2026-10-08 新增：修改销售单（PUT /api/store/sales-orders/:id）
+ *   对齐智慧记手机端「单据详情 → 修改销售单」（老板要求「依次进行」的 P0 项之一）。
+ *
+ *   为什么这样设计（安全边界，必须先说清）：
+ *   ① 已作废单不可改；
+ *   ② **已有收款的单不在这里改** —— 收款会牵动 accounts.balance 与 transactions 流水，
+ *      原地改金额会让「资金流水 ↔ 单据」对不上（涉资金回滚，须谨慎设计；这条是既定红线）。
+ *      这类单返回 409 + 明确指引：先冲销收款，或作废后用「复制为销售单」重开。
+ *   ③ 明细替换 = 先按旧明细回滚库存、再按新明细扣减库存，保证库存守恒。
+ *   ④ 本接口**不产生任何资金动作**：收款仍只能走 /:id/receive；这里只重算应收/欠款。
+ */
+app.put('/api/store/sales-orders/:id', authMiddleware, hasPerm('sales'), async (req, res) => {
+    await initDB();
+    const id = Number(req.params.id);
+    const row = (await safeExec("SELECT " + SO_COLS + " FROM sales_orders WHERE id = ?", [id])).values?.[0];
+    if (!row) return res.status(404).json({ error: '订单不存在' });
+    const old = mapSalesOrder(row);
+    if (old.payment_status === '作废') return res.status(400).json({ error: '该单已作废，不能修改' });
+
+    const received = Number(old.received_amount) || 0;
+    if (received > 0.005) {
+        return res.status(409).json({
+            code: 'HAS_PAYMENT',
+            error: '该单已有收款 ¥' + received.toFixed(2) + '，不能原地修改（会让资金流水与单据对不上）。请先冲销该笔收款，或作废本单后用「复制为销售单」按新内容重开。'
+        });
+    }
+
+    const { items, customer_id, customer_name, discount, express_amount, tax_amount,
+        small_change_amount, remark, bill_date, operator_id: targetOperatorId } = req.body;
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: '请至少添加一件商品后再保存' });
+    const badItem = items.find((it) => !(Number(it.quantity ?? 0) > 0));
+    if (badItem) return res.status(400).json({ error: '商品数量必须大于 0（' + (badItem.product_name || '未命名商品') + '）' });
+
+    // ① 回滚旧明细占用的库存，并清空旧明细
+    const oldItems = (await safeExec("SELECT product_id, quantity FROM sales_order_items WHERE order_id = ?", [id])).values || [];
+    for (const it of oldItems) {
+        if (it[0]) await run("UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?", [Number(it[1]) || 0, it[0]]);
+    }
+    await run("DELETE FROM sales_order_items WHERE order_id = ?", [id]);
+
+    // ② 重算金额（口径与 POST 完全一致：final = 明细 − 折扣 + 运费 + 税额 − 抹零）
+    let totalAmount = 0;
+    for (const item of items) totalAmount += (Number(item.quantity) || 0) * Number(item.price ?? item.unit_price ?? 0);
+    const extra = (Number(express_amount) || 0) + (Number(tax_amount) || 0) - (Number(small_change_amount) || 0);
+    const finalAmount = Math.round((totalAmount - (Number(discount) || 0) + extra) * 100) / 100;
+
+    // ③ 写新明细 + 扣新库存
+    for (const item of items) {
+        const qty = Number(item.quantity) || 0;
+        const up = Number(item.price ?? item.unit_price ?? 0);
+        await run("INSERT INTO sales_order_items (order_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [id, item.product_id, item.product_name, item.sku || '', qty, up, item.amount ?? qty * up]);
+        if (item.product_id) await run("UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?", [qty, item.product_id]);
+    }
+
+    // ④ 业务员（业绩归属）：可改；制单人（真实开单动作）保持原值不动
+    let operatorId = old.operator_id;
+    let operatorName = old.operator_name;
+    if (targetOperatorId && Number(targetOperatorId) > 0) {
+        const emp = (await safeExec("SELECT real_name FROM users WHERE id = ? AND status = 1", [Number(targetOperatorId)])).values?.[0];
+        if (emp) { operatorId = Number(targetOperatorId); operatorName = emp[0] || operatorName; }
+    }
+    let commissionAmount = 0;
+    try {
+        const cr = (await safeExec("SELECT COALESCE(commission_rate,0) FROM users WHERE id = ?", [operatorId])).values?.[0]?.[0];
+        commissionAmount = Math.round((Number(cr) || 0) * finalAmount) / 100;
+    } catch (e) { commissionAmount = 0; }
+
+    // ⑤ 无收款单 ⇒ 收款保持 0，应收/欠款按新金额重算
+    const oweAmount = Math.round(finalAmount * 100) / 100;
+    const paymentStatus = oweAmount > 0.005 ? '未结清' : '已结清';
+    const newBillDate = bill_date || old.bill_date || null;
+    await run("UPDATE sales_orders SET customer_id = ?, customer_name = ?, total_amount = ?, discount = ?, final_amount = ?, express_amount = ?, tax_amount = ?, small_change_amount = ?, receivable_amount = ?, received_amount = 0, owe_amount = ?, payment_status = ?, operator_id = ?, operator_name = ?, commission_amount = ?, remark = ?, bill_date = ? WHERE id = ?",
+        [customer_id || old.customer_id || null, customer_name || old.customer_name || null, totalAmount, Number(discount) || 0, finalAmount,
+            Number(express_amount) || 0, Number(tax_amount) || 0, Number(small_change_amount) || 0,
+            finalAmount, oweAmount, paymentStatus, operatorId, operatorName, commissionAmount,
+            remark ?? old.remark ?? '', newBillDate, id]);
+    saveDB();
+    res.json({ ok: true, id, order_number: old.order_number, final_amount: finalAmount, owe_amount: oweAmount, payment_status: paymentStatus, items: items.length });
+});
 app.post('/api/store/sales-orders/:id/receive', authMiddleware, hasPerm('sales'), async (req, res) => {
     await initDB();
     const id = Number(req.params.id);
