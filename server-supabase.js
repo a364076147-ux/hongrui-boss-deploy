@@ -2964,6 +2964,56 @@ app.get('/api/store/customer-last-prices/:id', authMiddleware, hasPerm('sales'),
     }
     res.json(out);
 });
+/* 客户「常购商品」——开单页选中客户后的快捷区
+ * ★ 2026-10-09 新增（老板真机反馈：「选择对应的客户能不能提取当时的单价和采购的产品，不用再重新查找」）
+ *   与 /store/customer-last-prices/:id **同源同一套口径**（同一条 SQL 骨架、同一套排除规则、
+ *   同一个归期表达式），避免"上次价"和"常购清单"两处各算一套、对不上。
+ *
+ * 契约：GET /api/store/customer-history-products/:id   （:id = 客户 id）
+ *   返回 [{ product_id, product_name, sku, last_price, last_date, times, total_qty }]
+ *   · last_price / last_date = **最近一次**成交价与归期（按归期倒序取首次出现）
+ *   · times = 成交次数（明细行数）；total_qty = 累计数量
+ *   · 排序＝最近购买日倒序；上限 50 条（够用且不让手机端铺满）
+ *   口径：排除作废单（payment_status='作废'）与退货单（biz_type='sale_return'）；
+ *        归期一律 substr(COALESCE(bill_date, created_at),1,10)。
+ *   ⚠️ product 已停用/删除的行不过滤 —— 前端会用它去商品池里找，找不到就标灰，
+ *      让用户明白"这项买过但现在开不了"，比静默消失可解释。
+ */
+app.get('/api/store/customer-history-products/:id', authMiddleware, hasPerm('sales'), async (req, res) => {
+    await initDB();
+    const cid = Number(req.params.id);
+    if (!cid)
+        return res.json([]);
+    const rows = (await safeExec("SELECT oi.product_id, oi.product_name, oi.sku, oi.quantity, oi.unit_price, " +
+        "substr(COALESCE(so.bill_date, so.created_at),1,10) AS d " +
+        "FROM sales_order_items oi " +
+        "JOIN sales_orders so ON oi.order_id = so.id " +
+        "WHERE so.customer_id = ? AND COALESCE(so.payment_status,'') <> '作废' " +
+        "AND COALESCE(so.biz_type,'sale') <> 'sale_return' AND oi.product_id IS NOT NULL " +
+        "ORDER BY d DESC, so.id DESC, oi.id DESC", [cid])).values || [];
+    const map = new Map();
+    for (const r of rows) {
+        const pid = Number(r[0]);
+        if (!pid)
+            continue;
+        if (!map.has(pid)) {
+            // 已按归期倒序 ⇒ 首次出现即"最近一次"
+            map.set(pid, {
+                product_id: pid,
+                product_name: r[1] || '',
+                sku: r[2] || '',
+                last_price: Number(r[4]) || 0,
+                last_date: r[5] || '',
+                times: 0,
+                total_qty: 0,
+            });
+        }
+        const it = map.get(pid);
+        it.times += 1;
+        it.total_qty += Number(r[3]) || 0;
+    }
+    res.json([...map.values()].slice(0, 50));
+});
 const PO_COLS = "id, order_number, supplier_id, supplier_name, total_amount, status, operator_id, operator_name, created_at, payment_status, bill_date, paid_amount, owe_amount, remark, maker_name";
 /* 「未删除」判据（2026-10-09）：进货单的删除采用软删除 —— status='cancelled'，记录与明细全保留。
  * ⚠️ 必须 COALESCE：`status NOT IN ('cancelled','void')` 在 status 为 NULL 时求值为 NULL
@@ -4216,11 +4266,32 @@ async function computeArap() {
         },
     };
 }
-app.get('/api/finance/arap', authMiddleware, hasPerm('finance_view'), async (_req, res) => {
+/* ★★★ 2026-10-09 欠款可见性对齐智慧记
+ *   老板真机反馈：「子账户怎么能看到客户欠款和进货欠款，这个怎么跟智慧记不一样」。
+ *   智慧记子账号实测（知识库 §9.3，非推断）：**数据不隔离，只遮成本/利润，收款/欠款/应收一律可见**。
+ *   而本仓库此前把 /finance/arap 与两个对账单接口都挂在 hasPerm('finance_view') 上 ⇒
+ *   子账号（曹怡航/蒋斌斌，权限里没有 finance_view）进应收应付页被守卫踢回首页、
+ *   客户管理页看不到欠款 —— **既与智慧记不一致，也与本文件自己的既定口径矛盾**：
+ *   下面脱敏器的说明已明确写着「销售额 / 单数 / **欠款** / 库存数量 / 零售额 → 全店可见」。
+ *   ⇒ 去掉这三个接口的 finance_view 门（只留登录态），让"欠款可见"回到既定口径。
+ *   ⚠️ 成本 / 利润仍由全局出口脱敏器统一保护，本改动不影响。
+ *   ⚠️ 「能不能收款/付款」仍由页面按钮与 income / expense 权限决定，与"能不能看"是两件事。
+ */
+app.get('/api/finance/arap', authMiddleware, async (_req, res) => {
     res.json(await computeArap());
 });
-// 客户对账单：期初 + 销售单 + 收款流水明细（口径与 /finance/arap 完全一致：按现名归集）
-app.get('/api/finance/customer-statement/:id', authMiddleware, hasPerm('finance_view'), async (req, res) => {
+/* 客户对账单：期初 + 销售单 + 收款流水明细（口径与 /finance/arap 完全一致：按现名归集）
+ *
+ * ★ 2026-10-09 新增可选区间 from / to（老板反馈「对账单不能选择时间」，智慧记可自选期间）
+ *   · **不传 ⇒ 行为与改造前逐字段一致**（期初 = 档案期初；明细全量）—— 向后兼容
+ *   · 传了 ⇒ 明细只给 [from, to] 内的，且**期初按区间开始日结转**：
+ *          区间期初 = 档案期初 + Σ(归期 < from 的销售) − Σ(归期 < from 的收款)
+ *     ★ 这一步不能省：只过滤明细而不动期初，会把「区间外的回款」算进本期，
+ *       金额直接算错，而且是**看起来对的错**（数字是具体数、不是 0，最容易被信）。
+ *   · 归期一律 substr(COALESCE(bill_date, created_at),1,10)，与 /store/customer-last-prices 同源。
+ *   · 响应新增 `date`（每行的归期）与 `range` / `archived_initial_balance`，旧字段全部保留。
+ */
+app.get('/api/finance/customer-statement/:id', authMiddleware, async (req, res) => {
     await initDB();
     const cid = Number(req.params.id);
     const cust = (await safeExec("SELECT name FROM customers WHERE id = ?", [cid])).values?.[0];
@@ -4228,10 +4299,14 @@ app.get('/api/finance/customer-statement/:id', authMiddleware, hasPerm('finance_
     // 传进来的是档案 id，但单据/流水只落了名称 ⇒ 先归一到「现名」，再把同单位多档案的期初合并
     const cnm = canonName(cust[0]);
     const initRow = (await safeExec(`SELECT COALESCE(SUM(initial_balance),0) FROM customers WHERE status=1 AND ${canonSQL('name')} = ?`, [cnm])).values?.[0];
+    const archInit = Number(initRow?.[0]) || 0;
+    const from = req.query.from ? String(req.query.from).slice(0, 10) : '';
+    const to = req.query.to ? String(req.query.to).slice(0, 10) : '';
     /* 单据 + 商品明细一次取全（LEFT JOIN）：前端打印模板会按 o.items 逐行渲染，
      * 未挂明细的历史单据 items 为空数组，不影响单据行本身。 */
     const stmtRows = (await safeExec(`SELECT so.id, so.order_number, so.created_at, so.final_amount, so.payment_status,
-        oi.product_name, oi.quantity, oi.unit_price, oi.amount
+        oi.product_name, oi.quantity, oi.unit_price, oi.amount,
+        substr(COALESCE(so.bill_date, so.created_at),1,10) AS d
         FROM sales_orders so
         LEFT JOIN sales_order_items oi ON oi.order_id = so.id
         WHERE ${canonSQL('so.customer_name')} = ? AND COALESCE(so.payment_status,'') <> '作废'
@@ -4239,29 +4314,54 @@ app.get('/api/finance/customer-statement/:id', authMiddleware, hasPerm('finance_
     const orderMap = new Map();
     for (const r of stmtRows) {
         const oid = Number(r[0]);
-        if (!orderMap.has(oid)) orderMap.set(oid, { order_number: r[1], created_at: r[2], amount: Number(r[3]), status: r[4], items: [] });
+        if (!orderMap.has(oid))
+            orderMap.set(oid, {
+                order_number: r[1], created_at: r[2],
+                date: r[9] || String(r[2] || '').slice(0, 10),
+                amount: Number(r[3]), status: r[4], items: [],
+            });
         if (r[5] !== null && r[5] !== undefined) {
             orderMap.get(oid).items.push({ product_name: r[5], quantity: Number(r[6]) || 0, unit_price: Number(r[7]) || 0, amount: Number(r[8]) || 0 });
         }
     }
-    const payments = (await safeExec(`SELECT created_at, amount, description FROM transactions WHERE type='income' AND ${canonSQL('party_name')} = ? ORDER BY id`, [cnm])).values || [];
+    const payRows = (await safeExec(`SELECT created_at, amount, description FROM transactions WHERE type='income' AND ${canonSQL('party_name')} = ? ORDER BY id`, [cnm])).values || [];
+    const paymentsAll = payRows.map((p) => ({ created_at: p[0], date: String(p[0] || '').slice(0, 10), amount: Number(p[1]), description: p[2] }));
+    const ordersAll = [...orderMap.values()];
+    /* 区间切分：未传区间时全部通过（= 旧行为） */
+    const inRange = (d) => (!from || (d && d >= from)) && (!to || (d && d <= to));
+    const ranged = !!(from || to);
+    const orders = ranged ? ordersAll.filter((o) => inRange(o.date)) : ordersAll;
+    const payments = ranged ? paymentsAll.filter((p) => inRange(p.date)) : paymentsAll;
+    /* 区间期初 = 档案期初 + 区间开始日之前的销售 − 区间开始日之前的收款 */
+    let carried = archInit;
+    if (from) {
+        for (const o of ordersAll) if (o.date && o.date < from) carried += Number(o.amount) || 0;
+        for (const p of paymentsAll) if (p.date && p.date < from) carried -= Number(p.amount) || 0;
+    }
     res.json({
-        name: cnm, initial_balance: Number(initRow?.[0]) || 0,
-        orders: [...orderMap.values()],
-        payments: payments.map((p) => ({ created_at: p[0], amount: Number(p[1]), description: p[2] })),
+        name: cnm,
+        initial_balance: Math.round(carried * 100) / 100,
+        archived_initial_balance: archInit,
+        range: { from: from || null, to: to || null },
+        orders,
+        payments,
     });
 });
-// 供应商对账单：期初 + 进货单 + 付款流水明细（口径同上）
-app.get('/api/finance/supplier-statement/:id', authMiddleware, hasPerm('finance_view'), async (req, res) => {
+/* 供应商对账单：期初 + 进货单 + 付款流水明细（口径同上，含同一套 from/to 区间与期初结转） */
+app.get('/api/finance/supplier-statement/:id', authMiddleware, async (req, res) => {
     await initDB();
     const sid = Number(req.params.id);
     const sup = (await safeExec("SELECT name FROM suppliers WHERE id = ?", [sid])).values?.[0];
     if (!sup) return res.status(404).json({ error: '供应商不存在' });
     const snm = canonName(sup[0]);
     const initRow = (await safeExec(`SELECT COALESCE(SUM(initial_balance),0) FROM suppliers WHERE status=1 AND ${canonSQL('name')} = ?`, [snm])).values?.[0];
+    const archInit = Number(initRow?.[0]) || 0;
+    const from = req.query.from ? String(req.query.from).slice(0, 10) : '';
+    const to = req.query.to ? String(req.query.to).slice(0, 10) : '';
     /* 同客户对账单：单据 + 商品明细一次取全（LEFT JOIN），未挂明细的历史单据 items 为空数组 */
     const stmtRows = (await safeExec(`SELECT po.id, po.order_number, po.created_at, po.total_amount, po.payment_status,
-        oi.product_name, oi.quantity, oi.unit_price, oi.amount
+        oi.product_name, oi.quantity, oi.unit_price, oi.amount,
+        substr(COALESCE(po.bill_date, po.created_at),1,10) AS d
         FROM purchase_orders po
         LEFT JOIN purchase_order_items oi ON oi.order_id = po.id
         WHERE ${canonSQL('po.supplier_name')} = ? AND COALESCE(po.payment_status,'') <> '作废' AND COALESCE(po.status,'completed') NOT IN ('cancelled','void')
@@ -4269,16 +4369,35 @@ app.get('/api/finance/supplier-statement/:id', authMiddleware, hasPerm('finance_
     const orderMap = new Map();
     for (const r of stmtRows) {
         const oid = Number(r[0]);
-        if (!orderMap.has(oid)) orderMap.set(oid, { order_number: r[1], created_at: r[2], amount: Number(r[3]), status: r[4], items: [] });
+        if (!orderMap.has(oid))
+            orderMap.set(oid, {
+                order_number: r[1], created_at: r[2],
+                date: r[9] || String(r[2] || '').slice(0, 10),
+                amount: Number(r[3]), status: r[4], items: [],
+            });
         if (r[5] !== null && r[5] !== undefined) {
             orderMap.get(oid).items.push({ product_name: r[5], quantity: Number(r[6]) || 0, unit_price: Number(r[7]) || 0, amount: Number(r[8]) || 0 });
         }
     }
-    const payments = (await safeExec(`SELECT created_at, amount, description FROM transactions WHERE type='expense' AND ${canonSQL('party_name')} = ? ORDER BY id`, [snm])).values || [];
+    const payRows = (await safeExec(`SELECT created_at, amount, description FROM transactions WHERE type='expense' AND ${canonSQL('party_name')} = ? ORDER BY id`, [snm])).values || [];
+    const paymentsAll = payRows.map((p) => ({ created_at: p[0], date: String(p[0] || '').slice(0, 10), amount: Number(p[1]), description: p[2] }));
+    const ordersAll = [...orderMap.values()];
+    const inRange = (d) => (!from || (d && d >= from)) && (!to || (d && d <= to));
+    const ranged = !!(from || to);
+    const orders = ranged ? ordersAll.filter((o) => inRange(o.date)) : ordersAll;
+    const payments = ranged ? paymentsAll.filter((p) => inRange(p.date)) : paymentsAll;
+    let carried = archInit;
+    if (from) {
+        for (const o of ordersAll) if (o.date && o.date < from) carried += Number(o.amount) || 0;
+        for (const p of paymentsAll) if (p.date && p.date < from) carried -= Number(p.amount) || 0;
+    }
     res.json({
-        name: snm, initial_balance: Number(initRow?.[0]) || 0,
-        orders: [...orderMap.values()],
-        payments: payments.map((p) => ({ created_at: p[0], amount: Number(p[1]), description: p[2] })),
+        name: snm,
+        initial_balance: Math.round(carried * 100) / 100,
+        archived_initial_balance: archInit,
+        range: { from: from || null, to: to || null },
+        orders,
+        payments,
     });
 });
 // ==================== 销售预订 ====================
