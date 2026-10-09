@@ -115,6 +115,44 @@ async function run(sql, params = []) {
         console.error('Run Error:', e.message, 'SQL:', sql);
     }
 }
+/* ★★ 2026-10-09 新增：`runLastId(sql, params)` —— 执行 INSERT 并返回新行 id。
+ *
+ * 【为什么必须有它 —— 这是一个真缺陷，不是洁癖】
+ *   原写法是**两步**：`await run("INSERT ...")` 然后 `await safeExec("SELECT last_insert_rowid()")`。
+ *   `last_insert_rowid()` 由 translateSQL 转成 PG 的 `lastval()`，而 **`lastval()` 是会话级状态**
+ *   （每个连接各自维护一份）。偏偏 `run()` 与 `safeExec()` 各自独立地
+ *   `getPool().connect() → client.release()`（池 `max: 20`）⇒ 两次调用**可能落在不同连接上**：
+ *     · 落在别的连接  ⇒ lastval() 返回**那条连接上一次 nextval 的值**（可能是另一个请求刚插入的 id）
+ *     · 该连接从未 nextval ⇒ 直接报 `lastval is not yet defined in this session`
+ *   雪上加霜的是 safeExec 的 catch 会把错误**静默**吞成 `{columns:[],values:[]}`
+ *   ⇒ 调用方拿到 undefined，表现为「主单插入成功、明细却没挂上 / 挂到别的单上」——
+ *   静默错数据，是查起来最痛苦的一类。
+ *
+ * 【修法】用 PG 原生的 `INSERT ... RETURNING id`，把「插入」与「取 id」并成
+ *   **同一条语句、同一个连接**，从根上消除对会话状态的依赖（无需事务、无需额外往返）。
+ *   失败/取不到时返回 null（调用方一律以 `if (id)` 判定，与旧行为兼容），并打印日志（绝不静默）。
+ */
+async function runLastId(sql, params = []) {
+    try {
+        const translated = translateSQL(sql);
+        const { sql: finalSql } = convertPlaceholders(translated);
+        const client = await getPool().connect();
+        try {
+            const result = await client.query({ text: finalSql + ' RETURNING id', values: params });
+            const row = result.rows && result.rows[0];
+            if (!row) return null;
+            // 正常情况下列名就是 id；兜底取第一个值，避免列名大小写/别名差异导致拿到 undefined
+            return row.id === undefined ? (Object.values(row)[0] ?? null) : row.id;
+        }
+        finally {
+            client.release();
+        }
+    }
+    catch (e) {
+        console.error('RunLastId Error:', e.message, 'SQL:', sql);
+        return null;
+    }
+}
 /* ==================== 性能：把 N 次顺序往返压成 1 次 ====================
  * 实测（2026-10-04，_governance/_probe-db-profile.cjs + _probe-platform-floor.cjs）：
  *   · Postgres 侧执行时间 0.1~4.6ms（sales_orders 4517 行全表扫也只 2.3ms）
@@ -1004,9 +1042,8 @@ app.get('/api/inventory/checks', authMiddleware, hasPerm('inventory_view'), asyn
 app.post('/api/inventory/checks', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
     const checkNumber = await generateOrderNumber('PD');
-    await run("INSERT INTO inventory_checks (check_number, operator_id) VALUES (?, ?)", [checkNumber, req.user.id]);
-    // 获取刚插入的盘点单 ID（SQLite: last_insert_rowid，PG 端 translateSQL 自动转 lastval）
-    const checkId = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0];
+    // 获取刚插入的盘点单 ID（见 runLastId 注释：必须与 INSERT 同一条语句，避免连接池会话漂移）
+    const checkId = await runLastId("INSERT INTO inventory_checks (check_number, operator_id) VALUES (?, ?)", [checkNumber, req.user.id]);
     // Get all products for the check
     const products = await safeExec("SELECT id, name, sku, stock_quantity FROM products WHERE status = 1");
     if (products.values) {
@@ -1566,8 +1603,8 @@ app.post('/api/finance/transactions/income', authMiddleware, hasPerm('income'), 
         accId = (await safeExec("SELECT id FROM accounts ORDER BY id LIMIT 1")).values?.[0]?.[0] || null;
     }
     if (!accId) {
-        await run("INSERT INTO accounts (name, type, balance) VALUES ('现金', 'cash', 0)");
-        accId = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0] || null;
+        // 见 runLastId 注释：INSERT 与「取刚插入的 id」必须同一条语句，否则连接池会话漂移会取到别的 id
+        accId = await runLastId("INSERT INTO accounts (name, type, balance) VALUES ('现金', 'cash', 0)");
     }
     const cat = category || (pname ? '收欠款' : '直接收款');
     // 收款单号 SKD+YYYYMMDD+4位当日序号（对齐智慧记）；取号失败不阻断开单
@@ -1625,8 +1662,8 @@ app.post('/api/finance/transactions/expense', authMiddleware, hasPerm('expense')
         accId = (await safeExec("SELECT id FROM accounts ORDER BY id LIMIT 1")).values?.[0]?.[0] || null;
     }
     if (!accId) {
-        await run("INSERT INTO accounts (name, type, balance) VALUES ('现金', 'cash', 0)");
-        accId = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0] || null;
+        // 见 runLastId 注释：INSERT 与「取刚插入的 id」必须同一条语句，否则连接池会话漂移会取到别的 id
+        accId = await runLastId("INSERT INTO accounts (name, type, balance) VALUES ('现金', 'cash', 0)");
     }
     const cat = category || (pname ? '付欠款' : '直接付款');
     // 付款单号 FKD+YYYYMMDD+4位当日序号（对齐智慧记）
@@ -3149,10 +3186,9 @@ app.post('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), asyn
     const paymentStatus = req.body.payment_status || (oweAmount > 0.005 ? '未结清' : '已结清');
     // status 显式写 'completed'：软删除判据是 status='cancelled'，若新单 status 为 NULL
     // 会被 `NOT IN` 判据静默排除（供应商对账里凭空少一张）⇒ 必须显式落值。
-    await run("INSERT INTO purchase_orders (order_number, supplier_id, supplier_name, total_amount, operator_id, operator_name, payment_status, bill_date, paid_amount, owe_amount, remark, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed')", [orderNumber, supplier_id, supplier_name, totalAmount, req.user.id, req.user.real_name, paymentStatus, bill_date || todayCST(), paidAmount, oweAmount, remark || '']);
+    // 见 runLastId 注释：INSERT 与取 id 必须同一条语句（连接池会话漂移会让明细挂到别的单上）
+    const orderId = await runLastId("INSERT INTO purchase_orders (order_number, supplier_id, supplier_name, total_amount, operator_id, operator_name, payment_status, bill_date, paid_amount, owe_amount, remark, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed')", [orderNumber, supplier_id, supplier_name, totalAmount, req.user.id, req.user.real_name, paymentStatus, bill_date || todayCST(), paidAmount, oweAmount, remark || '']);
     if (items) {
-        const orderIdResult = await safeExec("SELECT last_insert_rowid()");
-        const orderId = orderIdResult.values?.[0]?.[0];
         for (const item of items) {
             await run("INSERT INTO purchase_order_items (order_id, product_id, product_name, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?)", [orderId, item.product_id, item.product_name, item.quantity, item.unit_price, item.quantity * item.unit_price]);
             // 增加库存
@@ -3830,9 +3866,7 @@ app.post('/api/store/sales-returns', authMiddleware, hasPerm('return'), async (r
             totalAmount += (item.quantity || 0) * (item.unit_price || 0);
         }
     }
-    await run("INSERT INTO sales_returns (return_number, sales_order_id, total_amount, operator_id, operator_name, reason) VALUES (?, ?, ?, ?, ?, ?)", [returnNumber, sales_order_id, totalAmount, req.user.id, req.user.real_name, reason || '']);
-    const returnIdResult = await safeExec("SELECT last_insert_rowid()");
-    const returnId = returnIdResult.values?.[0]?.[0];
+    const returnId = await runLastId("INSERT INTO sales_returns (return_number, sales_order_id, total_amount, operator_id, operator_name, reason) VALUES (?, ?, ?, ?, ?, ?)", [returnNumber, sales_order_id, totalAmount, req.user.id, req.user.real_name, reason || '']);
     if (items && returnId) {
         for (const item of items) {
             await run("INSERT INTO sales_return_items (return_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)", [returnId, item.product_id, item.product_name, item.sku, item.quantity, item.unit_price, item.quantity * item.unit_price]);
@@ -3882,8 +3916,7 @@ app.post('/api/store/recycles', authMiddleware, hasPerm('recycle'), async (req, 
     let totalAmount = 0;
     for (const it of items)
         totalAmount += (it.quantity || 0) * (it.unit_price || 0);
-    await run("INSERT INTO recycles (recycle_number, customer_id, customer_name, total_amount, operator_id, operator_name, remark) VALUES (?, ?, ?, ?, ?, ?, ?)", [recycleNumber, customer_id || null, customer_name || null, totalAmount, req.user.id, req.user.real_name, remark || '']);
-    const recycleId = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0];
+    const recycleId = await runLastId("INSERT INTO recycles (recycle_number, customer_id, customer_name, total_amount, operator_id, operator_name, remark) VALUES (?, ?, ?, ?, ?, ?, ?)", [recycleNumber, customer_id || null, customer_name || null, totalAmount, req.user.id, req.user.real_name, remark || '']);
     if (items && recycleId) {
         for (const it of items) {
             await run("INSERT INTO recycle_items (recycle_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)", [recycleId, it.product_id, it.product_name, it.sku || '', it.quantity, it.unit_price, (it.quantity || 0) * (it.unit_price || 0)]);
@@ -3909,8 +3942,8 @@ app.post('/api/store/recycles', authMiddleware, hasPerm('recycle'), async (req, 
         accId = (await safeExec("SELECT id FROM accounts ORDER BY id LIMIT 1")).values?.[0]?.[0] || null;
     }
     if (!accId) {
-        await run("INSERT INTO accounts (name, type, balance) VALUES ('现金', 'cash', 0)");
-        accId = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0] || null;
+        // 见 runLastId 注释：INSERT 与「取刚插入的 id」必须同一条语句，否则连接池会话漂移会取到别的 id
+        accId = await runLastId("INSERT INTO accounts (name, type, balance) VALUES ('现金', 'cash', 0)");
     }
     if (accId) {
         /* 补单据号（2026-10-05）：回收是「付钱给客户」，属付款流水 ⇒ 单号用 FKD。
@@ -4423,9 +4456,8 @@ app.post('/api/store/reservations', authMiddleware, hasPerm('sales'), async (req
     const rn = await generateOrderNumber('YD');
     let totalAmount = 0;
     for (const it of items) totalAmount += (it.quantity || 0) * (it.price || 0);
-    await run("INSERT INTO sales_reservations (reservation_number, customer_id, customer_name, total_amount, status, remark, operator_id, operator_name) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
+    const rid = await runLastId("INSERT INTO sales_reservations (reservation_number, customer_id, customer_name, total_amount, status, remark, operator_id, operator_name) VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
         [rn, customer_id || null, customer_name || null, totalAmount, remark || '', req.user.id, req.user.real_name]);
-    const rid = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0];
     if (items && rid) {
         for (const it of items) {
             await run("INSERT INTO sales_reservation_items (reservation_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -4461,9 +4493,8 @@ app.post('/api/store/reservations/:id/complete', authMiddleware, hasPerm('sales'
         const cr = (await safeExec("SELECT COALESCE(commission_rate,0) FROM users WHERE id = ?", [req.user.id])).values?.[0]?.[0];
         commissionAmount = Math.round((Number(cr) || 0) * finalAmount) / 100;
     } catch (e) { commissionAmount = 0; }
-    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, commission_amount, payment_status, bill_date, receivable_amount, received_amount, owe_amount, small_change_amount, express_amount, tax_amount, remark, biz_type) VALUES (?, ?, ?, ?, 0, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, '', 'sale')",
+    const orderId = await runLastId("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, commission_amount, payment_status, bill_date, receivable_amount, received_amount, owe_amount, small_change_amount, express_amount, tax_amount, remark, biz_type) VALUES (?, ?, ?, ?, 0, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, '', 'sale')",
         [orderNumber, r[2], r[3], finalAmount, finalAmount, req.user.id, req.user.real_name, commissionAmount, M.payment_status, M.bill_date, M.receivable_amount, M.received_amount, M.owe_amount]);
-    const orderId = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0];
     for (const it of resolved) {
         await run("INSERT INTO sales_order_items (order_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
             [orderId, it.pid, it.name, it.sku, it.qty, it.price, it.amount]);
@@ -4499,9 +4530,8 @@ app.post('/api/store/purchase-returns', authMiddleware, hasPerm('purchase'), asy
     const rn = await generateOrderNumber('TH');
     let totalAmount = 0;
     for (const it of items) totalAmount += (it.quantity || 0) * (it.price || 0);
-    await run("INSERT INTO purchase_returns (return_number, purchase_order_id, supplier_id, supplier_name, total_amount, reason, operator_id, operator_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+    const rid = await runLastId("INSERT INTO purchase_returns (return_number, purchase_order_id, supplier_id, supplier_name, total_amount, reason, operator_id, operator_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [rn, purchase_order_id || null, supplier_id || null, supplier_name || null, totalAmount, reason || '', req.user.id, req.user.real_name]);
-    const rid = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0];
     if (items && rid) {
         for (const it of items) {
             await run("INSERT INTO purchase_return_items (return_id, product_id, product_name, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?)",
@@ -4535,9 +4565,8 @@ app.post('/api/store/quotes', authMiddleware, hasPerm('sales'), async (req, res)
     const qn = await generateOrderNumber('BJ');
     let totalAmount = 0;
     for (const it of items) totalAmount += (it.quantity || 0) * (it.price || 0);
-    await run("INSERT INTO quotes (quote_number, customer_id, customer_name, total_amount, status, remark, operator_id, operator_name) VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)",
+    const qid = await runLastId("INSERT INTO quotes (quote_number, customer_id, customer_name, total_amount, status, remark, operator_id, operator_name) VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)",
         [qn, customer_id || null, customer_name || null, totalAmount, remark || '', req.user.id, req.user.real_name]);
-    const qid = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0];
     if (items && qid) {
         for (const it of items) {
             await run("INSERT INTO quote_items (quote_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -4572,9 +4601,8 @@ app.post('/api/store/quotes/:id/convert', authMiddleware, hasPerm('sales'), asyn
         const cr = (await safeExec("SELECT COALESCE(commission_rate,0) FROM users WHERE id = ?", [req.user.id])).values?.[0]?.[0];
         commissionAmount = Math.round((Number(cr) || 0) * finalAmount) / 100;
     } catch (e) { commissionAmount = 0; }
-    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, commission_amount, payment_status, bill_date, receivable_amount, received_amount, owe_amount, small_change_amount, express_amount, tax_amount, remark, biz_type) VALUES (?, ?, ?, ?, 0, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, '', 'sale')",
+    const orderId = await runLastId("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, commission_amount, payment_status, bill_date, receivable_amount, received_amount, owe_amount, small_change_amount, express_amount, tax_amount, remark, biz_type) VALUES (?, ?, ?, ?, 0, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, '', 'sale')",
         [orderNumber, q[2], q[3], finalAmount, finalAmount, req.user.id, req.user.real_name, commissionAmount, M.payment_status, M.bill_date, M.receivable_amount, M.received_amount, M.owe_amount]);
-    const orderId = (await safeExec("SELECT last_insert_rowid()")).values?.[0]?.[0];
     for (const it of resolved) {
         await run("INSERT INTO sales_order_items (order_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
             [orderId, it.pid, it.name, it.sku, it.qty, it.price, it.amount]);
