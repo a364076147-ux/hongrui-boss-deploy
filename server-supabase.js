@@ -607,6 +607,13 @@ const ALL_PERMS = [
     'sales', 'return', 'recycle', 'purchase', 'orders', 'customers', 'suppliers',
     'inventory_view', 'inventory_full', 'income', 'expense', 'finance_view',
     'reconciliation', 'performance', 'sales_stats', 'employees', 'settings',
+    /* ★ 2026-10-09 新增（老板拍板 2-C）：
+     *   欠款可见性从「全店可见」收为**可勾选项**。原因是白天按智慧记口径放开后，
+     *   老板真机反馈「子账户看到欠款代收/欠款待付，这个不是子账户的权限」——
+     *   老板口径优先于对标 ⇒ 独立权限位，由管理员按账号授予。
+     *   ⚠️ 只管「欠款汇总」：/finance/arap、应收应付页、首页两块欠款 KPI。
+     *      客户详情里的「往来记录」不受此门限制（老板要求子账户能点开看详情）。 */
+    'debt_view',
 ];
 // 新店员默认权限（开单必需的基础功能）
 const DEFAULT_EMPLOYEE_PERMS = ['sales', 'return', 'customers', 'income', 'expense', 'performance'];
@@ -2060,16 +2067,21 @@ app.get('/api/analysis/dashboard', authMiddleware, async (req, res) => {
     ]);
     const N = (v) => Number(v || 0);
     const todaySales = N(S.todaySales), todayCost = N(S.todayCost), monthSales = N(S.monthSales), monthCost = N(S.monthCost);
-    // 应收/应付：与对账页同源（单一真源，口径不可能再分叉）
-    const arap = await computeArap();
+    /* ★ 2026-10-09（老板拍板 2-C）欠款字段按 debt_view 门禁：
+     *   未授权时**整个字段不出现**（不是 0）——0 会被前端渲染成"真的欠 0 元"，
+     *   属于「看似真值的错」，比不返回更坏。顺带省掉一次 computeArap() 全表往返。 */
+    const canDebt = parsePerms(req.user).includes('debt_view');
+    const arap = canDebt ? await computeArap() : null;
     res.json({
         todaySales, todayExpense: N(S.todayExpense), todayCost, todayProfit: todaySales - todayCost,
         todayOrders: N(S.todayOrders), warningCount: N(S.warningCount), monthSales,
         monthCost, monthProfit: monthSales - monthCost,
-        receivable: arap.summary.total_receivable,
-        unpaidCount: arap.summary.receivable_parties,   // 语义修正：家数（原为"未结清单数"）
-        payable: arap.summary.total_payable,
-        payableCount: arap.summary.payable_parties,
+        ...(canDebt ? {
+            receivable: arap.summary.total_receivable,
+            unpaidCount: arap.summary.receivable_parties,   // 语义修正：家数（原为"未结清单数"）
+            payable: arap.summary.total_payable,
+            payableCount: arap.summary.payable_parties,
+        } : {}),
     });
 });
 /* 销售统计 —— 对齐智慧记「报表逐月归组」口径
@@ -4011,10 +4023,20 @@ app.post('/api/store/settings/init', authMiddleware, hasPerm('settings'), async 
 });
 // ==================== Excel 导入导出 ====================
 // 导出商品（xlsx）
-app.get('/api/inventory/products/export', authMiddleware, hasPerm('inventory_view'), async (_req, res) => {
+/* ★ 2026-10-09（老板拍板 1-A）：本接口由 inventory_view 开放给子账号，
+ *   但 xlsx 是二进制响应、**绕过全局出口脱敏器**（那个只改 res.json）⇒ 若原样导出，
+ *   只读子账号能把「进货价」整表带走 —— 相当于把成本泄露从界面挪到了文件里。
+ *   ⇒ 按 sensitiveFlags(req.user).cost 决定是否带成本列（与页面隐藏同一判据）。 */
+app.get('/api/inventory/products/export', authMiddleware, hasPerm('inventory_view'), async (req, res) => {
     await initDB();
-    const result = await safeExec("SELECT name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity FROM products WHERE status = 1 ORDER BY id");
-    const rows = [['商品名称', '分类', '规格', '单位', '进货价', '销售价', '库存数量', '预警数量']];
+    const canCost = sensitiveFlags(req.user).cost;
+    const sel = canCost
+        ? "name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity"
+        : "name, category, spec, unit, sell_price, stock_quantity, warning_quantity";
+    const result = await safeExec(`SELECT ${sel} FROM products WHERE status = 1 ORDER BY id`);
+    const rows = [canCost
+        ? ['商品名称', '分类', '规格', '单位', '进货价', '销售价', '库存数量', '预警数量']
+        : ['商品名称', '分类', '规格', '单位', '销售价', '库存数量', '预警数量']];
     for (const r of result.values || []) rows.push(r);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rows), '商品');
@@ -4299,18 +4321,21 @@ async function computeArap() {
         },
     };
 }
-/* ★★★ 2026-10-09 欠款可见性对齐智慧记
- *   老板真机反馈：「子账户怎么能看到客户欠款和进货欠款，这个怎么跟智慧记不一样」。
- *   智慧记子账号实测（知识库 §9.3，非推断）：**数据不隔离，只遮成本/利润，收款/欠款/应收一律可见**。
- *   而本仓库此前把 /finance/arap 与两个对账单接口都挂在 hasPerm('finance_view') 上 ⇒
- *   子账号（曹怡航/蒋斌斌，权限里没有 finance_view）进应收应付页被守卫踢回首页、
- *   客户管理页看不到欠款 —— **既与智慧记不一致，也与本文件自己的既定口径矛盾**：
- *   下面脱敏器的说明已明确写着「销售额 / 单数 / **欠款** / 库存数量 / 零售额 → 全店可见」。
- *   ⇒ 去掉这三个接口的 finance_view 门（只留登录态），让"欠款可见"回到既定口径。
+/* ★★★ 2026-10-09 欠款可见性：**两轮改动，以第二轮为准**
+ *   ① 白天（对齐智慧记）：把 /finance/arap 与两个对账单接口的 finance_view 门去掉，
+ *      让"欠款可见"回到脱敏器说明里的既定口径。
+ *   ② 当晚（**老板拍板 2-C，本版生效**）：老板真机反馈「子账户看到欠款代收/欠款待付，
+ *      这个不是子账户的权限」⇒ **老板口径优先于对标**，欠款可见性收为独立权限位
+ *      `debt_view`，由管理员在「员工管理 → 资金管理 → 欠款查看」按账号授予。
+ *      · /finance/arap 与应收应付页：需 debt_view
+ *      · 首页 /analysis/dashboard 的两块欠款 KPI：需 debt_view（未授权时字段**不返回**）
+ *      · **两个对账单接口（customer/supplier-statement）不挂此门**：
+ *        老板要求子账户能点开客户往来详情，对账单是它的数据源；
+ *        且这里的金额是"这个客户欠多少"的单据流水，不是全店欠款汇总。
  *   ⚠️ 成本 / 利润仍由全局出口脱敏器统一保护，本改动不影响。
  *   ⚠️ 「能不能收款/付款」仍由页面按钮与 income / expense 权限决定，与"能不能看"是两件事。
  */
-app.get('/api/finance/arap', authMiddleware, async (_req, res) => {
+app.get('/api/finance/arap', authMiddleware, hasPerm('debt_view'), async (_req, res) => {
     res.json(await computeArap());
 });
 /* 客户对账单：期初 + 销售单 + 收款流水明细（口径与 /finance/arap 完全一致：按现名归集）
