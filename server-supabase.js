@@ -270,6 +270,16 @@ async function _runMigrations() {
             `CREATE UNIQUE INDEX IF NOT EXISTS uq_transactions_number_ref ON transactions (order_number, reference_id) WHERE order_number IS NOT NULL AND reference_id IS NOT NULL`,
             `CREATE INDEX IF NOT EXISTS idx_transactions_number ON transactions (order_number)`,
             `CREATE INDEX IF NOT EXISTS idx_transactions_party ON transactions (party_type, party_id)`,
+            /* ============ 资金流水「冲销删除 / 冲销重记」（2026-10-09 补）============
+             * 两列都是**审计指针**，只增不改：
+             *   reverse_of   —— 本行是「冲销」行，指向被冲销的原流水 id
+             *   revised_from —— 本行是「编辑重记」产生的新行，指向被改的原流水 id
+             * 用途：① 防重复冲销（反查 reverse_of 即可，不用模糊 LIKE）
+             *      ② 前端/报告可把「原行 + 冲销行 + 重记行」整链串起来展示
+             * 历史行全部为 NULL（老数据没有这个信息，不回填、不猜测）。 */
+            `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS reverse_of BIGINT`,
+            `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS revised_from BIGINT`,
+            `CREATE INDEX IF NOT EXISTS idx_transactions_reverse_of ON transactions (reverse_of)`,
         ];
         for (const sql of ddl) {
             try { await client.query(sql); } catch (e) { console.log('DDL skip:', e.message); }
@@ -1150,7 +1160,16 @@ function mergeByPid(rows) {
     return out;
 }
 
-app.post('/api/inventory/assemblies', authMiddleware, adminOnly, async (req, res) => {
+/* ★ 2026-10-09 权限放开（老板拍板第 3 项）：adminOnly → hasPerm('inventory_full')
+ *   为什么：菜单里「组装操作 / 拆分操作」两项的可见性一直由 **inventory_full** 控制，
+ *   而后端两条 POST 是 **adminOnly** —— 两层判据不同源。后果是：
+ *     配了 inventory_full 的子账号**看得见菜单、点得进页面、填得完表单**，
+ *     点「确认组装」却收到 403 「该功能仅管理员可用」。用户拿到的解释是"没权限"，
+ *     而菜单明明给了他这个入口 —— 这是**界面在骗人**，不是权限设计。
+ *   两条路由的写库逻辑本身就带「先全量校验 + 中途失败补偿回滚」，放开给 inventory_full
+ *   不降低安全性（仍是登录态 + 权限位），且与盘点（inventory_full）同档。
+ *   反向对照：DELETE/PUT 类危险动作仍全在 adminOnly，不受本次影响。 */
+app.post('/api/inventory/assemblies', authMiddleware, hasPerm('inventory_full'), async (req, res) => {
     await initDB();
     const operatorId = Number(req.body?.operator_id) || req.user.id;
     const items = Array.isArray(req.body?.items) ? req.body.items : [];
@@ -1235,7 +1254,8 @@ app.post('/api/inventory/assemblies', authMiddleware, adminOnly, async (req, res
         });
     }
 });
-app.post('/api/inventory/splits', authMiddleware, adminOnly, async (req, res) => {
+// ★ 2026-10-09 权限放开（第 3 项，与组装同一条理由）：adminOnly → hasPerm('inventory_full')
+app.post('/api/inventory/splits', authMiddleware, hasPerm('inventory_full'), async (req, res) => {
     await initDB();
     const operatorId = Number(req.body?.operator_id) || req.user.id;
     const items = Array.isArray(req.body?.items) ? req.body.items : [];
@@ -1342,6 +1362,165 @@ app.post('/api/inventory/splits', authMiddleware, adminOnly, async (req, res) =>
             error: e.message + (applied.length ? `（已回滚 ${applied.length - failed} 项库存改动${failed ? `，${failed} 项复原失败，请人工核对` : ''}）` : ''),
         });
     }
+});
+/* ══════════════ 组装单 / 拆分单 列表与详情（2026-10-09 补，老板拍板第 4 项） ══════════════
+ * 缺口：组装/拆分提交后**单号发了（ZZD… / CFD…）、库存也真的动了**，但界面上
+ *   没有任何入口能看到这两张表 ⇒ 开完即失忆：想复核"上周那把货是怎么拼的 /
+ *   拆成了什么、谁做的"，只能连数据库。智慧记把组装单/拆分单当**正式单据**列在
+ *   单据列表里，本轮对齐。
+ *
+ * 两条必须守的口径：
+ *   ① **只读**。两张表没有 status 列，落表即生效（库存已经动过）。列表/详情不提供
+ *      原地改与删 —— 改错的正确做法是**反向再开一张**（组装开错→用拆分还原，
+ *      拆分开错→用组装还原）。原地改数字会让库存与单据对不上，且不留审计痕迹。
+ *      这与「单据已落库后只允许反向冲销」的既有范式一致。
+ *   ② **角色按契约判定，并把"推断"标出来**：
+ *      · assembly_items.is_component：0=成品（产出）/ 其他=组件（消耗）—— 表里有这一列，是事实。
+ *      · split_items **没有 role 列** ⇒ 只能按 `ORDER BY id` 的顺序推断：
+ *        第 1 条=母件（消耗）、其余=子件（产出）。这与 POST 的
+ *        「items[0]=母件 / items[1..n]=子件」逐字同源，历史数据也按这个顺序落库。
+ *        但它是**推断不是事实** ⇒ 回执里显式带 `role_inferred: true`，不假装是库里的字段。
+ *
+ * 权限：列表/详情用 `inventory_view`（看），组装/拆分提交用 `inventory_full`（做）。
+ *   分开的理由：子账号应当能看到"我做过什么"，但能不能做由 inventory_full 决定。
+ */
+async function loadBillItemRows(table, fk, extras, ids) {
+    if (!ids.length) return new Map();
+    const ph = ids.map(() => '?').join(',');
+    const r = await safeExec(`SELECT ${fk}, product_id, quantity${extras} FROM ${table} WHERE ${fk} IN (${ph}) ORDER BY id`, ids);
+    const m = new Map();
+    for (const row of (r.values || [])) {
+        const k = Number(row[0]);
+        if (!m.has(k)) m.set(k, []);
+        m.get(k).push({ product_id: Number(row[1]), quantity: Number(row[2]), extra: Array.from(row).slice(3) });
+    }
+    return m;
+}
+async function loadRefMap(ids) {
+    const uniq = [...new Set(ids.map((n) => Number(n)).filter((n) => Number.isInteger(n) && n > 0))];
+    if (!uniq.length) return new Map();
+    const ph = uniq.map(() => '?').join(',');
+    const [pr, ur] = await Promise.all([
+        safeExec(`SELECT id, name, sku, unit FROM products WHERE id IN (${ph})`, uniq),
+        safeExec(`SELECT id, real_name FROM users WHERE id IN (${ph})`, uniq),
+    ]);
+    const m = new Map();
+    for (const row of (pr.values || [])) m.set(Number(row[0]), { name: row[1], sku: row[2], unit: row[3] });
+    for (const row of (ur.values || [])) m.set('u' + row[0], row[1]);
+    return m;
+}
+/** 把一条明细行变成带商品名的对象；role 由调用方给定 */
+function billLine(it, refMap, role) {
+    const p = refMap.get(it.product_id);
+    const line = {
+        product_id: it.product_id,
+        name: (p && p.name) || ('#' + it.product_id),
+        sku: (p && p.sku) || '', unit: (p && p.unit) || '',
+        quantity: it.quantity, role,
+    };
+    if (it.extra && it.extra.length >= 2) { line.batch_number = it.extra[0] ?? null; line.expiry_date = it.extra[1] ?? null; }
+    return line;
+}
+const sumQty = (arr) => Math.round(arr.reduce((s, x) => s + Number(x.quantity || 0), 0) * 100) / 100;
+
+/** 两个列表接口共用的取数（差别只有表名/单号列/角色规则） */
+async function queryBills(kind, req) {
+    const cfg = kind === 'assembly'
+        ? { head: 'assemblies', numCol: 'assembly_number', item: 'assembly_items', fk: 'assembly_id', extras: ', is_component' }
+        : { head: 'splits', numCol: 'split_number', item: 'split_items', fk: 'split_id', extras: ', batch_number, expiry_date' };
+    const { page = 1, pageSize = 100, keyword, startDate, endDate, withTotal } = req.query || {};
+    let where = ' WHERE 1=1';
+    if (keyword) { const kw = String(keyword).replace(/'/g, "''"); where += ` AND ${cfg.numCol} LIKE '%${kw}%'`; }
+    if (startDate) where += ` AND substr(created_at,1,10) >= '${String(startDate).replace(/'/g, "''")}'`;
+    if (endDate) where += ` AND substr(created_at,1,10) <= '${String(endDate).replace(/'/g, "''")}'`;
+    const pg = Math.max(1, Number(page) || 1);
+    const ps = Math.min(2000, Math.max(1, Number(pageSize) || 100));
+    const heads = ((await safeExec(`SELECT id, ${cfg.numCol}, operator_id, created_at FROM ${cfg.head}${where} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`, [ps, (pg - 1) * ps])).values || [])
+        .map((r) => ({ id: Number(r[0]), number: r[1], operator_id: r[2] == null ? null : Number(r[2]), created_at: r[3] }));
+    const ids = heads.map((h) => h.id);
+    const itemsMap = await loadBillItemRows(cfg.item, cfg.fk, cfg.extras, ids);
+    const refMap = await loadRefMap([].concat(...[...itemsMap.values()].map((arr) => arr.map((x) => x.product_id)), heads.map((h) => h.operator_id).filter(Boolean)));
+    const rows = heads.map((h) => {
+        const items = itemsMap.get(h.id) || [];
+        let outputs = [], components = [], source = null, children = [];
+        if (kind === 'assembly') {
+            // is_component：0=成品（产出）；其余（含历史 NULL）一律当组件（消耗）——与 POST 写值口径一致
+            outputs = items.filter((x) => Number(x.extra[0]) === 0).map((x) => billLine(x, refMap, 'output'));
+            components = items.filter((x) => Number(x.extra[0]) !== 0).map((x) => billLine(x, refMap, 'component'));
+        } else {
+            source = items.length ? billLine(items[0], refMap, 'source') : null;
+            children = items.slice(1).map((x) => billLine(x, refMap, 'child'));
+        }
+        return {
+            ...h, operator_name: refMap.get('u' + h.operator_id) || null,
+            outputs, components, source, children,
+            total_output_qty: sumQty(kind === 'assembly' ? outputs : children),
+            total_component_qty: sumQty(kind === 'assembly' ? components : (source ? [source] : [])),
+            // ★ 拆分单的角色是**推断**（表里没有 role 列）⇒ 显式声明，不冒充库中事实
+            role_inferred: kind === 'split',
+        };
+    });
+    let total = null;
+    if (withTotal) {
+        const A = await scalars([{ key: 'total', sql: `SELECT COUNT(*) FROM ${cfg.head}${where}` }]);
+        total = Number(A.total || 0);
+    }
+    return { rows, total, page: pg, pageSize: ps };
+}
+app.get('/api/inventory/assemblies', authMiddleware, hasPerm('inventory_view'), async (req, res) => {
+    await initDB();
+    const r = await queryBills('assembly', req);
+    if (req.query.withTotal) return res.json(r);
+    res.json(r.rows);
+});
+app.get('/api/inventory/splits', authMiddleware, hasPerm('inventory_view'), async (req, res) => {
+    await initDB();
+    const r = await queryBills('split', req);
+    if (req.query.withTotal) return res.json(r);
+    res.json(r.rows);
+});
+/** 单张单据详情（复用同一取数：先按 id 过滤再展开，保证列表与详情**同一个映射函数**） */
+async function getBillById(kind, id) {
+    const cfg = kind === 'assembly'
+        ? { head: 'assemblies', numCol: 'assembly_number', item: 'assembly_items', fk: 'assembly_id', extras: ', is_component' }
+        : { head: 'splits', numCol: 'split_number', item: 'split_items', fk: 'split_id', extras: ', batch_number, expiry_date' };
+    const head = (await safeExec(`SELECT id, ${cfg.numCol}, operator_id, created_at FROM ${cfg.head} WHERE id = ?`, [id])).values?.[0];
+    if (!head) return null;
+    const itemsMap = await loadBillItemRows(cfg.item, cfg.fk, cfg.extras, [id]);
+    const items = itemsMap.get(Number(id)) || [];
+    const refMap = await loadRefMap([...items.map((x) => x.product_id), head[2]].filter(Boolean));
+    let outputs = [], components = [], source = null, children = [];
+    if (kind === 'assembly') {
+        outputs = items.filter((x) => Number(x.extra[0]) === 0).map((x) => billLine(x, refMap, 'output'));
+        components = items.filter((x) => Number(x.extra[0]) !== 0).map((x) => billLine(x, refMap, 'component'));
+    } else {
+        source = items.length ? billLine(items[0], refMap, 'source') : null;
+        children = items.slice(1).map((x) => billLine(x, refMap, 'child'));
+    }
+    return {
+        id: Number(head[0]), number: head[1], operator_id: head[2] == null ? null : Number(head[2]),
+        created_at: head[3], operator_name: refMap.get('u' + head[2]) || null,
+        outputs, components, source, children,
+        total_output_qty: sumQty(kind === 'assembly' ? outputs : children),
+        total_component_qty: sumQty(kind === 'assembly' ? components : (source ? [source] : [])),
+        role_inferred: kind === 'split',
+    };
+}
+app.get('/api/inventory/assemblies/:id', authMiddleware, hasPerm('inventory_view'), async (req, res) => {
+    await initDB();
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: '组装单 id 不合法' });
+    const b = await getBillById('assembly', id);
+    if (!b) return res.status(404).json({ error: '组装单不存在' });
+    res.json(b);
+});
+app.get('/api/inventory/splits/:id', authMiddleware, hasPerm('inventory_view'), async (req, res) => {
+    await initDB();
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: '拆分单 id 不合法' });
+    const b = await getBillById('split', id);
+    if (!b) return res.status(404).json({ error: '拆分单不存在' });
+    res.json(b);
 });
 // ==================== FINANCE ====================
 app.get('/api/finance/accounts', authMiddleware, adminOnly, async (_req, res) => {
@@ -1465,7 +1644,7 @@ app.post('/api/finance/transactions/expense', authMiddleware, hasPerm('expense')
          * 存量影响：0（见上，该路径此前从未真正落写过）。 */
         const unpaid = (await safeExec(`SELECT id, COALESCE(total_amount,0) due, COALESCE(paid_amount,0) paid
             FROM purchase_orders
-            WHERE supplier_id = ? AND COALESCE(payment_status,'') NOT IN ('已结清','作废')
+            WHERE supplier_id = ? AND COALESCE(payment_status,'') NOT IN ('已结清','作废') AND ${PO_ALIVE}
             ORDER BY COALESCE(bill_date, substr(created_at,1,10)), id LIMIT 20`, [pid])).values || [];
         // 按金额逐单抵扣：付款金额先抵最早的欠单，不足部分保持未结清
         let remain = Number(amount) || 0;
@@ -1520,6 +1699,12 @@ app.get('/api/finance/transactions', authMiddleware, (req, res, next) => {
     const { type, account_id, page = 1, pageSize = 50, startDate, endDate, keyword, withTotal } = req.query;
     // 显式列名（不用 SELECT *），保证下标稳定；新增列只追加在末尾
     const COLS = "id, type, account_id, amount, category, description, reference_id, operator_id, operator_name, created_at, order_number, party_type, party_id, party_name";
+    /* ★ 2026-10-09：追加审计列 reverse_of / revised_from（前端据此显示「已冲销」并隐藏删除/编辑入口）。
+     *   带**能力探测 + 降级**：探测不到就退回原列集，绝不让整页查询因为缺列而返回空
+     *   （safeExec 会吞掉 SQL 报错 ⇒ 曾多次造成「页面没数据」这种看起来像业务问题的假故障）。 */
+    const AUDIT = (await txAuditColsAvailable())
+        ? ", reverse_of, revised_from, (SELECT COUNT(*) FROM transactions r WHERE r.reverse_of = t.id) AS rev_count"
+        : "";
     let where = " WHERE 1=1";
     if (type) {
         where += " AND type = '" + String(type).replace(/'/g, "''") + "'";
@@ -1537,7 +1722,7 @@ app.get('/api/finance/transactions', authMiddleware, (req, res, next) => {
     const pg = Math.max(1, Number(page) || 1);
     const ps = Math.min(2000, Math.max(1, Number(pageSize) || 50));
     const params = [ps, (pg - 1) * ps];
-    const sql = "SELECT " + COLS + " FROM transactions" + where + " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?";
+    const sql = "SELECT " + COLS + AUDIT + " FROM transactions t" + where + " ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?";
     /* ★ 改用显式列名（2026-10-05）：原为 SELECT * + 下标取值，
      *   加一列就会让下标整体错位（t[9] 不再是 created_at）——是个定时炸弹。
      *   显式列名 + 具名取值后，后续再加列不会再影响已有字段。 */
@@ -1547,6 +1732,10 @@ app.get('/api/finance/transactions', authMiddleware, (req, res, next) => {
         description: t[5], reference_id: t[6], operator_id: t[7], operator_name: t[8],
         created_at: t[9], order_number: t[10] || null,
         party_type: t[11] || null, party_id: t[12] || null, party_name: t[13] || null,
+        // 审计指针（列不可用时为 undefined ⇒ 前端按「未知」处理，不禁用入口）
+        reverse_of: t[14] == null ? null : Number(t[14]),
+        revised_from: t[15] == null ? null : Number(t[15]),
+        reversed: t[16] == null ? false : Number(t[16]) > 0,
     }));
     if (withTotal) {
         // COUNT 与 SUM 合并为 1 次往返（与本仓库 po/so 列表同款做法）
@@ -1560,6 +1749,185 @@ app.get('/api/finance/transactions', authMiddleware, (req, res, next) => {
         });
     }
     res.json(transactions);
+});
+/* ==================== 资金流水「冲销删除 / 冲销重记」（2026-10-09 补） ====================
+ * 缺口（老板 2026-10-09 拍板第 1 项）：流水此前只有 1 个 GET + 3 个 POST，
+ *   **没有删除、没有修改** ⇒ 录错一笔收款/付款，业务侧无法自救。
+ *
+ * 铁律（与已落地的「销售单作废回冲」完全同一范式，不另造一套）：
+ *   ① **不物理删除**。删除 = 写一条「同 type、同账户、金额取反」的冲销流水，
+ *      账户余额按原方向回滚。原流水原样保留 ⇒ 资金变动永远可审计、可复算。
+ *   ② **不原地改数**。编辑 = 先冲销原行、再按新值记一条新行（revised_from 指向原行）。
+ *      若直接 UPDATE amount，账户余额与流水的对应关系就永久断了
+ *      （谁也说不清差额那几百块去哪了），这是记账工具最不能犯的错。
+ *   ③ **不变量**：账户余额 ≡ 该账户流水的带符号净额
+ *      （income +1 / expense −1 / transfer −1 / transfer_in +1）。
+ *      冲销行沿用原 type 且金额取反 ⇒ 净额天然归零；余额回滚额 = 原金额 ⇒ 恒等式全程保持。
+ *   ④ **唯一指认 + 反向对照**：一律按 id 定位；防重复冲销靠 reverse_of 反查（不用模糊 LIKE）；
+ *      跨账户的转账**必须成对冲销**（只冲一侧 ⇒ 钱凭空多出或蒸发）。
+ *   ⑤ **拒绝而不是猜**：单据联动流水（销售单收款 / 进货单付款 / 已挂往来单位的流水）
+ *      一旦冲销，单据欠款与往来对账立刻对不上 ⇒ 明确 409 + 指路，绝不静默做半截事。
+ *
+ * 权限：与「作废销售单」同级 —— adminOnly。删钱比记账更高危，不开放给子账号
+ *      （若日后要下放，改这一处中间件即可，前后端同源改动）。
+ * ==================================================================================== */
+/** 流水符号表：账户余额变动 = NET_SIGN[type] × amount。新增 type 必须在此登记，否则拒绝冲销。 */
+const TX_NET_SIGN = { income: +1, expense: -1, transfer: -1, transfer_in: +1 };
+/** 审计列是否可用（进程内只探测一次）。探测失败时**降级**而不是让整页查询崩掉。 */
+let _txAuditCols = null;
+async function txAuditColsAvailable() {
+    if (_txAuditCols !== null) return _txAuditCols;
+    // 注意 safeExec 会吞掉异常返回空 values（假阴性风险）：这里靠 columns 判存在性，
+    // 列不存在时 PG 直接报错 ⇒ columns 为空 ⇒ 判定不可用。
+    const r = await safeExec("SELECT reverse_of, revised_from FROM transactions LIMIT 1");
+    _txAuditCols = r.columns.length >= 2;
+    if (!_txAuditCols) console.error('[tx-audit] transactions.reverse_of 探测失败 ⇒ 流水审计列不可用，删除/编辑入口将返回明确错误（不静默）');
+    return _txAuditCols;
+}
+const TX_AUDIT_COLS = 'id, type, account_id, amount, category, description, order_number, party_type, reverse_of, revised_from';
+/** 读一条流水（含审计列）。返回 null 表示不存在；抛 'NO_MIGRATION' 表示列缺失（不是"不存在"，必须区分）。 */
+async function loadTxForAudit(id) {
+    const t = (await safeExec(`SELECT ${TX_AUDIT_COLS} FROM transactions WHERE id = ?`, [id])).values?.[0];
+    if (t) return row2tx(t);
+    // 空结果有两种原因，必须区分：真不存在 vs 审计列缺失（safeExec 吞了报错）
+    const ctrl = (await safeExec("SELECT id FROM transactions WHERE id = ?", [id])).values?.[0];
+    if (ctrl) { const e = new Error('NO_MIGRATION'); throw e; }
+    return null;
+}
+function row2tx(r) {
+    return {
+        // ⚠️ account_id 是 BIGINT ⇒ PG 驱动回字符串。必须在这里就转数字：
+        //   否则「PUT 只改金额、不带 account_id」会走到 Number.isInteger('1') === false
+        //   ⇒ 误报「新账户不合法」（本装置 d54 用例 T9.13 就是抓这个的）。
+        id: Number(r[0]), type: r[1],
+        account_id: r[2] == null ? null : Number(r[2]),
+        amount: Number(r[3]) || 0,
+        category: r[4], description: r[5], order_number: r[6], party_type: r[7],
+        reverse_of: r[8] == null ? null : Number(r[8]),
+        revised_from: r[9] == null ? null : Number(r[9]),
+    };
+}
+/**
+ * 可冲销性判定（每条拒绝理由都必须唯一指认原因，不用模糊匹配兜）。
+ * 返回 { ok:true } 或 { ok:false, code, reason }
+ */
+async function txReversible(t) {
+    if (!(t.type in TX_NET_SIGN)) return { ok: false, code: 409, reason: `未知流水类型「${t.type}」，符号表未登记 ⇒ 无法安全回滚余额，已拒绝。` };
+    const amt = Number(t.amount);
+    if (!Number.isFinite(amt) || amt === 0) return { ok: false, code: 400, reason: '该笔金额为 0，没有资金变动可冲销。' };
+    if (!t.account_id) return { ok: false, code: 409, reason: '该笔没有账户指向（account_id 为空），无法回滚余额 ⇒ 已拒绝。' };
+    if (t.reverse_of) return { ok: false, code: 409, reason: `该笔本身是流水 #${t.reverse_of} 的冲销行，不能再冲销（会把已作废的账又翻回来）。` };
+    const already = (await safeExec("SELECT id FROM transactions WHERE reverse_of = ? ORDER BY id LIMIT 1", [t.id])).values?.[0]?.[0];
+    if (already) return { ok: false, code: 409, reason: `该笔已被流水 #${already} 冲销过，不能重复冲销。` };
+    if (t.party_type) return { ok: false, code: 409, reason: '该笔挂在往来单位上（已冲减客户/供应商欠款）。直接冲销会让往来欠款与流水对不上 ⇒ 请在对应客户/供应商的对账里处理。' };
+    const desc = String(t.description || '');
+    if (/^销售单\s*\S+\s*收款$/.test(desc)) return { ok: false, code: 409, reason: '该笔由销售单自动生成（销售单收款）⇒ 请到该销售单处理（修改单据或作废单据）。' };
+    if (/^采购单\s*\S+\s*付款$/.test(desc)) return { ok: false, code: 409, reason: '该笔由进货单自动生成（进货单付款）⇒ 请到该进货单处理。' };
+    if (t.order_number) {
+        const so = (await safeExec("SELECT id FROM sales_orders WHERE order_number = ? LIMIT 1", [t.order_number])).values?.[0]?.[0];
+        if (so) return { ok: false, code: 409, reason: `单号 ${t.order_number} 命中销售单 #${so}（该笔是这张单的收款/退货联动流水）⇒ 请到销售单处理。` };
+        const po = (await safeExec("SELECT id FROM purchase_orders WHERE order_number = ? LIMIT 1", [t.order_number])).values?.[0]?.[0];
+        if (po) return { ok: false, code: 409, reason: `单号 ${t.order_number} 命中进货单 #${po} ⇒ 请到进货单处理。` };
+    }
+    return { ok: true };
+}
+/** 取本次操作要冲销的全部行：普通流水 1 行；转账必须成对（同单号的两条） */
+async function txReversalTargets(t) {
+    if (t.type !== 'transfer' && t.type !== 'transfer_in') return [t];
+    if (!t.order_number) return { error: '这张转账流水没有单号，无法成对冲销（单冲一侧会让钱凭空多出/蒸发）⇒ 已拒绝。' };
+    const rows = (await safeExec("SELECT " + TX_AUDIT_COLS + " FROM transactions WHERE order_number = ? AND type IN ('transfer','transfer_in') ORDER BY id", [t.order_number])).values || [];
+    const list = rows.map(row2tx);
+    if (list.length !== 2) return { error: `单号 ${t.order_number} 的转账流水共 ${list.length} 条（应为 2 条：转出 + 转入）⇒ 数据本身不完整，不成对冲销，已拒绝。` };
+    return list;
+}
+/** 写一条冲销流水 + 按原方向回滚账户余额。返回 { reversalId, delta } */
+async function writeReversal(t, user, note) {
+    const sign = TX_NET_SIGN[t.type];
+    const delta = Math.round(sign * (-t.amount) * 100) / 100; // 账户余额的增量
+    const rev = await safeExec(
+        "INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, order_number, reverse_of) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        [t.type, t.account_id, -t.amount,
+            ((t.category || '') + '冲销').slice(0, 40),
+            `冲销 #${t.id}${note ? ' ' + note : ''}${t.description ? ' ' + t.description : ''}`.trim().slice(0, 200),
+            user.id, user.real_name, t.order_number || null, t.id]
+    );
+    const revId = rev.values?.[0]?.[0] ?? null;
+    await run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [delta, t.account_id]);
+    // PG 的 BIGINT 经驱动回来是**字符串** ⇒ 回执里统一成数字，避免前端 `id === 10031` 恒为 false
+    return { reversalId: revId == null ? null : Number(revId), delta };
+}
+app.delete('/api/finance/transactions/:id', authMiddleware, adminOnly, async (req, res) => {
+    await initDB();
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: '流水 id 不合法' });
+    if (!(await txAuditColsAvailable())) return res.status(500).json({ error: '数据库迁移未生效（transactions.reverse_of 缺失），为安全起见暂不允许冲销。' });
+    let t;
+    try { t = await loadTxForAudit(id); }
+    catch (e) { if (e.message === 'NO_MIGRATION') return res.status(500).json({ error: '数据库迁移未生效（transactions.reverse_of 缺失），为安全起见暂不允许冲销。' }); throw e; }
+    if (!t) return res.status(404).json({ error: '流水不存在' });
+    const chk = await txReversible(t);
+    if (!chk.ok) return res.status(chk.code).json({ error: chk.reason, rejected: true });
+    const targets = await txReversalTargets(t);
+    if (targets.error) return res.status(409).json({ error: targets.error, rejected: true });
+    for (const x of targets) {
+        const c = await txReversible(x);
+        if (!c.ok) return res.status(c.code).json({ error: `转账成对冲销被拒：${c.reason}`, rejected: true });
+    }
+    let rolledBack = 0;
+    const reversals = [];
+    for (const x of targets) {
+        const r = await writeReversal(x, req.user, '(删除)');
+        rolledBack = Math.round((rolledBack + Math.abs(x.amount)) * 100) / 100;
+        reversals.push({ of: x.id, reversal_id: r.reversalId, account_id: Number(x.account_id), amount: -x.amount, balance_delta: r.delta });
+    }
+    saveDB();
+    res.json({ ok: true, deleted: t.id, rolled_back: rolledBack, reversals });
+});
+app.put('/api/finance/transactions/:id', authMiddleware, adminOnly, async (req, res) => {
+    await initDB();
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: '流水 id 不合法' });
+    if (!(await txAuditColsAvailable())) return res.status(500).json({ error: '数据库迁移未生效（transactions.reverse_of 缺失），为安全起见暂不允许冲销重记。' });
+    let t;
+    try { t = await loadTxForAudit(id); }
+    catch (e) { if (e.message === 'NO_MIGRATION') return res.status(500).json({ error: '数据库迁移未生效（transactions.reverse_of 缺失），为安全起见暂不允许冲销重记。' }); throw e; }
+    if (!t) return res.status(404).json({ error: '流水不存在' });
+    /* 参数校验放在「可冲销性」之前：400 说的是**这次请求**的问题，与这行当前状态无关，
+     * 先报更准确（否则一条已被冲销的行会把参数错误盖成 409，调用方看不懂）。 */
+    // 允许改：账户 / 金额 / 类别 / 描述。类型不可改（改类型等于换了笔业务，请删了重记）。
+    const body = req.body || {};
+    const newAcc = body.account_id != null && body.account_id !== '' ? Number(body.account_id) : t.account_id;
+    const newAmt = body.amount != null && body.amount !== '' ? Number(body.amount) : t.amount;
+    const newCat = body.category != null ? String(body.category) : t.category;
+    const newDesc = body.description != null ? String(body.description) : t.description;
+    if (!Number.isFinite(newAmt) || newAmt === 0) return res.status(400).json({ error: '新金额必须是 0 以外的数字' });
+    if (!Number.isInteger(newAcc) || newAcc <= 0) return res.status(400).json({ error: '新账户不合法' });
+    const accOk = (await safeExec("SELECT id FROM accounts WHERE id = ? AND COALESCE(status,1) = 1", [newAcc])).values?.[0]?.[0];
+    if (!accOk) return res.status(400).json({ error: `账户 #${newAcc} 不存在或已停用` });
+    if (String(newCat || '').includes('冲销')) return res.status(400).json({ error: '类别不允许带「冲销」字样（那是系统自留的审计标识）' });
+    // 转账涉及两个账户成对变动，原地编辑只会改到一侧 ⇒ 明确拒绝并指路
+    if (t.type === 'transfer' || t.type === 'transfer_in') return res.status(409).json({ error: '转账不支持原地编辑（一次转账是「转出 + 转入」两条流水，改一侧会让两账户对不上）⇒ 请删除后重新转账。', rejected: true });
+    const chk = await txReversible(t);
+    if (!chk.ok) return res.status(chk.code).json({ error: chk.reason, rejected: true });
+    const sign = TX_NET_SIGN[t.type];
+    // ① 冲销原行
+    const rv = await writeReversal(t, req.user, '(编辑重记)');
+    // ② 按新值记一条新行，原单号沿用（对账时同一单号可见完整改前/改后链）
+    const ins = await safeExec(
+        "INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, order_number, party_type, party_id, party_name, revised_from) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        [t.type, newAcc, newAmt, newCat, newDesc, req.user.id, req.user.real_name,
+            t.order_number || null, t.party_type || null, null, null, t.id]
+    );
+    const newId = ins.values?.[0]?.[0] ?? null;
+    // ② 的余额变动（新值落账到（可能是新的）账户）
+    await run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [Math.round(sign * newAmt * 100) / 100, newAcc]);
+    saveDB();
+    res.json({
+        ok: true, revised: t.id, new_id: newId == null ? null : Number(newId),
+        reversal: { reversal_id: rv.reversalId, account_id: Number(t.account_id), amount: -t.amount, balance_delta: rv.delta },
+        applied: { account_id: newAcc, amount: newAmt, balance_delta: Math.round(sign * newAmt * 100) / 100 },
+        net_effect: Math.round((sign * newAmt - sign * t.amount) * 100) / 100,
+    });
 });
 app.get('/api/finance/overview', authMiddleware, hasPerm('finance_view'), async (_req, res) => {
     await initDB();
@@ -1828,7 +2196,9 @@ app.get('/api/analysis/sales/top-products', authMiddleware, hasPerm('sales_stats
 });
 /* 进货统计 —— 对齐智慧记「采购统计逐月归组」口径
  * ★ 同 sales：不传 group_by → 旧形态裸数组 [{date,total,order_count}]；传 group_by → 信封。
- * ★ 口径：采购单表无「作废」状态字段，故不做状态过滤（与旧版一致，不擅自改口径）。
+ * ★ 口径（2026-10-09 修订）：原注释写「采购单表无作废状态字段，故不做状态过滤」**已过时** ——
+ *   进货单删除走软删除 status='cancelled'（见 PO_ALIVE），故此处必须过滤，
+ *   否则删掉的进货单还会被算进进货金额。今日 517 张全为 completed ⇒ 补过滤后数字逐分不变。
  */
 app.get('/api/analysis/purchase', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
     await initDB();
@@ -1838,7 +2208,7 @@ app.get('/api/analysis/purchase', authMiddleware, hasPerm('sales_stats'), async 
     const isPeriodic = gb === 'month' || gb === 'year' || gb === 'day';
     const P = gb === 'month' ? "substr(COALESCE(bill_date, created_at),1,7)"
         : gb === 'year' ? "substr(COALESCE(bill_date, created_at),1,4)" : BD;
-    const cond = ['1=1'];
+    const cond = ['1=1', PO_ALIVE];
     if (start_date)
         cond.push(`${BD} >= '${String(start_date).replace(/'/g, "''")}'`);
     if (end_date)
@@ -2595,6 +2965,12 @@ app.get('/api/store/customer-last-prices/:id', authMiddleware, hasPerm('sales'),
     res.json(out);
 });
 const PO_COLS = "id, order_number, supplier_id, supplier_name, total_amount, status, operator_id, operator_name, created_at, payment_status, bill_date, paid_amount, owe_amount, remark, maker_name";
+/* 「未删除」判据（2026-10-09）：进货单的删除采用软删除 —— status='cancelled'，记录与明细全保留。
+ * ⚠️ 必须 COALESCE：`status NOT IN ('cancelled','void')` 在 status 为 NULL 时求值为 NULL
+ *    ⇒ 该行被**静默排除**（不是报错）。原 supplier-reconciliation 就是这么写的，
+ *    只因线上 517 张恰好全为 'completed' 才没暴露；新建单若不显式写 status 就会踩到。
+ *    凡聚合采购金额/条数的地方一律用本判据，避免「删了还在算」与「NULL 就被吞」两种错。 */
+const PO_ALIVE = "COALESCE(status,'completed') NOT IN ('cancelled','void')";
 function mapPurchaseOrder(o) {
     const owe = Number(o[12] || 0);
     return {
@@ -2610,7 +2986,7 @@ function mapPurchaseOrder(o) {
 app.get('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), async (req, res) => {
     await initDB();
     const { page = 1, pageSize = 200, keyword, startDate, endDate, status, withTotal } = req.query;
-    let where = " WHERE 1=1";
+    let where = " WHERE 1=1 AND " + PO_ALIVE;
     if (keyword) {
         const kw = String(keyword).replace(/'/g, "''");
         where += " AND (order_number LIKE '%" + kw + "%' OR supplier_name LIKE '%" + kw + "%')";
@@ -2645,7 +3021,7 @@ app.get('/api/store/purchase-orders/:id', authMiddleware, hasPerm('purchase'), a
         // 导出进货单（避免与 :id 冲突）
         const { startDate = '2020-01-01', endDate = '2030-12-31' } = req.query;
         const BD = "COALESCE(bill_date, substr(created_at,1,10))";
-        const result = await safeExec(`SELECT order_number, supplier_name, total_amount, paid_amount, owe_amount, payment_status, operator_name, ${BD} FROM purchase_orders WHERE ${BD} >= ? AND ${BD} <= ? ORDER BY ${BD}, id`, [String(startDate), String(endDate)]);
+        const result = await safeExec(`SELECT order_number, supplier_name, total_amount, paid_amount, owe_amount, payment_status, operator_name, ${BD} FROM purchase_orders WHERE ${BD} >= ? AND ${BD} <= ? AND ${PO_ALIVE} ORDER BY ${BD}, id`, [String(startDate), String(endDate)]);
         const rows = [['单据编号', '供应商名称', '应付金额', '已付金额', '欠款', '付款状态', '操作员', '业务日期']];
         for (const r of result.values || []) {
             // 导出与页面用同一判据（owe ≤ 0 ⇒ 已结清），避免「页面说已结清、导出说未结清」
@@ -2700,16 +3076,30 @@ app.post('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), asyn
         if (sidRes.values?.[0]?.[0]) supplier_id = sidRes.values[0][0];
     }
     const orderNumber = await generateOrderNumber('JH');
-    const totalAmount = final_amount || req.body.total_amount || 0;
+    /* ★ 2026-10-09：整单金额改走**唯一解析入口**（与 PUT 共用 resolveOrderTotal）。
+     *   原实现 `const totalAmount = final_amount || req.body.total_amount || 0;` 有两个洞：
+     *   ① 没送任何金额时**静默存 0** —— 明细进了货、库存加了，单子却记 ¥0.00 应付，
+     *      供应商欠款凭空少一笔（这类单只会在对账时以"金额对不上"的形式暴露）；
+     *   ② `|| 0` 把非法值（如 'abc'）也变成 0，同上。
+     *   现在：final > total > 商品总额−优惠 > 商品总额；非法值 400。
+     *   开单页（PurchaseOrder.tsx）始终送 final_amount，行为不变（回归断言见 d55 T8.2）。 */
+    const goodsTotal = Math.round((items || []).reduce((s, it) => s + (Number(it.quantity) || 0) * (Number(it.unit_price) || 0), 0) * 100) / 100;
+    const tr = resolveOrderTotal(req.body, goodsTotal, 0);
+    if (!tr.ok) return res.status(400).json({ error: tr.error });
+    const totalAmount = tr.total;
     /* ---- 付款口径：与销售单对称 ----
      * paid_amount 显式传入则用传入值；否则 settled=true 视为全额付讫，否则 0（赊购）
      * owe_amount = 应付 - 已付 */
+    if (paid_amount !== undefined && paid_amount !== null && paid_amount !== '' && !Number.isFinite(Number(paid_amount)))
+        return res.status(400).json({ error: '已付金额不合法（必须是数字）' });
     const paidAmount = paid_amount !== undefined && paid_amount !== null && paid_amount !== ''
         ? (Number(paid_amount) || 0)
         : (req.body.settled ? Number(totalAmount) : 0);
     const oweAmount = Math.round((Number(totalAmount) - paidAmount) * 100) / 100;
     const paymentStatus = req.body.payment_status || (oweAmount > 0.005 ? '未结清' : '已结清');
-    await run("INSERT INTO purchase_orders (order_number, supplier_id, supplier_name, total_amount, operator_id, operator_name, payment_status, bill_date, paid_amount, owe_amount, remark) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [orderNumber, supplier_id, supplier_name, totalAmount, req.user.id, req.user.real_name, paymentStatus, bill_date || todayCST(), paidAmount, oweAmount, remark || '']);
+    // status 显式写 'completed'：软删除判据是 status='cancelled'，若新单 status 为 NULL
+    // 会被 `NOT IN` 判据静默排除（供应商对账里凭空少一张）⇒ 必须显式落值。
+    await run("INSERT INTO purchase_orders (order_number, supplier_id, supplier_name, total_amount, operator_id, operator_name, payment_status, bill_date, paid_amount, owe_amount, remark, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed')", [orderNumber, supplier_id, supplier_name, totalAmount, req.user.id, req.user.real_name, paymentStatus, bill_date || todayCST(), paidAmount, oweAmount, remark || '']);
     if (items) {
         const orderIdResult = await safeExec("SELECT last_insert_rowid()");
         const orderId = orderIdResult.values?.[0]?.[0];
@@ -2723,6 +3113,249 @@ app.post('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), asyn
     }
     saveDB();
     res.json({ ok: true, order_number: orderNumber });
+});
+/* ==================== 进货单「修改 / 删除」（2026-10-09 补） ====================
+ * 缺口（老板 2026-10-09 拍板第 2 项）：进货单此前只有 GET(列表/详情) + POST，
+ *   **没有修改、没有删除**。录错一张（供应商选错 / 数量多打一个 0 / 重复录）
+ *   只能干看着，而库存和应付已经跟着偏了。
+ *
+ * 与销售单的对称关系（不另立标准）：
+ *   销售单：PUT 用 hasPerm('sales')；DELETE（作废）用 adminOnly。
+ *   本处完全对齐：PUT 用 hasPerm('purchase')；DELETE 用 adminOnly。
+ *
+ * 铁律：
+ *   ① **删除 = 软删除**（status='cancelled'，单据与明细全保留，可查可追溯）。
+ *      删除后必须从所有采购口径里消失 —— 已同步改：进货单列表/合计、进货统计、
+ *      付款抵扣候选单、单据导出、供应商对账、客户供应商总览（统一用 PO_ALIVE）。
+ *   ② **删除必须回冲库存**：按明细逐条 `stock_quantity -= quantity`，
+ *      与建单时的 `stock += quantity` 严格互为逆运算。
+ *   ③ **删除必须回滚资金**：单号相同、类型为 expense 的「进货支出」流水（实测 109 张单有）
+ *      逐条写负数冲销行 + 账户余额回滚 —— 与销售单作废同一范式（复用 writeReversal）。
+ *      查不到流水但标记已付的情形**如实披露**，不假装回滚成功。
+ *   ④ **修改按明细差量调库存**：以 product_id 聚合 old/new 数量，逐商品 `stock += (old - new)`。
+ *      不做「先整体回冲再整体重建」——中途失败会留下半张单的库存差。
+ *   ⑤ **修改不允许把单改成倒欠**：newTotal < paid_amount ⇒ 409 指路，且**在任何写操作之前**校验。
+ *   ⑥ 已删除的单、被采购退货单引用的单：一律 409，不做"题不对意"的事。
+ */
+/* ★ 2026-10-09 新增：整单应付金额的**唯一解析入口**（POST 与 PUT 共用）。
+ *   为什么必须抽成一个函数：本轮就是因为 POST 与 PUT 各写了一遍、优先级还不一样
+ *   （POST final 优先 / PUT total 优先），导致「优惠」在改单时被静默吞掉 —— 两条路由
+ *   只要各写一份，早晚会再分叉。抽成一份，从结构上杜绝。
+ *
+ *   优先级：final_amount（折后应付）> total_amount（商品总额）> 商品总额 − discount > 商品总额
+ *   非法值：任何显式传入但非有限数的金额 ⇒ ok:false，调用方回 400。
+ *     **绝不 `Number(v) || 0`** —— `Number('abc')` = NaN，NaN 是 falsy，`|| 0` 把乱码
+ *     变成一个看起来完全正常的 ¥0.00，然后一路写进库（只在"该单有已付"时才被 409 偶然拦住）。
+ *   兜底：无明细时（改单只改单头）用调用方给的 fallback（= 原单金额）。
+ */
+function resolveOrderTotal(body, goodsTotal, fallback) {
+    const pick = (v) => {
+        if (v === undefined || v === null || v === '') return { has: false };
+        const n = Number(v);
+        return Number.isFinite(n) ? { has: true, n } : { has: false, bad: true };
+    };
+    const f = pick(body.final_amount), t = pick(body.total_amount), d = pick(body.discount);
+    if (f.bad || t.bad || d.bad) return { ok: false, error: '金额不合法（必须是数字）' };
+    const r2 = (n) => Math.round(n * 100) / 100;
+    if (f.has) return { ok: true, total: r2(f.n) };
+    if (t.has) return { ok: true, total: r2(t.n) };
+    if (goodsTotal == null) return { ok: true, total: r2(Number(fallback) || 0) };
+    if (d.has) return { ok: true, total: r2(goodsTotal - d.n) };
+    return { ok: true, total: r2(goodsTotal) };
+}
+
+function mapPOForWrite(o) {
+    return {
+        id: Number(o[0]), order_number: o[1],
+        supplier_id: o[2] == null ? null : Number(o[2]), supplier_name: o[3],
+        total_amount: Number(o[4] || 0), status: o[5] || 'completed',
+        operator_id: o[6], operator_name: o[7], created_at: o[8], payment_status: o[9],
+        bill_date: o[10] || null, paid_amount: Number(o[11] || 0), owe_amount: Number(o[12] || 0),
+        remark: o[13] || '', maker_name: o[14] || null,
+    };
+}
+async function loadPOForWrite(id) {
+    const o = (await safeExec("SELECT " + PO_COLS + " FROM purchase_orders WHERE id = ?", [id])).values?.[0];
+    return o ? mapPOForWrite(o) : null;
+}
+/** 进货单写操作的前置校验（每条拒绝理由都唯一指认原因） */
+async function poWriteGuard(po) {
+    if (po.status === 'cancelled' || po.status === 'void')
+        return { ok: false, code: 409, reason: '该进货单已删除（status=cancelled），不能再修改或重复删除。' };
+    const ret = (await safeExec("SELECT id, return_number FROM purchase_returns WHERE purchase_order_id = ? LIMIT 1", [po.id])).values?.[0];
+    if (ret) return { ok: false, code: 409, reason: `该进货单已被退货单 ${ret[1] || '#' + ret[0]} 引用，原单不能消失 ⇒ 请先处理退货单。` };
+    return { ok: true };
+}
+app.delete('/api/store/purchase-orders/:id', authMiddleware, adminOnly, async (req, res) => {
+    await initDB();
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: '进货单 id 不合法' });
+    const po = await loadPOForWrite(id);
+    if (!po) return res.status(404).json({ error: '进货单不存在' });
+    const g = await poWriteGuard(po);
+    if (!g.ok) return res.status(g.code).json({ error: g.reason, rejected: true });
+
+    // ① 库存回冲（逐条，与建单时的 stock += qty 互为逆运算；负数明细会被加回，口径一致）
+    const items = (await safeExec("SELECT product_id, quantity FROM purchase_order_items WHERE order_id = ?", [id])).values || [];
+    const stockRestored = [];
+    for (const it of items) {
+        const pid = it[0] == null ? null : Number(it[0]);
+        const qty = Number(it[1]) || 0;
+        if (pid) {
+            await run("UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?", [qty, pid]);
+            stockRestored.push({ product_id: pid, quantity: qty });
+        }
+    }
+
+    // ② 资金回滚：同单号的流水逐条冲销（负数留痕 + 余额回滚）
+    let rolledBack = 0;
+    const reversals = [];
+    const skipped = [];
+    if (po.order_number) {
+        const rows = (await safeExec("SELECT " + TX_AUDIT_COLS + " FROM transactions WHERE order_number = ? ORDER BY id", [po.order_number])).values || [];
+        for (const raw of rows) {
+            const t = row2tx(raw);
+            if (!(t.type in TX_NET_SIGN)) { skipped.push({ id: t.id, why: '未知流水类型 ' + t.type }); continue; }
+            if (!t.account_id) { skipped.push({ id: t.id, why: '流水无账户指向' }); continue; }
+            if (t.reverse_of) { skipped.push({ id: t.id, why: '本身是冲销行' }); continue; }
+            const already = (await safeExec("SELECT id FROM transactions WHERE reverse_of = ? LIMIT 1", [t.id])).values?.[0]?.[0];
+            if (already) { skipped.push({ id: t.id, why: '已被流水 #' + already + ' 冲销过' }); continue; }
+            try {
+                const r = await writeReversal(t, req.user, '(进货单删除)');
+                rolledBack = Math.round((rolledBack + Math.abs(t.amount)) * 100) / 100;
+                reversals.push({ of: t.id, reversal_id: r.reversalId, account_id: Number(t.account_id), amount: -t.amount, balance_delta: r.delta });
+            } catch (e) {
+                skipped.push({ id: t.id, why: '冲销写入失败：' + e.message });
+            }
+        }
+    }
+
+    await run("UPDATE purchase_orders SET status = 'cancelled' WHERE id = ?", [id]);
+    saveDB();
+    /* 如实披露（**不许说"从未落账"**）：
+     *   本仓的进货付款有**两代**记录方式，单号规则不同 ——
+     *   ① 老导入（智慧记，实测 109 张单）：付款流水 `order_number` = 进货单号（如 JH…/原单号），
+     *      本次删除能按单号找到并逐条冲销 ⇒ 已走 ② 之前的 reversals 分支。
+     *   ② 现行流程：只有 `POST /finance/transactions/expense`（分类「付款/付欠款」），
+     *      它自己用 `generateOrderNumber('expense')` 生成 **FKD…** 单号，
+     *      **不会**把进货单号写进 transactions ⇒ 按单号根本找不到。
+     *   ⇒ 情形 ② 下**本就不该回滚**：钱确实付出去了，删掉单据不等于供应商退钱给你；
+     *     供应商欠款会由其余未删单据重新合计（PO_ALIVE 已把它从对账口径剔除）。
+     *   所以这里只说「查不到、未回滚」，并指路人工核对，不编造"从未落账"这种可能导致
+     *   老板以为钱还在账上的结论。 */
+    res.json({
+        ok: true, cancelled: id, order_number: po.order_number,
+        stock_restored: stockRestored, reversals, rolled_back: rolledBack, skipped,
+        note: (po.paid_amount > 0.005 && reversals.length === 0)
+            ? `该单登记已付 ¥${po.paid_amount.toFixed(2)}，但**没有**以本单号记账的资金流水，故本次未做资金回滚。`
+                + `（现行「付款/付欠款」登记的流水单号是 FKD… 形式、与本单号无关，系统无法据单号认定它属于本单；`
+                + `钱已实际付出，删除单据不等同于退款 ⇒ 需人工核对供应商欠款是否要另行调整。）`
+            : undefined,
+    });
+});
+app.put('/api/store/purchase-orders/:id', authMiddleware, hasPerm('purchase'), async (req, res) => {
+    await initDB();
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ error: '进货单 id 不合法' });
+    const po = await loadPOForWrite(id);
+    if (!po) return res.status(404).json({ error: '进货单不存在' });
+    const g = await poWriteGuard(po);
+    if (!g.ok) return res.status(g.code).json({ error: g.reason, rejected: true });
+
+    const body = req.body || {};
+    let supplierId = body.supplier_id != null && body.supplier_id !== '' ? Number(body.supplier_id) : po.supplier_id;
+    const supplierName = body.supplier_name != null ? String(body.supplier_name) : po.supplier_name;
+    if (!supplierId && supplierName) {
+        const r = await safeExec("SELECT id FROM suppliers WHERE name = ? ORDER BY id LIMIT 1", [supplierName]);
+        if (r.values?.[0]?.[0]) supplierId = Number(r.values[0][0]);
+    }
+    const billDate = body.bill_date != null && body.bill_date !== '' ? String(body.bill_date) : (po.bill_date || todayCST());
+    const remark = body.remark != null ? String(body.remark) : po.remark;
+
+    /* ---------- 第一阶段：全部校验，一个字节都不写 ---------- */
+    let next = null;
+    let newTotal = po.total_amount;
+    if (body.items !== undefined) {
+        if (!Array.isArray(body.items) || body.items.length === 0)
+            return res.status(400).json({ error: '请至少保留一件商品（要清空整单请直接删除该进货单）' });
+        if (body.items.find((it) => !(Number(it.quantity ?? 0) > 0)))
+            return res.status(400).json({ error: '商品数量必须大于 0（与新建进货单同口径）' });
+        /* ★ 单价也要校验，不能 `Number(x) || 0`：`'abc'` 会被静默当成 ¥0.00
+         *   ⇒ 明细金额变 0、整单应付变 0，而请求"成功"了。这是最坏的一类错（静默改数）。 */
+        if (body.items.find((it) => it.unit_price !== undefined && it.unit_price !== null && it.unit_price !== '' && !Number.isFinite(Number(it.unit_price))))
+            return res.status(400).json({ error: '商品单价不合法（必须是数字）' });
+        next = body.items.map((it) => ({
+            product_id: it.product_id == null || it.product_id === '' ? null : Number(it.product_id),
+            product_name: it.product_name || '',
+            quantity: Number(it.quantity) || 0,
+            unit_price: Number(it.unit_price) || 0,
+        }));
+        newTotal = Math.round(next.reduce((s, x) => s + x.quantity * x.unit_price, 0) * 100) / 100;
+    }
+    /* 整单金额解析（**与 POST 同一段逻辑、同一优先级**，见 resolveOrderTotal）。
+     *   ★ 2026-10-09 修正一（优先级）：原本写成 `total_amount` 优先。而 POST 是 final 优先，
+     *     开单页又**同时**送 total_amount（商品总额）与 final_amount（折后应付）⇒
+     *     若 PUT 取 total_amount，「优惠金额」会在改单时被静默吞掉：页面显示应付 ¥900
+     *     （1000 − 优惠 100），保存后库里悄悄变回 ¥1000，页面还会用回执把这个错数回显出来。
+     *   ★ 2026-10-09 修正二（非法值）：原本是 `Number(v) || 0`。`Number('abc')` = NaN，
+     *     `NaN || 0` = 0 ⇒ 传个乱码金额就把整单应付**静默改成 ¥0.00**；
+     *     只在"该单有已付"时才会被后面的 409 偶然拦住，无已付的单则一路写下去。
+     *     ⇒ 改为「非数字即 400」，把静默改数变成明确拒绝。 */
+    const totalRes = resolveOrderTotal(body, next ? next.reduce((s, x) => s + x.quantity * x.unit_price, 0) : null, newTotal);
+    if (!totalRes.ok) return res.status(400).json({ error: totalRes.error });
+    newTotal = totalRes.total;
+    if (newTotal < po.paid_amount - 0.005)
+        return res.status(409).json({
+            error: `改后金额 ¥${newTotal.toFixed(2)} 小于该单已付 ¥${po.paid_amount.toFixed(2)}，会让这张单变成倒欠 ⇒ 请先到「付款记录」冲销那笔付款，或把金额改回 ≥ 已付。`,
+            rejected: true,
+        });
+
+    /* ---------- 第二阶段：落库 ---------- */
+    const stockAdjust = [];
+    if (next) {
+        const oldRows = (await safeExec("SELECT product_id, quantity FROM purchase_order_items WHERE order_id = ?", [id])).values || [];
+        const agg = (rows) => {
+            const m = new Map();
+            for (const r of rows) {
+                const p = r[0] == null ? null : Number(r[0]);
+                if (!p) continue;
+                m.set(p, (m.get(p) || 0) + (Number(r[1]) || 0));
+            }
+            return m;
+        };
+        const oldM = agg(oldRows);
+        const newM = agg(next.map((x) => [x.product_id, x.quantity]));
+        /* ★★ 2026-10-09 修正（装置 d55 抓到的真缺陷）：差量方向必须取 **新 − 旧**。
+         *   建单时库存是 `stock += quantity`（一张单给库存 +N）。
+         *   改单要把这张单的贡献从「旧数量」换成「新数量」⇒ 库存增量 = (+新) − (+旧) = 新 − 旧。
+         *   原实现在这里算的是 `旧 − 新`，方向正好相反 —— **改少反而加库存、改多反而减库存**，
+         *   且不改零头、不报错、看不出异常，还会随每次改单持续累积。
+         *   实证（d55 T9）：把一行从 3 件改成 1 件，商品#2 库存 14 → 16（应为 → 12），
+         *   总库存 +2（应为 −2），而回执里还写着 `stock_delta: 2` 自我印证 —— 错得非常"自洽"。
+         *   注意：删除路径用的是 `stock -= quantity`（按当前明细回冲），方向本来就对，不动。 */
+        for (const pid of new Set([...oldM.keys(), ...newM.keys()])) {
+            const delta = (newM.get(pid) || 0) - (oldM.get(pid) || 0);
+            if (Math.abs(delta) < 1e-9) continue;
+            await run("UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?", [delta, pid]);
+            stockAdjust.push({ product_id: pid, old_qty: oldM.get(pid) || 0, new_qty: newM.get(pid) || 0, stock_delta: delta });
+        }
+        await run("DELETE FROM purchase_order_items WHERE order_id = ?", [id]);
+        for (const x of next) {
+            await run("INSERT INTO purchase_order_items (order_id, product_id, product_name, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?)",
+                [id, x.product_id, x.product_name, x.quantity, x.unit_price, Math.round(x.quantity * x.unit_price * 100) / 100]);
+        }
+    }
+    const owe = Math.round((newTotal - po.paid_amount) * 100) / 100;
+    const payStatus = owe > 0.005 ? '未结清' : '已结清';
+    await run("UPDATE purchase_orders SET supplier_id = ?, supplier_name = ?, total_amount = ?, owe_amount = ?, payment_status = ?, bill_date = ?, remark = ? WHERE id = ?",
+        [supplierId, supplierName, newTotal, owe, payStatus, billDate, remark, id]);
+    saveDB();
+    res.json({
+        ok: true, revised: id, order_number: po.order_number,
+        items_replaced: !!next, stock_adjust: stockAdjust,
+        before: { supplier_name: po.supplier_name, total_amount: po.total_amount, owe_amount: po.owe_amount, bill_date: po.bill_date, remark: po.remark },
+        after: { supplier_name: supplierName, total_amount: newTotal, owe_amount: owe, payment_status: payStatus, bill_date: billDate, remark },
+    });
 });
 // 开单可选业务员：返回在职业务员 + 管理员（管理员开单选业务员，子账户开单选自己或管理员）
 app.get('/api/store/sales-staff', authMiddleware, hasPerm('sales'), async (_req, res) => {
@@ -3397,7 +4030,7 @@ app.post('/api/store/customers/import', authMiddleware, hasPerm('customers'), up
 app.get('/api/finance/supplier-reconciliation', authMiddleware, hasPerm('reconciliation'), async (_req, res) => {
     await initDB();
     // status 可能是 '1' / 'completed' / 空，统一视为有效单据
-    const result = await safeExec("SELECT supplier_id, supplier_name, COUNT(*), COALESCE(SUM(total_amount),0) FROM purchase_orders WHERE status NOT IN ('cancelled','void') GROUP BY supplier_id, supplier_name ORDER BY SUM(total_amount) DESC");
+    const result = await safeExec("SELECT supplier_id, supplier_name, COUNT(*), COALESCE(SUM(total_amount),0) FROM purchase_orders WHERE " + PO_ALIVE + " GROUP BY supplier_id, supplier_name ORDER BY SUM(total_amount) DESC");
     const list = (result.values || []).map((r) => ({
         supplier_id: r[0], supplier_name: r[1] || '未填供应商', order_count: Number(r[2]), total_amount: Number(r[3])
     }));
@@ -3483,7 +4116,7 @@ async function computeArap() {
                    GROUP BY 1) u ON u.nm = cg.nm
         LEFT JOIN (SELECT ${canonSQL('supplier_name')} nm, COUNT(*) cnt, SUM(total_amount) amt
                    FROM purchase_orders
-                   WHERE COALESCE(payment_status,'') <> '作废'
+                   WHERE COALESCE(payment_status,'') <> '作废' AND ${PO_ALIVE}
                      AND supplier_name IS NOT NULL AND ${FOLD_SQL('supplier_name')} <> ''
                    GROUP BY 1) pu ON pu.nm = cg.nm
         LEFT JOIN (SELECT ${canonSQL('party_name')} nm,
@@ -3631,7 +4264,7 @@ app.get('/api/finance/supplier-statement/:id', authMiddleware, hasPerm('finance_
         oi.product_name, oi.quantity, oi.unit_price, oi.amount
         FROM purchase_orders po
         LEFT JOIN purchase_order_items oi ON oi.order_id = po.id
-        WHERE ${canonSQL('po.supplier_name')} = ? AND COALESCE(po.payment_status,'') <> '作废'
+        WHERE ${canonSQL('po.supplier_name')} = ? AND COALESCE(po.payment_status,'') <> '作废' AND COALESCE(po.status,'completed') NOT IN ('cancelled','void')
         ORDER BY po.id, oi.id`, [snm])).values || [];
     const orderMap = new Map();
     for (const r of stmtRows) {
