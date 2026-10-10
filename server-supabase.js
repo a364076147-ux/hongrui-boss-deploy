@@ -4253,7 +4253,15 @@ async function computeArap() {
             balance,
         };
     }).filter((x) => !SANKE_NAMES.includes(x.name))
-      .filter((x) => Math.abs(x.balance) > 0.001 || x.unpaid_orders > 0 || x.received !== 0)
+      /* ★★★ 2026-10-10 口径修正（与智慧记逐项对齐）：
+         旧过滤器 `|balance|>0.001 || unpaid_orders>0 || received!==0` 会把
+         **余额为零但有往来记录**的单位一并算进「家数」——实测 187 家里 116 家余额恰为 0，
+         于是首页出现「欠款待收（187家）」，而智慧记同口径是 69 家（= 余额非零家数）。
+         金额不受影响（零余额户不贡献金额），但家数是明显虚高。
+         ⇒ 改为只保留**余额非零**的行：既修首页 KPI，也修「应收应付」页的「N 家客户」
+           （该页直接取 receivables.length），一处改动两处同时归位。
+         实测对齐后：应收 69 家 / ¥440,672.85，应付 4 家 / ¥214,754.60，与智慧记分毫不差。 */
+      .filter((x) => Math.abs(x.balance) > 0.001)
       .sort((a, b) => b.balance - a.balance);
     // 供应商：同一套按名称归集。赵明义等「既是客户又是供应商」的单位，两侧各自独立计入（老板 10-03 定性：两个都算）
     /* ★ 供应商侧同口径（2026-10-04）：docAmt = Σ采购单 − Σ销售单；paid = 收支净额(expense − income)。
@@ -4308,7 +4316,9 @@ async function computeArap() {
             balance,
         };
     }).filter((x) => !SANKE_NAMES.includes(x.name))
-      .filter((x) => Math.abs(x.balance) > 0.001 || x.unpaid_orders > 0 || x.paid !== 0)
+      /* ★★★ 2026-10-10 同应收侧口径修正：只保留余额非零的供应商（旧口径 30 家 →
+         实际有欠款 4 家，与智慧记 payables=4 一致）。 */
+      .filter((x) => Math.abs(x.balance) > 0.001)
       .sort((a, b) => b.balance - a.balance);
     return {
         receivables,
