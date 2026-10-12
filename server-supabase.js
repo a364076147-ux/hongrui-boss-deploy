@@ -9,6 +9,7 @@ import path from 'path';
 import fs from 'fs';
 import multer from 'multer';
 import XLSX from 'xlsx';
+import crypto from 'crypto';   // ★ R15 幂等：请求体指纹（req_hash）
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 const PORT = Number(process.env.PORT || 3001);
 // ===== 安全加固：凭据必须来自环境变量（Render 控制台 Secret 注入），禁止明文 fallback =====
@@ -50,6 +51,9 @@ function getPool() {
     }
     return pool;
 }
+/* ==== SQL-PREP BEGIN（唯一真源 · 装置按标记抽取求值，2026-10-11 P5）==== */
+/* 本标记块**只为可测性而存在**：块内代码零改动（纯注释包裹），
+ * 让 `_diag/sprint/p5-tx-test.cjs` 能断言"真实发布的这段 SQL 预处理"而不是副本。 */
 function translateSQL(sql) {
     return sql
         .replace(/datetime\('now','localtime'\)/g, "to_char(now() AT TIME ZONE 'Asia/Shanghai', 'YYYY-MM-DD HH24:MI:SS')")
@@ -72,6 +76,40 @@ function convertPlaceholders(sql) {
     let count = 0;
     return { sql: sql.replace(/\?/g, () => `$${++count}`), count };
 }
+/* ==== SQL-PREP END ==== */
+/* ==== WRITE-LEDGER BEGIN（唯一真源 · 2026-10-11 48h 冲刺 P5-2「写失败必须可见」）==== */
+/* 【治什么病】修复前 `run()` / `runLastId()` / `safeExec()` 三个执行器的 catch 只
+ *   `console.error` 后照常返回（run 返 undefined、safeExec 返空结果集）⇒ 写库失败被**静默吞掉**，
+ *   而路由紧接着 `res.json({ ok: true })` ⇒ 前端拿到"成功"、库里什么都没写。这就是 P3-02 / P1-04。
+ * 【实测到的两个真实后果（隔离库，2026-10-11）】
+ *   ① `POST /finance/transactions/income {amount:null}` ⇒ 200 `{ok:true, order_number:"SKD…001"}`
+ *      而 `transactions` 一行没写（amount 是 NOT NULL）；
+ *   ② 同一请求里 `UPDATE accounts SET balance = balance + NULL` ⇒ **该账户余额被写成 NULL**
+ *      （accounts.balance 列可空，`x + NULL = NULL` 不报错）⇒ 一条非法请求静默抹掉账户余额。
+ * 【为什么不把 run() 直接改成 throw】`run()` 有 96 个调用点，而本服务**没有 async 错误边界**
+ *   （Express 4 不接管 async handler 的 rejection）⇒ 一抛就变成「请求挂死、客户端一直转圈」，
+ *   比"假成功"更难排查。故采用**请求级记账 + 响应出口守卫**：既不挂死，也绝不撒谎。
+ * 【为什么用 AsyncLocalStorage】零调用点改动即可做到**按请求隔离**：用模块级变量会让并发请求串味。
+ * 【能力边界·必须说清】只能捕获经 run / runLastId / **写型** safeExec 的失败；
+ *   直接 `pool.query()` 且自行 catch 的写路径不受保护（本文件当前无此类路径，已 grep 核过）。
+ * ★ 本块被 `_diag/sprint/p5extract.cjs` 的 `loadLedger()` 按标记抽取后求值 ⇒ 断言**真实发布的**这段代码。
+ * ======================================================================================== */
+import { AsyncLocalStorage } from 'async_hooks';
+const WRITE_LEDGER = new AsyncLocalStorage();
+/** 写语句判据：**只**给写语句记账 —— safeExec 同时服务读（含能力探测），
+ *  若读失败也记账，那些「刻意探测某列是否存在」的调用会把正常请求误判成写失败。 */
+function isWriteSQL(sql) {
+    return /^\s*(insert|update|delete|alter|create|drop|truncate|grant|revoke)\b/i.test(String(sql || ''));
+}
+function noteWriteFailure(sql, e) {
+    const box = WRITE_LEDGER.getStore();
+    if (!box) return;                       // 非请求上下文（启动期建表、脚本）不记
+    box.push({
+        sql: String(sql || '').replace(/\s+/g, ' ').slice(0, 220),
+        error: String((e && e.message) || e).slice(0, 300),
+    });
+}
+/* ==== WRITE-LEDGER END ==== */
 async function safeExec(sql, params = []) {
     try {
         const translated = translateSQL(sql);
@@ -96,6 +134,9 @@ async function safeExec(sql, params = []) {
     }
     catch (e) {
         console.error('SQL Error:', e.message, 'SQL:', sql);
+        /* ★ P5-2：读失败可以降级成空结果（历史行为保留），**写失败必须记账**
+         *   —— 记进本次请求的台账，由响应出口守卫拒绝返回 ok:true。 */
+        if (isWriteSQL(sql)) noteWriteFailure(sql, e);
         return { columns: [], values: [] };
     }
 }
@@ -113,6 +154,7 @@ async function run(sql, params = []) {
     }
     catch (e) {
         console.error('Run Error:', e.message, 'SQL:', sql);
+        noteWriteFailure(sql, e);   // ★ P5-2：写失败必须可见（响应出口守卫据此拦截"假成功"）
     }
 }
 /* ★★ 2026-10-09 新增：`runLastId(sql, params)` —— 执行 INSERT 并返回新行 id。
@@ -150,9 +192,73 @@ async function runLastId(sql, params = []) {
     }
     catch (e) {
         console.error('RunLastId Error:', e.message, 'SQL:', sql);
+        noteWriteFailure(sql, e);   // ★ P5-2：INSERT 取 id 失败不再静默返 null
         return null;
     }
 }
+/* ==== WITH-TX BEGIN（唯一真源 · 装置按标记抽取求值，2026-10-11 P5）==== */
+/* ==================== B0 公共前置：事务助手 withTx（2026-10-11 · 48h 冲刺 P5）====================
+ * 【为什么必须有 —— 这是两个真缺陷的同一个根，不是洁癖】
+ *   · P1-06 的病灶：POST /store/sales-returns 先 INSERT 主单、再 INSERT 明细，两次调用各自
+ *     getPool().connect() → release()（池 max:20）⇒ **两条语句落在不同连接、各自自动提交**。
+ *     明细 INSERT 因缺 product_id 违反 NOT NULL 抛错，被 run() 的 catch 吞成一行日志，
+ *     路由仍 res.json({ok:true}) ⇒ 造出「零明细销售退货单」，且用户看到"成功"。（假成功）
+ *   · P1-01/P1-02 的病灶："读-算-写"跨语句无锁 ⇒ 并发收付款互相覆盖（丢失更新）。
+ *   ⇒ 两者是同一类病：**单请求内非原子**。用同一把工具根治，而不是各修各的。
+ *
+ * 【纪律】
+ *   · q / run / lastId 与 safeExec / run / runLastId **同签名、同返回形状**（rowMode:'array'）
+ *     ⇒ 路由代码可原地替换，**不需要改取值方式**（否则会造出"取到 undefined"的新缺陷）。
+ *   · **与 safeExec 的关键差别：不吞异常**。q 抛错 ⇒ 调用方 await 直接 reject ⇒ withTx
+ *     ROLLBACK 后**继续上抛** ⇒ 由路由转成明确错误码。绝不静默，绝不假成功。
+ *   · 凡「改金额 / 改库存 / 建单据+明细 / 读-算-写」的写路径，一律走本函数；
+ *     只读查询与真正单语句的写不需要（省一次 BEGIN/COMMIT 往返）。
+ *
+ * 【rowMode:'array' 不可省】原因见 safeExec 上方注释（不别名聚合列重名会塌缩）。
+ *   若这里改用默认行对象，取值形状会与既有 r[0] 位置索引不一致。
+ * ============================================================================================== */
+async function withTx(fn) {
+    const client = await getPool().connect();
+    const prep = (sql, params) => {
+        const { sql: finalSql } = convertPlaceholders(translateSQL(sql));
+        return { finalSql, params: Array.isArray(params) ? params : (params === undefined ? [] : [params]) };
+    };
+    const tx = {
+        async q(sql, params = []) {
+            const { finalSql, params: p } = prep(sql, params);
+            const r = await client.query({ text: finalSql, values: p, rowMode: 'array' });
+            return { columns: r.fields.map((f) => f.name), values: r.rows, rowCount: r.rowCount };
+        },
+        async run(sql, params = []) {
+            const { finalSql, params: p } = prep(sql, params);
+            const r = await client.query({ text: finalSql, values: p });
+            return { rowCount: r.rowCount };
+        },
+        async lastId(sql, params = []) {
+            const { finalSql, params: p } = prep(sql, params);
+            const r = await client.query({ text: finalSql + ' RETURNING id', values: p });
+            const row = r.rows && r.rows[0];
+            if (!row) return null;
+            return row.id === undefined ? (Object.values(row)[0] ?? null) : row.id;
+        },
+    };
+    try {
+        await client.query('BEGIN');
+        const out = await fn(tx);
+        await client.query('COMMIT');
+        return out;
+    }
+    catch (e) {
+        try { await client.query('ROLLBACK'); }
+        catch (e2) { console.error('ROLLBACK 失败:', e2.message); }
+        console.error('withTx 已回滚:', e.message, '| SQL:', e.sql || '(未提供)');
+        throw e;                    // ★ 必须上抛：静默吞掉就会重演 P1-06 的"假成功"
+    }
+    finally {
+        client.release();
+    }
+}
+/* ==== WITH-TX END ==== */
 /* ==================== 性能：把 N 次顺序往返压成 1 次 ====================
  * 实测（2026-10-04，_governance/_probe-db-profile.cjs + _probe-platform-floor.cjs）：
  *   · Postgres 侧执行时间 0.1~4.6ms（sales_orders 4517 行全表扫也只 2.3ms）
@@ -318,10 +424,107 @@ async function _runMigrations() {
             `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS reverse_of BIGINT`,
             `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS revised_from BIGINT`,
             `CREATE INDEX IF NOT EXISTS idx_transactions_reverse_of ON transactions (reverse_of)`,
+            /* ============ P2（2026-10-11）：明细行级「开单当时进价」与源ID ============
+             *   背景：成本口径从「商品档案当前价」改为「行级历史价」（详见 COST_UNIT_SQL 注释）。
+             *   这四列全部**只为补历史价服务**，对既有查询零影响（都是可空附加列）：
+             *     cost_price     —— 开单当时的进价（源智慧记明细 pur_prc），NULL = 无历史价 ⇒ 回退档案价
+             *     spec / unit    —— 源明细的规格与单位，供单据详情/打印逐字对齐
+             *     src_item_id    —— 智慧记明细雪花ID，**幂等键**（重复回填靠它去重）
+             *     src_product_id —— 智慧记商品雪花ID，供跨系统逐商品对账（不靠名字猜）
+             *   ⚠ 历史行天然为 NULL：没有源明细的单（本地自建/源侧已删）不回填、不猜测。 */
+            `ALTER TABLE sales_order_items ADD COLUMN IF NOT EXISTS cost_price DOUBLE PRECISION`,
+            `ALTER TABLE sales_order_items ADD COLUMN IF NOT EXISTS spec TEXT`,
+            `ALTER TABLE sales_order_items ADD COLUMN IF NOT EXISTS unit TEXT`,
+            `ALTER TABLE sales_order_items ADD COLUMN IF NOT EXISTS src_item_id BIGINT`,
+            `ALTER TABLE sales_order_items ADD COLUMN IF NOT EXISTS src_product_id BIGINT`,
+            `ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS cost_price DOUBLE PRECISION`,
+            `ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS spec TEXT`,
+            `ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS unit TEXT`,
+            `ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS src_item_id BIGINT`,
+            `ALTER TABLE purchase_order_items ADD COLUMN IF NOT EXISTS src_product_id BIGINT`,
+            /* 幂等键：同一源明细只能回填一次（重复跑回填脚本不会写第二遍）。
+             * 用部分唯一索引（WHERE NOT NULL）以兼容历史 NULL 行。 */
+            `CREATE UNIQUE INDEX IF NOT EXISTS uq_soi_src_item ON sales_order_items (src_item_id) WHERE src_item_id IS NOT NULL`,
+            `CREATE UNIQUE INDEX IF NOT EXISTS uq_poi_src_item ON purchase_order_items (src_item_id) WHERE src_item_id IS NOT NULL`,
+            `CREATE INDEX IF NOT EXISTS idx_sales_items_order ON sales_order_items (order_id)`,
+            `CREATE INDEX IF NOT EXISTS idx_sales_items_cost ON sales_order_items (cost_price) WHERE cost_price IS NULL`,
+            /* ============ ★★ 2026-10-12 冲刺 R15（P2-01）写接口幂等保护 ============
+             * 见下方 IDEM 块的设计说明。此处只建**载体表**（幂等键 + 请求体指纹 + 响应回放）。
+             * 三键列全部 NOT NULL ⇒ 从根上不涉及 PG 的 NULL 唯一语义（第六轮 §1.3 实测：UNIQUE 允许多 NULL）。
+             * 唯一索引用 (user_id, endpoint, client_request_id) —— 第六轮 §1.6 实测结论：
+             *   **禁全局唯一**（会跨用户拦 23505，命中即回放 ⇒ 跨用户信息泄露）。 */
+            `CREATE TABLE IF NOT EXISTS idempotency_keys (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                endpoint TEXT NOT NULL,
+                client_request_id TEXT NOT NULL,
+                req_hash TEXT NOT NULL,
+                status_code INTEGER DEFAULT 0,
+                response_body TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                completed_at TIMESTAMPTZ
+            )`,
+            `CREATE UNIQUE INDEX IF NOT EXISTS uq_idem_user_endpoint_crid ON idempotency_keys (user_id, endpoint, client_request_id)`,
+            `CREATE INDEX IF NOT EXISTS idx_idem_stale ON idempotency_keys (created_at) WHERE response_body IS NULL`,
         ];
         for (const sql of ddl) {
             try { await client.query(sql); } catch (e) { console.log('DDL skip:', e.message); }
         }
+        /* ============ [[IDEM-SELFCHECK]] 幂等载体表可用性自检（2026-10-12） ============
+         * 背景：幂等中间件已改为 **fail-closed**（见 IDEM 块）。若 `idempotency_keys` 不可用，
+         *   所有**带幂等键**的写请求都会 503 —— 这是刻意的取舍：可用性让位于「不得重复记账」。
+         * 隐患：上面的 DDL 循环把失败降级成一行 `DDL skip:` 日志，极易被淹掉
+         *   ⇒ 出现最坏组合「全站写不了、却看不出原因」。
+         * 做法：DDL 之后**主动探一次表**（真实 INSERT→DELETE 往返，不依赖 information_schema，
+         *   因为"表存在但无权限"也必须能被发现）；成功静默，失败打醒目告警并留状态供 /api/health 查询。
+         * ★ 刻意**不阻断启动**：不带幂等键的老客户端行为必须逐字不变，
+         *   阻断启动会把「部分写请求不可用」放大成「整套系统不可用」。 */
+        try {
+            await client.query('BEGIN');
+            await client.query(
+                "INSERT INTO idempotency_keys (user_id, endpoint, client_request_id, req_hash, status_code) VALUES (0, '__selfcheck__', '__selfcheck__', 'x', 0)");
+            await client.query("DELETE FROM idempotency_keys WHERE endpoint = '__selfcheck__'");
+            await client.query('COMMIT');
+            globalThis.__IDEM_SELFCHECK = { ok: true, at: new Date().toISOString(), error: null };
+        }
+        catch (e) {
+            try { await client.query('ROLLBACK'); } catch (e2) { /* 连接可能已废，忽略 */ }
+            globalThis.__IDEM_SELFCHECK = { ok: false, at: new Date().toISOString(), error: String(e.message || e).slice(0, 300) };
+            console.error('\n' + '='.repeat(78));
+            console.error('!!! [IDEM-SELFCHECK] 幂等载体表不可用 —— 带幂等键的写请求将全部返回 503');
+            console.error('!!! 原因:', globalThis.__IDEM_SELFCHECK.error);
+            console.error('!!! 影响: 前端新版本所有写操作（开单/收款/退货/库存）会被拒绝，且**不会静默放行**。');
+            console.error('!!! 处置: 检查 idempotency_keys 建表权限与磁盘；恢复后重启后端即可。');
+            console.error('='.repeat(78) + '\n');
+        }
+        /* ★★ 2026-10-11 P5-4（P3-09）：盘点明细的数量列建表时落成 bigint，
+         *   而 `products.stock_quantity` 是 double precision ⇒ 只要有**一个**商品库存带小数
+         *   （磨具按米/卷计量，本库实测 **22 个**：砂布卷 1.93 / 国产红色拉丝带 29.78…），
+         *   `POST /inventory/checks` 就会在插明细时**整批失败**：
+         *     实测 HTTP 500 ／ fail_count=22 ／ first_error="无效的类型 bigint 输入语法: \"29.78\""
+         *   ⇒ **盘点功能整体不可用**（不是数据问题，是列型与业务不一致）。
+         *   【修法】三列放宽为 double precision（与 products.stock_quantity 同型）。
+         *     bigint → double precision 是**加宽转换、零数据丢失**；
+         *     不采用「四舍五入成整数」——那会把 29.78 的盘亏算错（静默丢精度）。
+         *   【幂等 + 锁粒度】只在**当前仍是整数型**时才 ALTER，避免每次启动都取一次 ACCESS EXCLUSIVE 锁。
+         *   【影响面】该表本库 119 行 ⇒ 迁移代价可忽略。 */
+        try {
+            const t = await client.query(
+                "SELECT data_type FROM information_schema.columns WHERE table_schema='public' " +
+                "AND table_name='inventory_check_items' AND column_name='system_quantity'");
+            const dt = String(t.rows?.[0]?.data_type || '');
+            if (dt && dt !== 'double precision' && dt !== 'real' && dt !== 'numeric') {
+                await client.query(
+                    "ALTER TABLE inventory_check_items " +
+                    "ALTER COLUMN system_quantity TYPE double precision, " +
+                    "ALTER COLUMN actual_quantity TYPE double precision, " +
+                    "ALTER COLUMN difference      TYPE double precision");
+                console.log('[migrate] inventory_check_items 数量列已放宽为 double precision（P3-09）');
+            }
+        } catch (e) { console.error('[migrate] inventory_check_items 列放宽失败（盘点会不可用）:', e.message); }
+        // P2（2026-10-11）：DDL 之后再探测成本口径列 —— 本进程内一次性定死，
+        // 保证同一进程里所有成本查询用同一套口径（不会"一半新一半旧"）。
+        await probeCostUnitColumn((m) => console.log(m));
         console.log('Database connected (Supabase)');
     }
     finally {
@@ -348,9 +551,66 @@ function initDB() {
     return _migrationsPromise;
 }
 function saveDB() { }
+/* ==== BJ-TIME BEGIN（唯一真源 · 2026-10-11 48h 冲刺 P4「时区统一」）====================
+ * 【为什么】服务端跑 UTC（Render），本机跑 GMT+8 ⇒ 同一份数据算出不同的「今天 / 本月」：
+ *   · 本机 GMT+8：`new Date(y, m, 1).toISOString().slice(0,10)` ⇒ **2026-09-30**（应为 10-01）
+ *       —— 本地 10-01 00:00 = UTC 09-30 16:00，被 toISOString 拉回上一天；
+ *   · 任何主机  ：`new Date().toISOString().slice(0,10)` ⇒ **UTC 日期**
+ *       —— 北京时间 00:00~08:00 期间，「今天」会算成昨天。
+ *   ⇒ 实测影响（隔离库同一份数据）：本月销售额多算 ¥16,177.50、收入多算 ¥41,783.50。
+ *
+ * 【做法】一律用**显式 Asia/Shanghai** 求日期，结果**与本进程 TZ 无关**。
+ *
+ * ★ 铁律：本块**只算日期边界，绝不读取或改写任何历史时间戳**。
+ *   P4 的修复面＝「拿哪个日期去查」，不是「把库里的时间改成什么」。
+ * ★ 本块被 `_diag/sprint/p4-tz-test.cjs` **按标记抽取后求值** ⇒ 断言的是真实发布的这段代码。
+ * ★ 内联而非独立模块：Dockerfile 只 `COPY server-supabase.js`（单文件部署），
+ *   新增模块文件不会进镜像 ⇒ 内联是「部署零改动 + 最小增量」的唯一解。
+ * ================================================================================== */
+const BJ_TZ = 'Asia/Shanghai';
+const _bjDate = (v) => {
+    const d = (v === undefined || v === null) ? new Date() : (v instanceof Date ? v : new Date(v));
+    if (Number.isNaN(d.getTime())) throw new Error('bj-time: 非法时间 ' + String(v));
+    return d;
+};
+/** 北京时区 YYYY-MM-DD（en-CA 天然输出 ISO 形式，免手工拼装） */
+function bjYmd(v) {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: BJ_TZ, year: 'numeric', month: '2-digit', day: '2-digit' }).format(_bjDate(v));
+}
+/** 北京时区「今天」 */
+function bjToday(v) { return bjYmd(v); }
+/** 纯日期加减（只走 UTC 算术，避免二次时区偏移） */
+function bjShift(ymd, days) {
+    const [y, m, d] = String(ymd).split('-').map(Number);
+    const u = new Date(Date.UTC(y, m - 1, d) + Number(days) * 86400000);
+    return `${u.getUTCFullYear()}-${String(u.getUTCMonth() + 1).padStart(2, '0')}-${String(u.getUTCDate()).padStart(2, '0')}`;
+}
+/** 北京时区下、相对 v 偏移 offset 个月的**首日**（offset 可为负） */
+function bjMonthStart(offset, v) {
+    const [y, m] = bjYmd(v).split('-').map(Number);
+    const k = m - 1 + (Number(offset) || 0);
+    const yy = y + Math.floor(k / 12);
+    const mm = ((k % 12) + 12) % 12;
+    return `${yy}-${String(mm + 1).padStart(2, '0')}-01`;
+}
+/** 北京时区下、相对 v 偏移 offset 个月的**末日** */
+function bjMonthEnd(offset, v) { return bjShift(bjMonthStart((Number(offset) || 0) + 1, v), -1); }
+/** 北京时区下**往前 n 天**（n 为负 ⇒ 往后） */
+function bjDaysAgo(n, v) { return bjShift(bjYmd(v), -(Number(n) || 0)); }
+/** 北京时区「现在」的 YYYY-MM-DD HH:mm:ss（与库内 created_at 同口径，便于对拍） */
+function bjNowString(v) {
+    const p = new Intl.DateTimeFormat('en-GB', {
+        timeZone: BJ_TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+    }).formatToParts(_bjDate(v));
+    const g = (t) => p.find((x) => x.type === t).value;
+    return `${g('year')}-${g('month')}-${g('day')} ${g('hour')}:${g('minute')}:${g('second')}`;
+}
+/* ==== BJ-TIME END ==== */
 /** 业务日期（东八区），格式 YYYY-MM-DD —— 与智慧记 bill_date 口径一致 */
 function todayCST() {
-    return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+    // P4：改为复用上面唯一真源（原实现 `Date.now()+8h → toISOString` 结果本就正确，此处统一入口）
+    return bjToday();
 }
 /* ==================== 销售单统一口径（2026-10-03 抽取，唯一真源） ====================
  * 背景（实测缺陷）：创建销售单原有三条路径 —— ①手工开单 ②报价转单 ③预订出库。
@@ -434,6 +694,128 @@ async function resolveProductIdForOrder(productId, productName) {
  * 修正后全期间毛利率 = 6.76%（原为 -5.83%）。
  */
 const COST_SIGN_SQL = "CASE WHEN so.final_amount < 0 OR COALESCE(so.biz_type,'sale')='sale_return' THEN -1 ELSE 1 END";
+/* ==================== 成本计价口径：「历史成本优先」（2026-10-11 P2） ====================
+ * 【为什么要改】旧口径一律用 `p.cost_price`（商品档案的**当前**成本）去乘**历史**销售量：
+ *     · 与业务事实不符 —— 商品进价会变（实测同一商品：石墨布 480→96、钢丸 237.5→190、
+ *       诺顿拉丝带红 260→130），拿今天的进价算三个月前的单，毛利是假的；
+ *     · 一旦档案成本被改成 0（未录/停用），历史毛利会被**整体虚高**，且无处察觉。
+ *   ⇒ 正确口径：**用开单当时的进价**（智慧记明细自带 `pur_prc`），档案成本只做兜底。
+ *
+ * 【落库位置】源 `pur_prc` 存到 `sales_order_items.cost_price`（行级，一行一个价）。
+ *
+ * 【发布顺序无关（硬要求）】生产库可能**还没有**这一列。若 SQL 直接引用 `oi.cost_price`，
+ *   未迁移即 500。故此处做**运行期列探测**：
+ *     · 列存在 → `COALESCE(oi.cost_price, p.cost_price)`（行级历史价优先，缺则回退档案价）
+ *     · 列缺失 → `p.cost_price`（**逐字等于旧口径**，行为零变化）
+ *   两个变量只在探测后取值，任何顺序发布都安全。
+ *
+ * ★ 判据：`GET /api/analysis/dashboard` 的 `costBasis` 字段应为 `historical`（列可用时）。
+ * ★ 注意：库存存货成本（`stock_quantity × cost_price`，商品档案维度）**不走此口径**，
+ *   那是「现在仓库里的货值多少」，本就该用当前成本，不属本次改造范围。
+ * ==================================================================================== */
+let COST_UNIT_SQL = 'p.cost_price';          // 单件成本表达式（默认＝旧口径）
+let COST_UNIT_IS_HISTORICAL = false;         // 是否已切到行级历史成本
+/* 行级历史价表达式：`NULLIF(...,0)` 把 **0 视为"没记录"**。
+ *   理由：源 `pur_prc = 0` 表示智慧记当时也没录进价（实测 2 行），
+ *   此时用 0 当成本 ⇒ 该行毛利被整额虚高；退回档案价是**更接近事实的估计**，
+ *   且档案价是真实数据、不是凭空造的。是否"回退"会在响应里如实标注。 */
+const COST_ITEM_EXPR = 'NULLIF(CAST(oi.cost_price AS DOUBLE PRECISION), 0)';
+
+/* ★ 三个行级判据构成**严格划分**（互斥且完备）：每一条明细行必落入且仅落入一类。
+ *   这是"可验证"的前提 —— 若分类有交叠，三数相加会大于总行数，结论就没法自证。
+ *   （初版曾用 `oi.cost_price IS NOT NULL` 判 historic ⇒ 行级价=0 的行同时落进
+ *     historic 与 missing 两类，划分被破坏；单元测试 T2.6 为此增设并在修正后转正。） */
+/** ① 用了「开单当时进价」且该价有效 */
+const COST_ROW_HISTORIC_SQL = () => (COST_UNIT_IS_HISTORICAL
+    ? `COALESCE(${COST_ITEM_EXPR},0) <> 0`
+    : 'FALSE');
+/** ② 当时进价不可用 ⇒ 回退商品档案当前成本；旧口径下**每一行都属此类**（本就没有历史价） */
+const COST_ROW_FALLBACK_SQL = () => (COST_UNIT_IS_HISTORICAL
+    ? `COALESCE(${COST_ITEM_EXPR},0) = 0 AND COALESCE(p.cost_price,0) <> 0`
+    : 'COALESCE(p.cost_price,0) <> 0');
+/** ③ 两种价都拿不到 ⇒ **毛利被高估的行**（本次修复要报出来的对象） */
+const COST_ROW_MISSING_SQL = () => (COST_UNIT_IS_HISTORICAL
+    ? `COALESCE(${COST_ITEM_EXPR},0) = 0 AND COALESCE(p.cost_price,0) = 0`
+    : 'COALESCE(p.cost_price,0) = 0');
+/**
+ * 探测 `sales_order_items.cost_price` 是否存在，据此切换成本口径。
+ * 幂等、只读、失败不阻断启动（保持旧口径）。
+ */
+async function probeCostUnitColumn(log = () => { }) {
+    try {
+        const r = await safeExec(`SELECT COUNT(*)::int FROM information_schema.columns WHERE table_name='sales_order_items' AND column_name='cost_price'`);
+        const n = Number((r && r.values && r.values[0] && r.values[0][0]) || 0);
+        COST_UNIT_IS_HISTORICAL = n > 0;
+        COST_UNIT_SQL = n > 0 ? `COALESCE(${COST_ITEM_EXPR}, p.cost_price)` : 'p.cost_price';
+        log(`[cost] sales_order_items.cost_price ${n > 0 ? '可用' : '缺失'} ⇒ 成本口径 = ${COST_UNIT_SQL}`);
+    } catch (e) {
+        COST_UNIT_IS_HISTORICAL = false;
+        COST_UNIT_SQL = 'p.cost_price';
+        log('[cost] 列探测失败，保持旧口径 p.cost_price：' + e.message);
+    }
+    return COST_UNIT_IS_HISTORICAL;
+}
+/**
+ * 成本完整性指标（P2，2026-10-11）——回答「这个毛利能不能信」。
+ *
+ * 【为什么必须有】旧前端用 `!todayCost`（今日成本为 0）当「未录成本价」的判据，有两个洞：
+ *   ① 今日**没有销售**时 todayCost 恒为 0 ⇒ 误报「未录成本价」（无销售≠没录成本）；
+ *   ② 今日**有销售但只部分商品缺成本**时 todayCost > 0 ⇒ **漏报**，毛利被静默高估。
+ *   老板明确要求：**不得只采用 `todaySales > 0` 的简单条件**。
+ *   ⇒ 唯一正确判据是「**逐明细行**问：这一行有没有成本价」。
+ *
+ * 返回 5 个标量（对给定时间窗）：
+ *   costItemRows     用「开单当时进价」的行数
+ *   costFallbackRows 历史价缺失、**回退用商品档案当前成本**的行数（毛利近似，需提示）
+ *   costMissingRows  两种价都拿不到（空或 0）的行数 ⇒ **毛利被高估的行**
+ *   costMissingQty   这些行的净数量（含退货符号）
+ *   costMissingAmount 这些行的净销售额 ＝ 毛利**虚高**的金额上界
+ *
+ * @param {string} dateCond 施加在 `so` 上的日期谓词（不含 AND 前缀）
+ * @param {string} extra `scopeSql + VOID_SO` 之类的附加条件（含 AND 前缀）
+ */
+function costIntegritySql(dateCond, extra = '') {
+    const J = `FROM sales_order_items oi JOIN sales_orders so ON oi.order_id=so.id JOIN products p ON oi.product_id=p.id WHERE ${dateCond}${extra}`;
+    return [
+        /* 先取窗口内**不加任何成本条件**的总行数 —— 它是后面三分类的对照基准。
+         * 独立算一次（而不是把三数相加）才能真校验划分：三数之和 ≠ 总数 ⇒ 判据有交叠/漏项。 */
+        { key: 'costTotalRows', sql: `SELECT COUNT(*) ${J}` },
+        { key: 'costItemRows', sql: `SELECT COUNT(*) ${J} AND ${COST_ROW_HISTORIC_SQL()}` },
+        { key: 'costFallbackRows', sql: `SELECT COUNT(*) ${J} AND ${COST_ROW_FALLBACK_SQL()}` },
+        { key: 'costMissingRows', sql: `SELECT COUNT(*) ${J} AND ${COST_ROW_MISSING_SQL()}` },
+        { key: 'costMissingQty', sql: `SELECT COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity),0) ${J} AND ${COST_ROW_MISSING_SQL()}` },
+        { key: 'costMissingAmount', sql: `SELECT COALESCE(SUM(${COST_SIGN_SQL} * oi.amount),0) ${J} AND ${COST_ROW_MISSING_SQL()}` },
+    ];
+}
+/** 把 5 个成本完整性标量整理成响应体（两端点共用，字段命名 snake_case）
+ * @param {object} S scalars 结果
+ * @param {Function} N 数值转换
+ * @param {boolean} isHist 当前成本口径是否已切到行级历史价（决定 basis 的诚实标注）
+ */
+function costIntegrityOut(S, N = Number, isHist = COST_UNIT_IS_HISTORICAL) {
+    const hist = N(S.costItemRows), fb = N(S.costFallbackRows), miss = N(S.costMissingRows);
+    const declared = N(S.costTotalRows);
+    const total = hist + fb + miss;
+    let basis;
+    if (declared === 0) basis = 'none';                  // 窗口内没有成本明细行
+    else if (!isHist) basis = miss === 0 ? 'current' : 'current_partial';
+    else if (hist === 0) basis = 'all_fallback';         // 有行但历史价全不可用
+    else if (fb === 0 && miss === 0) basis = 'historical';// 全部用开单当时进价（最可信）
+    else basis = 'mixed';
+    return {
+        total_rows: declared,
+        historic_rows: hist,
+        fallback_rows: fb,
+        missing_rows: miss,
+        missing_qty: N(S.costMissingQty),
+        missing_amount: Math.round(N(S.costMissingAmount) * 100) / 100,
+        complete: miss === 0,
+        /* 划分自证：三分类之和必须等于**独立统计**的窗口总行数。
+         * 若为 false ⇒ 判据出现交叠或漏项 ⇒ 本窗口任何毛利结论都不可用（前端须拒信）。 */
+        partitioned: total === declared,
+        basis,
+    };
+}
 /* ================= 单据号：对齐智慧记口径（2026-10-05） =================
  * 智慧记实测格式：`前缀(3位大写字母) + YYYYMMDD + 4位当日序号`
  *   销售 XSD ｜ 进货 JHD ｜ 收款 SKD ｜ 付款 FKD
@@ -576,10 +958,42 @@ async function generateOrderNumber(prefix) {
 }
 const app = express();
 app.use(helmet());
-app.use(cors({ exposedHeaders: ['X-Sensitive-Filtered'] }));
+app.use(cors({ exposedHeaders: ['X-Sensitive-Filtered', 'X-Idempotent-Replay'] }));
 app.use(morgan('dev'));
 app.use(cacheHeaderMiddleware); // 只读参考数据的私有短缓存
 app.use(express.json());
+/* ==== WRITE-GUARD BEGIN（唯一真源 · 2026-10-11 48h 冲刺 P5-2）==== */
+/* 与上方 WRITE-LEDGER 配对。本中间件做两件事：
+ *   ① 给**每个请求**开一个台账（ALS 上下文），用 `WRITE_LEDGER.run(...)` 包住整条后续处理链
+ *      ⇒ 该请求内所有经 run/runLastId/写型 safeExec 的失败都会落到这个数组里，互不串味；
+ *   ② 改写**本请求**的 `res.json`：若这次请求发生过写失败，则**不允许**返回 `ok === true`，
+ *      一律降级为 500 + `code:'WRITE_FAILED'`（附首条失败原因，前端可直接展示）。
+ * 【判据边界（防误伤）】只对 `body.ok === true` 且 `res.statusCode < 400` 的响应降级；
+ *   本来就是错误响应（ok 缺省/非 true）或已有 >=400 状态码的**不动** ⇒ 不做二次改写、不覆盖更精确的错误。
+ * 【顺序证明】必须注册在**第一条路由之前**，否则拦不到任何东西；`p5-b02-test.cjs` 的 C8 断言了这一点。
+ * ===================================================================================== */
+app.use((req, res, next) => {
+    const fails = [];
+    WRITE_LEDGER.run(fails, () => {
+        const origJson = res.json.bind(res);
+        res.json = (body) => {
+            if (fails.length && body && body.ok === true && res.statusCode < 400) {
+                console.error(`[WRITE-GUARD] 拦截"假成功": ${req.method} ${req.originalUrl} | ${fails.length} 条写失败 | ${fails[0].error}`);
+                res.status(500);
+                return origJson({
+                    ok: false,
+                    code: 'WRITE_FAILED',
+                    error: '数据库写入失败，本次操作未生效',
+                    fail_count: fails.length,
+                    first_error: fails[0].error,
+                });
+            }
+            return origJson(body);
+        };
+        next();
+    });
+});
+/* ==== WRITE-GUARD END ==== */
 /* 健康探针（免鉴权）—— 保活脚本与前端「唤醒」都用它：
  *   · 只做 1 次极轻查询，不碰业务表，成本 ≈ 1 次往返
  *   · 刻意不缓存，CDN/代理必须回源，否则保活打不到源站
@@ -599,7 +1013,12 @@ app.get('/api/health', async (_req, res) => {
         db = !!(r.values && r.values.length);
     } catch (e) { db = false; }
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
-    res.json({ ok: true, db, ms: Date.now() - t0, at: new Date().toISOString(), commit: BUILD_COMMIT, bootAt: BOOT_AT });
+    /* ★ 2026-10-12：暴露幂等载体自检结果（[[IDEM-SELFCHECK]]）。
+     *   幂等中间件已 fail-closed ⇒ 本表不可用时带键写请求全 503；
+     *   把状态放在健康端点，运维**一眼可见**，不必去翻启动日志。
+     *   ⚠️ `ok:true` 的语义**不变**（仍是"进程活着"），不要拿 idem 去改 ok —— 发布判据依赖 ok。 */
+    const idem = globalThis.__IDEM_SELFCHECK || { ok: null, at: null, error: null };
+    res.json({ ok: true, db, ms: Date.now() - t0, at: new Date().toISOString(), commit: BUILD_COMMIT, bootAt: BOOT_AT, idem });
 });
 // ==================== 权限体系 ====================
 // 细粒度功能权限：管理员/店长默认拥有全部；店员按 permissions 数组控制
@@ -677,6 +1096,296 @@ const checkSensitivePerm = (category, permId) => {
         res.status(403).json({ error: '无敏感数据访问权限' });
     };
 };
+
+/* ==== IDEM BEGIN（唯一真源 · 2026-10-12 冲刺 R15 / P2-01「写接口无幂等键」）====
+ * 【问题】写接口无幂等键 ⇒ **双击「保存」/ 超时后重试 / 网络重放**，都会重复建单。
+ * 【设计依据】《宏瑞BOSS_B0B1补强与打印双方案_20261011.md》§4.3 三重幂等中的第 ① 层，
+ *   并已吸收《第六轮遗漏项与施工准入审计_20261011.md》§1 的**实测修正**（勿再引用旧理由）：
+ *     ① **作用域禁全局唯一** —— 全局唯一会跨用户拦 23505；若命中即回放原结果，
+ *        用户 B 提交与 A 相同的 crid 就会拿到 **A 的响应体**（恶意构造 `"1"`/`"test"` 可精确命中）
+ *        ⇒ 跨用户信息泄露。故用 UNIQUE(user_id, endpoint, client_request_id)。
+ *     ② **必须存 req_hash** —— 唯一索引**分不清**「同请求重放」与「不同请求撞码」（都报 23505）。
+ *        命中后比对指纹：一致 → 回放原结果；不一致 → **409 显式报错**。
+ *        若不比对而一律回放，用户「改了金额重发」会**静默拿到旧结果、以为改成功了** —— 比报错更危险。
+ *     ③ **NULL 语义** —— PG 实测（§1.3/§1.4）UNIQUE 默认允许多个 NULL，普通唯一索引与部分唯一索引
+ *        对老客户端**都兼容**（旧结论"必须用部分索引否则老客户端集体失败"已被推翻）。
+ *        本表三键列全 NOT NULL ⇒ 根本不涉及该问题；老客户端不发 key ⇒ 根本不进本表。
+ * 【为什么用独立幂等表，而不是「给 5 张业务表加列」】
+ *   a) 业务表加列**无法回放响应**（命中后还得重新推导响应体）；独立表直接存响应原文。
+ *   b) 各写路由**只挂一行中间件**，零改各路由业务逻辑 ⇒ 符合「最小增量补丁、禁重构已验收功能」。
+ *   c) `safeExec` **吞错**（catch 后返空结果集）⇒ 判不了唯一冲突；必须借 `withTx` 的 `tx.run` 拿真 23505。
+ *   d) 遵守工程纪律「同功能只留 1 个当前版」，不做两套半接线的机制。
+ *   ⇒ 这是**实现载体的选择**，不改变 §4.3 三层设计的任何判据。
+ * 【失败语义（对齐第六轮 §1.9 E1 实测：回滚会释放 crid）】业务失败（非 2xx）时**必须删除本行**，
+ *   否则「第一次提交失败 → 用户改对了再提交」会被**自己的幂等键**挡住（自己挡自己）。
+ * 【捕获点为何是 `res.end` 而不是 `res.json`】P5-2 的响应出口守卫（WRITE-GUARD）也在包 `res.json`，
+ *   且它是 app 级中间件、**先于路由注册** ⇒ 若我在路由里包 `res.json`，捕获到的是守卫**改写前**的体
+ *   （可能含 `ok:true`）⇒ 重放会**绕过守卫**、回放一个本该被拦的"假成功"。
+ *   `res.end` 是所有响应（含守卫改写后）的唯一终点 ⇒ 此处捕获的才是**用户真正收到的字节**。
+ * 【残留自愈】进程崩溃会留下 response 为空的行 ⇒ 超过 IDEM_STALE_SEC 视为放弃并释放，可重新提交。
+ * 【已知能力边界】响应落库是**异步**的 ⇒ 紧随其后（毫秒级窗口）到达的重放可能撞到「处理中」并得 409；
+ *   它是**诚实**的（明说正在处理、可重试），**绝不会重复执行**。
+ * ==================================================================================== */
+const IDEM_STALE_SEC = 600;
+
+/** 稳定序列化（键名排序）＋ 剔除幂等键字段本身 —— 保证「同一请求」的指纹稳定可复现 */
+function _idemCanon(v) {
+    if (v === null || typeof v !== 'object') return JSON.stringify(v === undefined ? null : v);
+    if (Array.isArray(v)) return '[' + v.map(_idemCanon).join(',') + ']';
+    return '{' + Object.keys(v).sort()
+        .filter((k) => k !== 'client_request_id' && k !== 'idemKey')
+        .map((k) => JSON.stringify(k) + ':' + _idemCanon(v[k])).join(',') + '}';
+}
+/** 请求体指纹：并入 `method + url`，避免「同 body 不同目标」被误判成同一请求 */
+function idemHash(req) {
+    return crypto.createHash('sha256')
+        .update(String(req.method || '') + ' ' + String(req.originalUrl || ''))
+        .update('\u0000')
+        .update(_idemCanon(req.body || {}))
+        .digest('hex')
+        .slice(0, 32);
+}
+/* ★★★ 必须用 `err.code`（SQLSTATE）判定「唯一冲突」，**禁只按错误消息文本** —— 这条是实测踩出来的：
+ *   本机 PG 的 `lc_messages` 是中文 ⇒ 实测错误消息为
+ *     「重复键违反唯一约束"uq_idem_user_endpoint_crid"」
+ *   —— `duplicate key` 与 `23505` 两个英文特征**一个都不出现** ⇒ 首版判据**全部漏判**，
+ *   中间件于是**静默 fail-open**：同键重发照样建第二行、同键不同体也不报 409。
+ *   实测证据：`_diag/sprint/p5-b14-r15-test.cjs` 首跑 A3/A4/A5/B1b/B3/B4 六条失败，
+ *   后端日志出现 `[err] idem 前置失败（放行，不影响业务）: 重复键违反唯一约束…`。
+ *   SQLSTATE（`23505`）与语言环境**无关**，是唯一可靠判据；消息文本只作兜底（并补上中文与约束名）。 */
+const isUniqueViolation = (e) => {
+    if (String((e && e.code) || '') === '23505') return true;
+    const msg = String((e && e.message) || e) + '|' + String((e && e.constraint) || '');
+    return /23505|duplicate key|重复键|唯一约束|uq_idem_user_endpoint_crid/i.test(msg);
+};
+
+/** ★★★ 幂等专用直连执行器：**出错必须抛**（不像 safeExec 会降级成空结果）。
+ *  为什么不能用 `safeExec`：它 catch 后返回 `{ columns: [], values: [] }`，
+ *  与「真的查不到这一行」**完全无法区分** ⇒ 幂等中间件会把「查询失败」误当成
+ *  「幂等键已被释放」，从而 silent fail-open（同键重发照样执行 ⇒ **重复记账 / 重复扣减库存**）。
+ *  P5-2 的写失败台账也不适用：这里要的不是"先记账、再由出口守卫拦截"，
+ *  而是**在业务处理器之前就拒绝执行**（守卫拦的是 `ok:true`，而重复记账那次是"真成功"）。
+ *  ⇒ 本助手只做一件事：把真实错误原样抛出，由调用方决定 fail-closed。 */
+async function idemExec(sql, params = []) {
+    const { sql: finalSql } = convertPlaceholders(translateSQL(sql));
+    const client = await getPool().connect();
+    try {
+        const r = await client.query({ text: finalSql, values: Array.isArray(params) ? params : [params], rowMode: 'array' });
+        return { values: r.rows, rowCount: r.rowCount };
+    }
+    finally {
+        client.release();
+    }
+}
+
+/**
+ * 幂等中间件。**必须挂在 authMiddleware 之后**（要读 req.user.id）、业务处理器之前。
+ * 未携带幂等键（`X-Client-Request-Id` 或 body.client_request_id）时直接放行 ⇒ 老客户端行为逐字不变。
+ */
+function idem(endpoint) {
+    return async function idemMiddleware(req, res, next) {
+        const crid = String(req.get('x-client-request-id')
+            || (req.body && req.body.client_request_id) || '').trim();
+        if (!crid) return next();
+        const uid = req.user && req.user.id;
+        if (!uid) return next();
+        const hash = idemHash(req);
+        const where = ' WHERE user_id = ? AND endpoint = ? AND client_request_id = ?';
+        const args = [uid, endpoint, crid];
+
+        /* ② 在**响应终点**捕获用户真正收到的字节：成功落库（供后续回放）、失败释放键。
+         * ★ 捕获点为何是 `res.end` 而不是 `res.json`：P5-2 的响应出口守卫（WRITE-GUARD）也包
+         *   `res.json`，且它是 app 级中间件、**先于路由注册** ⇒ 若在路由里包 `res.json`，
+         *   捕获到的是守卫**改写前**的体（可能含 `ok:true`）⇒ 重放会**绕过守卫**、
+         *   回放一个本该被拦的"假成功"。`res.end` 是所有响应（含守卫改写后）的唯一终点。
+         *
+         * ★★★ 2026-10-12（P5-B25，实测新增缺陷 —— 这条是**真问题，不是重构**）：
+         *   这段原先是**直落**在函数尾部的顺序代码，于是**只有「INSERT 抢占成功」那一条路**
+         *   会执行到它；而「键已存在」的 catch 分支一律 `return next()` ⇒ **直接跳出中间件**、
+         *   **从不安装捕获钩子**。后果（已实测复现，非推断）：
+         *     · 残留自愈路径（陈旧 pending 行被抢占后执行成功）⇒ 本次响应**无处落库**
+         *       ⇒ 该键**永远停在 pending**（status_code=0、response_body 为 NULL）；
+         *     · 同键重试 ⇒ 被判"处理中" 409（安全）；
+         *     · 但**再等满 IDEM_STALE_SEC（600s）后**重试 ⇒ 又判为"崩溃残留"⇒ **再执行一次**
+         *       ⇒ 重复记账 / 重复扣减库存，且响应是 200、无任何回放标记。
+         *   即：**幂等保护在"超时残留"这条路径上会静默放行重复记账**，正是明令禁止的那一类。
+         *   ⇒ 改为具名 `armCapture()`，并在**每一条「已取得本键所有权后继续执行」的路径**
+         *     都挂上它（① 新鲜抢占成功 ② 残留抢占成功 ③ 冲突但行已消失），与响应出口一一对应。
+         *   ★ `res.__idemArmed` 幂等护栏：多条路径可能都调用，只允许真正挂一次。 */
+        const armCapture = () => {
+            if (res.__idemArmed) return;
+            res.__idemArmed = true;
+            const origEnd = res.end.bind(res);
+            res.end = function (chunk, encoding, cb) {
+                if (!res.__idemDone) {
+                    res.__idemDone = true;                 // 只捕获一次（res.end 可能被重入）
+                    try {
+                        const sc = res.statusCode || 200;
+                        const ctype = String(res.getHeader('content-type') || '');
+                        const isJson = /json/i.test(ctype);
+                        if (sc >= 200 && sc < 300 && isJson && chunk) {
+                            const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk);
+                            JSON.parse(text);              // 只回放合法 JSON；解析失败则走释放分支
+                            run('UPDATE idempotency_keys SET status_code = ?, response_body = ?, completed_at = now()'
+                                + where, [sc, text, ...args])
+                                .catch((e2) => console.error('idem 落响应失败（不影响业务）:', e2.message));
+                        }
+                        else {
+                            run('DELETE FROM idempotency_keys' + where, args)
+                                .catch((e2) => console.error('idem 释放失败（不影响业务）:', e2.message));
+                        }
+                    }
+                    catch (e) {
+                        console.error('idem 捕获失败（不影响业务）:', e.message);
+                        run('DELETE FROM idempotency_keys' + where, args).catch(() => { });
+                    }
+                }
+                return origEnd(chunk, encoding, cb);
+            };
+        };
+
+        /* ① 抢占幂等键：借真实唯一索引做并发闸门（真实 23505 只能从驱动错误对象上拿）
+         * ★★★ 2026-10-12（R16-A，老板「不得静默放行可能重复记账的操作」）：
+         *   原实现对**非唯一冲突**的失败是 **fail-open** —— `return next()`，即
+         *   「幂等表缺失 / 权限不足 / 连接池耗尽 / 锁等待超时 / DB 抖动」时**静默放行**。
+         *   后果：用户双击两次 ⇒ 建两张单、扣两次库存，而两次都返回 `ok:true`，
+         *   前端与守卫**都看不出异常**（守卫只看写失败台账，这两次写是"真成功"）。
+         *   ⇒ 现改为 **fail-closed**：返回 503 且**不进入业务处理器**（一个字节都不写库）。
+         *   ★ 代价与配套：若幂等表本身不可用，带幂等键的写请求会全部 503（可用性让位于数据安全）。
+         *     为避免"全站写不了却查不出原因"，启动时另有 [[IDEM-SELFCHECK]] 显式自检告警。*/
+        try {
+            await idemExec(
+                'INSERT INTO idempotency_keys (user_id, endpoint, client_request_id, req_hash, status_code) VALUES (?, ?, ?, ?, 0)',
+                [uid, endpoint, crid, hash]);
+        }
+        catch (e) {
+            if (!isUniqueViolation(e)) {
+                console.error('[idem] 抢占失败 ⇒ 拒绝执行（fail-closed）:', e.message);
+                return res.status(503).json({
+                    ok: false, code: 'IDEM_UNAVAILABLE',
+                    error: '提交保护暂时不可用，本次未执行任何写入，请稍后重试。',
+                });
+            }
+            /* ★ 查已存在行也必须走 idemExec（抛错）——原用 safeExec，出错时返回 `{values: []}`，
+             *   与「真的没有这一行」无法区分 ⇒ 会把「查询失败」当成「键已被释放」，
+             *   于是**在唯一冲突这条路径上再次 fail-open**。 */
+            let row;
+            try {
+                const r = await idemExec(
+                    'SELECT req_hash, status_code, response_body, EXTRACT(EPOCH FROM (now() - created_at))::int FROM idempotency_keys'
+                    + where, args);
+                row = r.values && r.values[0];
+            }
+            catch (e2) {
+                console.error('[idem] 状态查询失败 ⇒ 拒绝执行（fail-closed）:', e2.message);
+                return res.status(503).json({
+                    ok: false, code: 'IDEM_UNAVAILABLE',
+                    error: '提交保护暂时不可用，本次未执行任何写入，请稍后重试。',
+                });
+            }
+            if (!row) {
+                /* 走到这里 = INSERT 撞了 23505、但行随后消失。释放只发生在「响应非 2xx 或非 JSON」
+                 *   ⇒ 那一次并未成功 ⇒ 本次按新请求处理是安全的（等同改动前语义）。
+                 * ⚠️ 这**不是**"异常放行"：真正的查询异常已被上面的 catch 拦死并 503。
+                 *    留一条证据，便于日后核对这条罕见路径确实发生过。
+                 * ★★★ 2026-10-12（P5-B25）：但**必须先把键重新立起来**再继续 ——
+                 *   否则本次执行完，响应落库的 UPDATE 找不到行（影响 0 行）⇒ 键永久缺失
+                 *   ⇒ 同键重试会 INSERT 成功并**再执行一次**（与残留路径同一类缺口）。
+                 *   重建若撞唯一约束 = 并发方已立好那行 ⇒ 直接用它的即可，不报错。 */
+                console.warn('[idem] 键在抢占后被释放（前一次未成功）⇒ 重建键并按新请求执行:', endpoint, crid);
+                try {
+                    await idemExec(
+                        'INSERT INTO idempotency_keys (user_id, endpoint, client_request_id, req_hash, status_code) VALUES (?, ?, ?, ?, 0)',
+                        [uid, endpoint, crid, hash]);
+                }
+                catch (e5) {
+                    if (!isUniqueViolation(e5)) {
+                        console.error('[idem] 重建键失败 ⇒ 拒绝执行（fail-closed）:', e5.message);
+                        return res.status(503).json({
+                            ok: false, code: 'IDEM_UNAVAILABLE',
+                            error: '提交保护暂时不可用，本次未执行任何写入，请稍后重试。',
+                        });
+                    }
+                    /* 并发方已立好 ⇒ 不作处理，继续（它会把响应落库） */
+                }
+                armCapture();
+                return next();
+            }
+            const [h, sc, body, age] = row;
+            if (String(h) !== hash)
+                return res.status(409).json({
+                    ok: false, code: 'IDEM_KEY_REUSED',
+                    error: '同一次请求标识已用于内容不同的提交，本次未执行。请重新发起。',
+                });
+            if (Number(sc) > 0 && body) {                  // 真重放 ⇒ 原样回放，并显式标注
+                res.set('X-Idempotent-Replay', '1');
+                return res.status(Number(sc)).json(JSON.parse(body));
+            }
+            if (Number(age) > IDEM_STALE_SEC) {
+                /* 崩溃残留 ⇒ 抢占后按新请求处理。
+                 * ★ 必须**原子抢占并以 rowCount 为准**：原实现用 `run()`（吞错）后无条件 `next()`
+                 *   ⇒ 若清理因 DB 抖动失败，行仍在，本次却照样执行 ⇒ 又一个 fail-open 窗口。
+                 *   ⇒ 改为带条件的原子抢占（只有确实抢到了才继续，否则 409）。
+                 *
+                 * ★★★ 2026-10-12（P5-B25，实测新增缺陷）：抢占动作**原本是 DELETE** ⇒
+                 *   行被删掉后，本次响应落库走的是
+                 *     `UPDATE idempotency_keys SET status_code=?, response_body=? WHERE 同键`
+                 *   —— 行已不存在 ⇒ **UPDATE 影响 0 行** ⇒ 这次成功执行**没留下任何记录**。
+                 *   后果（实测复现，非推断）：同键再发一次 ⇒ INSERT 不再撞唯一约束 ⇒
+                 *     **再执行一遍**（实测同一个客户被建了 2 行、HTTP 200 且无回放标记）。
+                 *   即：**残留自愈这条路径会静默放行重复记账 / 重复扣减库存**，
+                 *   正是老板明令禁止的那一类（"幂等机制发生异常时不得静默放行"）。
+                 *
+                 * ⇒ 改为**带条件的原子 UPDATE 抢占**（不再 DELETE）：
+                 *     · 单条语句 ⇒ 与 DELETE 版同样原子，rowCount 仍是唯一判据；
+                 *     · 行**留在库里**（status_code 复位为 0）⇒ 后续 res.end 的 UPDATE 能命中它，
+                 *       把这次的真实响应落进 status_code / response_body ⇒ 同键重试得到**回放**；
+                 *     · 业务失败时 res.end 会 DELETE 该行 ⇒ 键被释放，可重提（语义与新鲜路径一致）；
+                 *     · 再崩一次也只是重新等满 IDEM_STALE_SEC **一次**（因 created_at 已刷新）。
+                 *   净效果：残留路径与新鲜路径的幂等语义**完全一致**，不再有"键凭空消失"的窗口。 */
+                let claimed = 0;
+                try {
+                    const d = await idemExec(
+                        'UPDATE idempotency_keys SET created_at = now(), status_code = 0,'
+                        + ' response_body = NULL, completed_at = NULL'
+                        + where
+                        + " AND status_code = 0 AND created_at < now() - interval '" + IDEM_STALE_SEC + " seconds'",
+                        args);
+                    claimed = Number(d.rowCount) || 0;
+                }
+                catch (e3) {
+                    console.error('[idem] 抢占崩溃残留失败 ⇒ 拒绝执行（fail-closed）:', e3.message);
+                    return res.status(503).json({
+                        ok: false, code: 'IDEM_UNAVAILABLE',
+                        error: '提交保护暂时不可用，本次未执行任何写入，请稍后重试。',
+                    });
+                }
+                if (!claimed) {
+                    console.warn('[idem] 抢占未取得独占权（并发或状态已变）⇒ 拒绝执行:', endpoint, crid);
+                    return res.status(409).json({
+                        ok: false, code: 'IDEM_IN_PROGRESS',
+                        error: '同一请求正在处理中，请勿重复提交。',
+                    });
+                }
+                /* ★★★ 必须挂捕获钩子后再 next()（P5-B25 缺陷修法）：
+                 *   本路径是"我抢到了这枚陈旧键、马上要真正执行"，
+                 *   与"INSERT 抢占成功"在语义上**完全等价** ⇒ 响应落库/失败释放的处置也必须一致。
+                 *   原先直接 `return next()` 跳过了捕获安装 ⇒ 本次响应永不落库 ⇒
+                 *   键永远 pending ⇒ 满 600s 后重试会被再次判为残留并**再执行一次**。 */
+                armCapture();
+                return next();
+            }
+            return res.status(409).json({
+                ok: false, code: 'IDEM_IN_PROGRESS',
+                error: '同一请求正在处理中，请勿重复提交。',
+            });
+        }
+
+        armCapture();
+        next();
+    };
+}
+/* ==== IDEM-END ==== */
 
 // 过滤敏感数据（根据权限返回 null 或脱敏值）—— 单字段版（保留，供逐字段调用）
 const filterSensitiveData = (data, user, category, field) => {
@@ -899,6 +1608,13 @@ app.delete('/api/auth/users/:id', authMiddleware, adminOnly, async (req, res) =>
 app.put('/api/auth/password', authMiddleware, async (req, res) => {
     await initDB();
     const { oldPassword, newPassword } = req.body;
+    /* ★ B0-5（P1-05）：入参硬校验。修复前字段缺失 ⇒ `bcrypt.compareSync(undefined, hash)` 抛
+     *   「Illegal arguments: undefined, string」⇒ 本路由无 try/catch ⇒ Express 默认错误页把
+     *   **完整调用栈 ＋ 绝对路径**回给了客户端（实测 HTTP 500 ＋ text/html）。
+     *   ⚠️ 刻意**不加口令长度/复杂度规则**（属行为变更，会打断现有弱口令用户自助改密）
+     *   ⇒ 已登记为待拍板 D6（见冲刺报告 §12）。本条只做「必填 ＋ 类型」。*/
+    if (typeof oldPassword !== 'string' || typeof newPassword !== 'string' || oldPassword === '' || newPassword === '')
+        return res.status(400).json({ ok: false, error: '原密码与新密码必填，且必须为字符串' });
     const result = await safeExec("SELECT password FROM users WHERE id = ?", [req.user.id]);
     const user = result.values?.[0];
     if (!user)
@@ -980,7 +1696,8 @@ app.get('/api/inventory/products/batch', authMiddleware, hasPerm('inventory_view
 app.get('/api/inventory/products/expiry', authMiddleware, hasPerm('inventory_view'), async (req, res) => {
     await initDB();
     const { days = 30 } = req.query;
-    const endDate = new Date(Date.now() + (Number(days) || 30) * 86400000).toISOString().slice(0, 10);
+    // P4：保质期截止日 = 北京今天 + days（原走 UTC ⇒ 早 8 点前差一天）
+    const endDate = bjDaysAgo(-(Number(days) || 30));
     const result = await safeExec("SELECT * FROM products WHERE status = 1 AND expiry_date IS NOT NULL AND expiry_date <= ? ORDER BY expiry_date ASC", [endDate]);
     const products = (result.values || []).map((p) => ({
         id: p[0], sku: p[1], name: p[2], category: p[3], spec: p[4], unit: p[5],
@@ -1003,7 +1720,35 @@ app.put('/api/inventory/products/:id', authMiddleware, hasPerm('inventory_full')
     await initDB();
     const { id } = req.params;
     const { sku, name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity, batch_number, production_date, expiry_date, supplier_id, wholesale_price } = req.body;
-    await run("UPDATE products SET sku=?, name=?, category=?, spec=?, unit=?, cost_price=?, sell_price=?, stock_quantity=?, warning_quantity=?, batch_number=?, production_date=?, expiry_date=?, supplier_id=?, wholesale_price=?, updated_at=datetime('now','localtime') WHERE id=?", [sku, name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity, batch_number, production_date, expiry_date, supplier_id, wholesale_price || 0, id]);
+    /* ★★ 2026-10-11 P5-4（P3-05）：商品编辑盖库存 ⇒ 丢失更新。
+     *   【缺陷实证】修复前该接口直接 `stock_quantity = ?` **绝对值覆盖**，而编辑页送上来的是
+     *     **列表加载时的旧值** ⇒ 期间的开单/进货改动全被抹掉。
+     *     实测：快照 100 → 期间真实开单卖 5（库存 95）→ 保存旧值 100 ⇒ 库存被写回 **100**（丢 5）。
+     *   【修法（最小增量，不改任何字段口径）】整段进事务 + 行级排他锁 → 若客户端同时送了「打开时库存」
+     *     `stock_quantity_baseline`，则在锁内比对：不一致 ⇒ 409 STOCK_CONFLICT 并回报当前值。
+     *   【兼容】未送基线（旧 APK / 旧前端）一律保持旧行为，**不静默改契约**。
+     *   【禁重构】字段列表与 `|| 0` 罚兑逐字保留。 */
+    const hasNewStock = stock_quantity !== undefined && stock_quantity !== null && stock_quantity !== '';
+    const hasBase = req.body.stock_quantity_baseline !== undefined && req.body.stock_quantity_baseline !== null && req.body.stock_quantity_baseline !== '';
+    try {
+        await withTx(async (tx) => {
+            const cur = (await tx.q("SELECT stock_quantity FROM products WHERE id = ? FOR UPDATE", [id])).values?.[0];
+            if (!cur) throw Object.assign(new Error('product not found'), { httpCode: 404, code: 'PRODUCT_NOT_FOUND', msg: '商品不存在' });
+            const curStock = Number(cur[0]) || 0;
+            if (hasNewStock && hasBase && Number(req.body.stock_quantity_baseline) !== curStock) {
+                throw Object.assign(new Error('stock conflict'), {
+                    httpCode: 409, code: 'STOCK_CONFLICT', current_stock: curStock,
+                    msg: `库存已被其他操作改为 ${curStock}（你打开时是 ${Number(req.body.stock_quantity_baseline)}）⇒ 请刷新后重试`,
+                });
+            }
+            await tx.run("UPDATE products SET sku=?, name=?, category=?, spec=?, unit=?, cost_price=?, sell_price=?, stock_quantity=?, warning_quantity=?, batch_number=?, production_date=?, expiry_date=?, supplier_id=?, wholesale_price=?, updated_at=datetime('now','localtime') WHERE id=?", [sku, name, category, spec, unit, cost_price, sell_price, stock_quantity, warning_quantity, batch_number, production_date, expiry_date, supplier_id, wholesale_price || 0, id]);
+        });
+    }
+    catch (e) {
+        if (e && e.httpCode) return res.status(e.httpCode).json({ ok: false, code: e.code, error: e.msg, current_stock: e.current_stock });
+        console.error('[PRODUCTS-PUT] 保存失败，已整体回滚:', e.message);
+        return res.status(500).json({ ok: false, code: 'PRODUCT_WRITE_FAILED', error: '保存失败，本次操作未生效（已整体回滚）' });
+    }
     saveDB();
     saveDB();
     res.json({ ok: true });
@@ -1046,7 +1791,7 @@ app.get('/api/inventory/checks', authMiddleware, hasPerm('inventory_view'), asyn
     const result = await safeExec("SELECT * FROM inventory_checks ORDER BY id DESC");
     res.json(result.values || []);
 });
-app.post('/api/inventory/checks', authMiddleware, adminOnly, async (req, res) => {
+app.post('/api/inventory/checks', authMiddleware, adminOnly, idem('checks'), async (req, res) => {
     await initDB();
     const checkNumber = await generateOrderNumber('PD');
     // 获取刚插入的盘点单 ID（见 runLastId 注释：必须与 INSERT 同一条语句，避免连接池会话漂移）
@@ -1089,21 +1834,42 @@ app.post('/api/inventory/checks/:checkId/items', authMiddleware, adminOnly, asyn
 app.put('/api/inventory/checks/:id/complete', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
     const { id } = req.params;
+    /* ★★ 2026-10-11 P5-4（P3-06）：盘点完成**可重入** ⇒ 会把盘点之后发生的开单抹掉。
+     *   【缺陷实证】修复前对同一张盘点单可反复 complete，每次都把
+     *     `stock_quantity = actual_quantity`（绝对值）再写一遍 ⇒
+     *     盘点完成后真实开单卖 5（库存 50→45）再点一次「完成」，库存被拉回 **50**（那 5 件凭空回来）。
+     *   【语义】盘点是**快照**，只能应用一次；重复应用不是「幂等」（库存会随之后的业务变动而变）。
+     *   【修法】① 锁定盘点单并校验状态：已 completed ⇒ 409（说清楚已完成时间与当时应用数）
+     *     ② 明细取数与回写同事务，中途失败整体回滚（不留「半盘」库存）
+     *     ③ **不改字段口径**：仍只回写 actual_quantity 非空的项（2026-09-27 的 NULL 保护逐字保留） */
     // [修复 2026-09-27] 只回写「已录入实际数量」的项。
     // 原实现 SELECT 全部明细后无条件 UPDATE：未录入项(actual_quantity IS NULL)会把
     // products.stock_quantity 直接写成 NULL = 清空库存。
     // 实测本库盘点单 #2（PD202609271812）有 119 项全部未录入 ⇒ 一点「完成」即清空 119 个商品库存。
-    const items = await safeExec("SELECT product_id, actual_quantity FROM inventory_check_items WHERE check_id = ? AND actual_quantity IS NOT NULL", [id]);
-    let applied = 0;
-    if (items.values) {
-        for (const item of items.values) {
-            await run("UPDATE products SET stock_quantity = ?, updated_at=datetime('now','localtime') WHERE id = ?", [item[1], item[0]]);
-            applied++;
-        }
+    let applied = 0, skipped = 0;
+    try {
+        const out = await withTx(async (tx) => {
+            const chk = (await tx.q("SELECT status, completed_at FROM inventory_checks WHERE id = ? FOR UPDATE", [id])).values?.[0];
+            if (!chk) throw Object.assign(new Error('check not found'), { httpCode: 404, code: 'CHECK_NOT_FOUND', msg: '盘点单不存在' });
+            if (String(chk[0] || '') === 'completed')
+                throw Object.assign(new Error('already completed'), { httpCode: 409, code: 'CHECK_ALREADY_COMPLETED', msg: `该盘点单已于 ${chk[1] || '更早'} 完成过，不能重复完成（重复应用会抹掉盘点后发生的开单改动）。如需重盘，请新建一张盘点单。` });
+            const items = (await tx.q("SELECT product_id, actual_quantity FROM inventory_check_items WHERE check_id = ? AND actual_quantity IS NOT NULL", [id])).values || [];
+            let n = 0;
+            for (const item of items) {
+                await tx.run("UPDATE products SET stock_quantity = ?, updated_at=datetime('now','localtime') WHERE id = ?", [item[1], item[0]]);
+                n++;
+            }
+            const sk = (await tx.q("SELECT count(*) FROM inventory_check_items WHERE check_id = ? AND actual_quantity IS NULL", [id])).values?.[0]?.[0];
+            await tx.run("UPDATE inventory_checks SET status='completed', completed_at=datetime('now','localtime') WHERE id=?", [id]);
+            return { n, sk: Number(sk || 0) };
+        });
+        applied = out.n; skipped = out.sk;
     }
-    const skippedRow = await safeExec("SELECT count(*) FROM inventory_check_items WHERE check_id = ? AND actual_quantity IS NULL", [id]);
-    const skipped = Number(skippedRow.values?.[0]?.[0] || 0);
-    await run("UPDATE inventory_checks SET status='completed', completed_at=datetime('now','localtime') WHERE id=?", [id]);
+    catch (e) {
+        if (e && e.httpCode) return res.status(e.httpCode).json({ ok: false, code: e.code, error: e.msg });
+        console.error('[CHECKS-COMPLETE] 盘点完成失败，已整体回滚:', e.message);
+        return res.status(500).json({ ok: false, code: 'CHECK_WRITE_FAILED', error: '盘点完成失败，本次操作未生效（已整体回滚）' });
+    }
     saveDB();
     res.json({ ok: true, applied, skipped });
 });
@@ -1582,146 +2348,297 @@ app.get('/api/finance/accounts/options', authMiddleware, async (_req, res) => {
     const accounts = (result.values || []).map((a) => ({ id: a[0], name: a[1], type: a[2] }));
     res.json(accounts);
 });
-app.post('/api/finance/accounts', authMiddleware, adminOnly, async (req, res) => {
+app.post('/api/finance/accounts', authMiddleware, adminOnly, idem('accounts'), async (req, res) => {
     await initDB();
-    const { name, type, balance } = req.body;
-    await run("INSERT INTO accounts (name, type, balance) VALUES (?, ?, ?)", [name, type || 'cash', balance || 0]);
+    const { name, type, balance } = req.body || {};
+    /* ★ 2026-10-11 P5-2：`accounts.name` 是 NOT NULL 且无默认值 ⇒ 修复前传 name=null
+     *   会 INSERT 失败被 run() 吞掉，接口仍回 ok:true（"建了但其实没建"）。
+     *   期初余额同样必须先是数字再落库（原 `balance || 0` 会把 'abc' 原样送进 double precision）。 */
+    if (!name || !String(name).trim()) {
+        return res.status(400).json({ ok: false, code: 'ACCOUNT_BAD_NAME', error: '账户名称不能为空' });
+    }
+    let bal = 0;
+    if (balance != null && balance !== '') {
+        bal = Number(balance);
+        if (!Number.isFinite(bal)) {
+            return res.status(400).json({ ok: false, code: 'ACCOUNT_BAD_BALANCE', error: '期初余额必须是数字' });
+        }
+    }
+    let newId = null;
+    try {
+        newId = await withTx((tx) => tx.lastId("INSERT INTO accounts (name, type, balance) VALUES (?, ?, ?)", [String(name).trim(), type || 'cash', bal]));
+    }
+    catch (e) {
+        console.error('[FIN-ACCOUNT] 新增账户失败，已回滚:', e.message);
+        return res.status(500).json({
+            ok: false, code: 'ACCOUNT_WRITE_FAILED',
+            error: '新增账户失败，本次操作未生效',
+            detail: String(e.message).slice(0, 200),
+        });
+    }
     saveDB();
     saveDB();
-    res.json({ ok: true });
+    res.json({ ok: true, id: newId == null ? null : Number(newId) });
 });
-app.post('/api/finance/transactions/income', authMiddleware, hasPerm('income'), async (req, res) => {
+app.post('/api/finance/transactions/income', authMiddleware, hasPerm('income'), idem('tx-income'), async (req, res) => {
     await initDB();
-    const { account_id, amount, category, description, customer_id, customer_name } = req.body;
+    const { account_id, amount, category, description, customer_id, customer_name } = req.body || {};
+    /* ★★ 2026-10-11 P5-2 入口硬校验（修复前**一处校验都没有**）：
+     *   实测缺陷（隔离库 hongrui_ws48，见 _diag/sprint/p5-b02-test.cjs）：
+     *     `POST {amount:null}` ⇒ HTTP 200 `{ok:true, order_number:"SKD202610110001"}`，但
+     *       ① `transactions` 一行没写（amount 列 NOT NULL，INSERT 报错被 run() 静默吞掉）；
+     *       ② 紧接着 `UPDATE accounts SET balance = balance + NULL` ⇒ **账户 #1 余额
+     *          2,444,840.23 被写成 NULL**（accounts.balance 可空，`x + NULL = NULL` 不报错）
+     *          ⇒ 一条非法请求静默抹掉账户余额，而接口报"成功"。
+     *   故：金额必须「有限且 > 0」；账户若显式指定则必须真实存在且未停用（不得静默换账户）。 */
+    const amt = Number(amount);
+    if (!Number.isFinite(amt) || amt <= 0) {
+        return res.status(400).json({ ok: false, code: 'INCOME_BAD_AMOUNT', error: '收款金额必须是大于 0 的数字' });
+    }
     // 客户收款：记录往来对象，冲减该客户欠款
-    let pid = customer_id || null, pname = customer_name || null, ptype = null;
+    let pid = customer_id ? Number(customer_id) : null, pname = customer_name || null, ptype = null;
     if (!pid && pname) {
         const r = await safeExec("SELECT id FROM customers WHERE name = ? ORDER BY id LIMIT 1", [pname]);
-        if (r.values?.[0]?.[0]) pid = r.values[0][0];
+        if (r.values?.[0]?.[0]) pid = Number(r.values[0][0]);
     }
     if (pid) { ptype = 'customer'; }
     else if (pname) { ptype = 'customer'; }
-    // 账户兜底：优先前端指定 → 现金账户 → 任意账户 → 自动创建现金账户
-    let accId = account_id || null;
-    if (!accId) {
-        accId = (await safeExec("SELECT id FROM accounts WHERE type = 'cash' LIMIT 1")).values?.[0]?.[0] || null;
-    }
-    if (!accId) {
-        accId = (await safeExec("SELECT id FROM accounts ORDER BY id LIMIT 1")).values?.[0]?.[0] || null;
-    }
-    if (!accId) {
-        // 见 runLastId 注释：INSERT 与「取刚插入的 id」必须同一条语句，否则连接池会话漂移会取到别的 id
-        accId = await runLastId("INSERT INTO accounts (name, type, balance) VALUES ('现金', 'cash', 0)");
+    // 账户：显式指定 ⇒ 必须存在且未停用（400）；未指定 ⇒ 兜底（现金 → 任意 → 自动建现金账户）
+    let accId = (account_id != null && account_id !== '') ? Number(account_id) : null;
+    if (accId != null) {
+        const okAcc = (await safeExec("SELECT id FROM accounts WHERE id = ? AND COALESCE(status,1) = 1", [accId])).values?.[0]?.[0];
+        if (!okAcc) return res.status(400).json({ ok: false, code: 'INCOME_BAD_ACCOUNT', error: `账户 #${accId} 不存在或已停用` });
     }
     const cat = category || (pname ? '收欠款' : '直接收款');
     // 收款单号 SKD+YYYYMMDD+4位当日序号（对齐智慧记）；取号失败不阻断开单
     const orderNumber = await generateOrderNumber('income');
-    await run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name, order_number) VALUES ('income', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [accId, amount, cat, description, req.user.id, req.user.real_name, ptype, pid, pname, orderNumber]);
-    await run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [amount, accId]);
-    // 冲减该客户欠款（2026-10-04 修复）：按金额逐单抵扣，并【同步三个金额字段】。
-    //   原实现只改 payment_status，不动 received_amount / owe_amount ⇒ 造出「已结清但欠款仍在」的
-    //   不自洽单；而界面状态只看 owe_amount（OrderManagement 的 isUnpaid = owe > 0.005）
-    //   ⇒ 少收的钱会被前台显示成「已收款」。故必须三字段一起改。
-    if (pid && category !== '直接收款') {
-        const unpaid = (await safeExec(`SELECT id, COALESCE(receivable_amount, final_amount, 0) due,
-                COALESCE(received_amount, 0) rec
-            FROM sales_orders
-            WHERE customer_id = ? AND COALESCE(payment_status,'') NOT IN ('已结清','作废')
-            ORDER BY id LIMIT 20`, [pid])).values || [];
-        let remain = Number(amount) || 0;
-        for (const row of unpaid) {
-            if (remain <= 0.005) break;
-            const due = Number(row[1]) || 0;
-            const rec0 = Number(row[2]) || 0;
-            const gap = Math.round((due - rec0) * 100) / 100;
-            if (gap <= 0.005) {
-                // 金额其实已够、只是状态没更新 ⇒ 仅补状态，避免重复加钱
-                await run("UPDATE sales_orders SET payment_status = '已结清' WHERE id = ?", [row[0]]);
-                continue;
+    /* ★ 2026-10-11 P5-2 事务化：修复前「INSERT 流水 / 改账户余额 / 逐单抵扣欠款」三条语句
+     *   各走一次连接、无事务 ⇒ 任一条失败都留半截账（流水记了余额没加、余额加了欠款没冲），
+     *   且因 run() 吞异常而回 ok:true ⇒ 账实不符且**看不见**。现整段进同一事务，失败整体回滚。 */
+    let usedAcc = accId;
+    try {
+        usedAcc = await withTx(async (tx) => {
+            let aid = accId;
+            if (!aid) {
+                aid = (await tx.q("SELECT id FROM accounts WHERE type = 'cash' LIMIT 1")).values?.[0]?.[0] || null;
             }
-            const pay = Math.min(remain, gap);
-            const newRec = Math.round((rec0 + pay) * 100) / 100;
-            const newOwe = Math.round(Math.max(0, due - newRec) * 100) / 100;
-            await run("UPDATE sales_orders SET received_amount = ?, owe_amount = ?, payment_status = ? WHERE id = ?",
-                [newRec, newOwe, newOwe <= 0.005 ? '已结清' : '未结清', row[0]]);
-            remain = Math.round((remain - pay) * 100) / 100;
-        }
+            if (!aid) {
+                aid = (await tx.q("SELECT id FROM accounts ORDER BY id LIMIT 1")).values?.[0]?.[0] || null;
+            }
+            if (!aid) {
+                // 见 runLastId 注释：INSERT 与「取刚插入的 id」必须同一条语句，否则连接池会话漂移会取到别的 id
+                aid = await tx.lastId("INSERT INTO accounts (name, type, balance) VALUES ('现金', 'cash', 0)");
+            }
+            aid = Number(aid);
+            /* ★★ 2026-10-11 P5-3（B0-3）两处改动，只为消除并发丢失更新与死锁，抵扣口径零改动：
+             *   ① 候选欠单查询加**行级排他锁**：并发"收欠款"在数据库侧排队，后到者读到的是
+             *      前一笔提交后的 rec/owe，而不是各自基于同一快照各写一遍。
+             *      实测（hongrui_ws48，5 笔并发各 ¥600 收同一客户的 3 张 ¥1000 欠单，跨 5 个账户）：
+             *        修复前 账户 +3000 而单据只核销 600（差额 2400、0 张结清）；
+             *        修复后 3000/3000 全结清（见 _diag/sprint/p5-b03-test.cjs）。
+             *   ② 把该语句**移到账户 UPDATE 之前**：全局加锁顺序统一为「先锁单据、后动账户」，
+             *      与销售单收款 / 付款登记同序 ⇒ 三条路径交叉并发不成环、不死锁。
+             *   【为什么"同账户"时不报错】实测同账户并发恰好正确：账户行的写锁把整个事务
+             *   串了起来。但这是**副作用**、不是设计 ⇒ 一旦并发落到不同账户（现金/微信/支付宝
+             *   各记一笔，很常见）就立刻丢账，故不能依赖它。 */
+            const unpaid = (pid && category !== '直接收款') ? (await tx.q(`SELECT id, COALESCE(receivable_amount, final_amount, 0) due,
+                    COALESCE(received_amount, 0) rec
+                FROM sales_orders
+                WHERE customer_id = ? AND COALESCE(payment_status,'') NOT IN ('已结清','作废')
+                ORDER BY id LIMIT 20 FOR UPDATE`, [pid])).values || [] : null;
+            await tx.run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name, order_number) VALUES ('income', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [aid, amt, cat, description, req.user.id, req.user.real_name, ptype, pid, pname, orderNumber]);
+            await tx.run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [amt, aid]);
+            // 冲减该客户欠款（2026-10-04 修复）：按金额逐单抵扣，并【同步三个金额字段】。
+            //   原实现只改 payment_status，不动 received_amount / owe_amount ⇒ 造出「已结清但欠款仍在」的
+            //   不自洽单；而界面状态只看 owe_amount（OrderManagement 的 isUnpaid = owe > 0.005）
+            //   ⇒ 少收的钱会被前台显示成「已收款」。故必须三字段一起改。
+            if (unpaid) {                 // 候选集已在锁内取好（见上方 FOR-UPDATE 段），此处只做分配
+                let remain = amt;
+                for (const row of unpaid) {
+                    if (remain <= 0.005) break;
+                    const due = Number(row[1]) || 0;
+                    const rec0 = Number(row[2]) || 0;
+                    const gap = Math.round((due - rec0) * 100) / 100;
+                    if (gap <= 0.005) {
+                        // 金额其实已够、只是状态没更新 ⇒ 仅补状态，避免重复加钱
+                        await tx.run("UPDATE sales_orders SET payment_status = '已结清' WHERE id = ?", [row[0]]);
+                        continue;
+                    }
+                    const pay = Math.min(remain, gap);
+                    const newRec = Math.round((rec0 + pay) * 100) / 100;
+                    const newOwe = Math.round(Math.max(0, due - newRec) * 100) / 100;
+                    await tx.run("UPDATE sales_orders SET received_amount = ?, owe_amount = ?, payment_status = ? WHERE id = ?",
+                        [newRec, newOwe, newOwe <= 0.005 ? '已结清' : '未结清', row[0]]);
+                    remain = Math.round((remain - pay) * 100) / 100;
+                }
+            }
+            return aid;
+        });
+    }
+    catch (e) {
+        console.error('[FIN-INCOME] 收款记账失败，已整体回滚:', e.message);
+        return res.status(500).json({
+            ok: false, code: 'INCOME_WRITE_FAILED',
+            error: '收款记账失败，本次操作未生效（已整体回滚）',
+            detail: String(e.message).slice(0, 200),
+        });
     }
     saveDB(); saveDB();
-    res.json({ ok: true, order_number: orderNumber });
+    res.json({ ok: true, order_number: orderNumber, account_id: usedAcc });
 });
-app.post('/api/finance/transactions/expense', authMiddleware, hasPerm('expense'), async (req, res) => {
+app.post('/api/finance/transactions/expense', authMiddleware, hasPerm('expense'), idem('tx-expense'), async (req, res) => {
     await initDB();
-    const { account_id, amount, category, description, supplier_id, supplier_name } = req.body;
-    let pid = supplier_id || null, pname = supplier_name || null, ptype = null;
+    const { account_id, amount, category, description, supplier_id, supplier_name } = req.body || {};
+    /* ★ 2026-10-11 P5-2：与收款同型加固（金额有限且 > 0；显式账户必须真实存在）。
+     *   修复前同样无校验 ⇒ `amount:null` 会把账户余额写成 NULL 且回 ok:true。 */
+    const amt = Number(amount);
+    if (!Number.isFinite(amt) || amt <= 0) {
+        return res.status(400).json({ ok: false, code: 'EXPENSE_BAD_AMOUNT', error: '付款金额必须是大于 0 的数字' });
+    }
+    let pid = supplier_id ? Number(supplier_id) : null, pname = supplier_name || null, ptype = null;
     if (!pid && pname) {
         const r = await safeExec("SELECT id FROM suppliers WHERE name = ? ORDER BY id LIMIT 1", [pname]);
-        if (r.values?.[0]?.[0]) pid = r.values[0][0];
+        if (r.values?.[0]?.[0]) pid = Number(r.values[0][0]);
     }
     if (pid) { ptype = 'supplier'; }
     else if (pname) { ptype = 'supplier'; }
-    // 账户兜底：优先前端指定 → 现金账户 → 任意账户 → 自动创建现金账户
-    let accId = account_id || null;
-    if (!accId) {
-        accId = (await safeExec("SELECT id FROM accounts WHERE type = 'cash' LIMIT 1")).values?.[0]?.[0] || null;
-    }
-    if (!accId) {
-        accId = (await safeExec("SELECT id FROM accounts ORDER BY id LIMIT 1")).values?.[0]?.[0] || null;
-    }
-    if (!accId) {
-        // 见 runLastId 注释：INSERT 与「取刚插入的 id」必须同一条语句，否则连接池会话漂移会取到别的 id
-        accId = await runLastId("INSERT INTO accounts (name, type, balance) VALUES ('现金', 'cash', 0)");
+    // 账户：显式指定 ⇒ 必须存在且未停用（400）；未指定 ⇒ 兜底（现金 → 任意 → 自动建现金账户）
+    let accId = (account_id != null && account_id !== '') ? Number(account_id) : null;
+    if (accId != null) {
+        const okAcc = (await safeExec("SELECT id FROM accounts WHERE id = ? AND COALESCE(status,1) = 1", [accId])).values?.[0]?.[0];
+        if (!okAcc) return res.status(400).json({ ok: false, code: 'EXPENSE_BAD_ACCOUNT', error: `账户 #${accId} 不存在或已停用` });
     }
     const cat = category || (pname ? '付欠款' : '直接付款');
     // 付款单号 FKD+YYYYMMDD+4位当日序号（对齐智慧记）
     const orderNumber = await generateOrderNumber('expense');
-    await run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name, order_number) VALUES ('expense', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [accId, amount, cat, description, req.user.id, req.user.real_name, ptype, pid, pname, orderNumber]);
-    await run("UPDATE accounts SET balance = balance - ? WHERE id = ?", [amount, accId]);
-    if (pid && category !== '直接付款') {
-        /* 冲减该供应商欠款（2026-10-04 修复，与销售侧「收欠款」同范式）：
-         * ① 判据统一：候选单改用「状态 + 业务日期」，结算由 owe 派生（老板拍板：欠款 ≤ 0 即已结清）；
-         * ② **抵扣基数改为实际欠款**：原实现拿 `total_amount`（单据全额）当应抵金额
-         *    ⇒ 一张 10,000 已付 8,000 的单，再付 2,000 也抵不掉，永久赖在「未结清」；
-         * ③ **同步 paid_amount / owe_amount**：原实现只写 payment_status ⇒ 造出「已结清但欠款仍在」
-         *    的不自洽单（与销售侧修复前的缺陷同型）。
-         * ④ 不变量：newPaid + newOwe 恒等于 due(=total_amount)，全库 515 张此式 0 违反，必须保住。
-         * 存量影响：0（见上，该路径此前从未真正落写过）。 */
-        const unpaid = (await safeExec(`SELECT id, COALESCE(total_amount,0) due, COALESCE(paid_amount,0) paid
-            FROM purchase_orders
-            WHERE supplier_id = ? AND COALESCE(payment_status,'') NOT IN ('已结清','作废') AND ${PO_ALIVE}
-            ORDER BY COALESCE(bill_date, substr(created_at,1,10)), id LIMIT 20`, [pid])).values || [];
-        // 按金额逐单抵扣：付款金额先抵最早的欠单，不足部分保持未结清
-        let remain = Number(amount) || 0;
-        for (const row of unpaid) {
-            if (remain <= 0.005) break;
-            const due = Number(row[1]) || 0;
-            const paid0 = Number(row[2]) || 0;
-            const gap = Math.round((due - paid0) * 100) / 100;
-            if (gap <= 0.005) {
-                // 金额其实已够、只是状态没更新 ⇒ 仅补状态，避免重复加钱
-                await run("UPDATE purchase_orders SET payment_status = '已结清' WHERE id = ?", [row[0]]);
-                continue;
+    /* ★ 2026-10-11 P5-2 事务化：INSERT 流水 / 扣账户余额 / 逐单抵扣应付 必须同生共死。 */
+    let usedAcc = accId;
+    try {
+        usedAcc = await withTx(async (tx) => {
+            let aid = accId;
+            if (!aid) {
+                aid = (await tx.q("SELECT id FROM accounts WHERE type = 'cash' LIMIT 1")).values?.[0]?.[0] || null;
             }
-            const pay = Math.min(remain, gap);
-            const newPaid = Math.round((paid0 + pay) * 100) / 100;
-            const newOwe = Math.round(Math.max(0, due - newPaid) * 100) / 100;
-            await run("UPDATE purchase_orders SET paid_amount = ?, owe_amount = ?, payment_status = ? WHERE id = ?",
-                [newPaid, newOwe, newOwe <= 0.005 ? '已结清' : '未结清', row[0]]);
-            remain = Math.round((remain - pay) * 100) / 100;
-        }
+            if (!aid) {
+                aid = (await tx.q("SELECT id FROM accounts ORDER BY id LIMIT 1")).values?.[0]?.[0] || null;
+            }
+            if (!aid) {
+                // 见 runLastId 注释：INSERT 与「取刚插入的 id」必须同一条语句，否则连接池会话漂移会取到别的 id
+                aid = await tx.lastId("INSERT INTO accounts (name, type, balance) VALUES ('现金', 'cash', 0)");
+            }
+            aid = Number(aid);
+            /* ★★ 2026-10-11 P5-3（B0-3）：与收款侧完全同型的加固（候选欠单加行级排他锁，
+             *   并把取候选集挪到账户写之前，统一「先锁单据、后动账户」的加锁顺序）。
+             *   实测（hongrui_ws48，5 笔并发各 ¥600 付同一供应商的 3 张 ¥1000 欠单）：
+             *     修复前 账户 −3000 而单据只核销 1200（差额 1800、仅 1/3 结清）⇒
+             *     付出去的钱在账上走了、应付却不减 ⇒ 供应商被重复付款。 */
+            const unpaid = (pid && category !== '直接付款') ? (await tx.q(`SELECT id, COALESCE(total_amount,0) due, COALESCE(paid_amount,0) paid
+                FROM purchase_orders
+                WHERE supplier_id = ? AND COALESCE(payment_status,'') NOT IN ('已结清','作废') AND ${PO_ALIVE}
+                ORDER BY COALESCE(bill_date, substr(created_at,1,10)), id LIMIT 20 FOR UPDATE`, [pid])).values || [] : null;
+            await tx.run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, party_type, party_id, party_name, order_number) VALUES ('expense', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [aid, amt, cat, description, req.user.id, req.user.real_name, ptype, pid, pname, orderNumber]);
+            await tx.run("UPDATE accounts SET balance = balance - ? WHERE id = ?", [amt, aid]);
+            if (unpaid) {                 // 候选集已在锁内取好（见上方段），此处只做分配
+                /* 冲减该供应商欠款（2026-10-04 修复，与销售侧「收欠款」同范式）：
+                 * ① 判据统一：候选单改用「状态 + 业务日期」，结算由 owe 派生（老板拍板：欠款 ≤ 0 即已结清）；
+                 * ② **抵扣基数改为实际欠款**：原实现拿 `total_amount`（单据全额）当应抵金额
+                 *    ⇒ 一张 10,000 已付 8,000 的单，再付 2,000 也抵不掉，永久赖在「未结清」；
+                 * ③ **同步 paid_amount / owe_amount**：原实现只写 payment_status ⇒ 造出「已结清但欠款仍在」
+                 *    的不自洽单（与销售侧修复前的缺陷同型）。
+                 * ④ 不变量：newPaid + newOwe 恒等于 due(=total_amount)，全库 515 张此式 0 违反，必须保住。
+                 * 存量影响：0（见上，该路径此前从未真正落写过）。 */
+
+                // 按金额逐单抵扣：付款金额先抵最早的欠单，不足部分保持未结清
+                let remain = amt;
+                for (const row of unpaid) {
+                    if (remain <= 0.005) break;
+                    const due = Number(row[1]) || 0;
+                    const paid0 = Number(row[2]) || 0;
+                    const gap = Math.round((due - paid0) * 100) / 100;
+                    if (gap <= 0.005) {
+                        // 金额其实已够、只是状态没更新 ⇒ 仅补状态，避免重复加钱
+                        await tx.run("UPDATE purchase_orders SET payment_status = '已结清' WHERE id = ?", [row[0]]);
+                        continue;
+                    }
+                    const pay = Math.min(remain, gap);
+                    const newPaid = Math.round((paid0 + pay) * 100) / 100;
+                    const newOwe = Math.round(Math.max(0, due - newPaid) * 100) / 100;
+                    await tx.run("UPDATE purchase_orders SET paid_amount = ?, owe_amount = ?, payment_status = ? WHERE id = ?",
+                        [newPaid, newOwe, newOwe <= 0.005 ? '已结清' : '未结清', row[0]]);
+                    remain = Math.round((remain - pay) * 100) / 100;
+                }
+            }
+            return aid;
+        });
+    }
+    catch (e) {
+        console.error('[FIN-EXPENSE] 付款记账失败，已整体回滚:', e.message);
+        return res.status(500).json({
+            ok: false, code: 'EXPENSE_WRITE_FAILED',
+            error: '付款记账失败，本次操作未生效（已整体回滚）',
+            detail: String(e.message).slice(0, 200),
+        });
     }
     saveDB(); saveDB();
-    res.json({ ok: true, order_number: orderNumber });
+    res.json({ ok: true, order_number: orderNumber, account_id: usedAcc });
 });
-app.post('/api/finance/transactions/transfer', authMiddleware, adminOnly, async (req, res) => {
+app.post('/api/finance/transactions/transfer', authMiddleware, adminOnly, idem('tx-transfer'), async (req, res) => {
     await initDB();
-    const { from_account_id, to_account_id, amount, description } = req.body;
+    const { from_account_id, to_account_id, amount, description } = req.body || {};
+    /* ★★ 2026-10-11 P5-2 入口硬校验：修复前**一条校验都没有**，而四条语句又是"扣款在前、入账在后"：
+     *   实测缺陷（隔离库）：`to_account_id:999999`（不存在）⇒ HTTP 200 `{ok:true}`，而
+     *     · `UPDATE accounts SET balance = balance - ? WHERE id = from` **照常扣款**；
+     *     · `UPDATE accounts SET balance = balance + ? WHERE id = 999999` 影响 **0 行**、不报错
+     *   ⇒ **钱从转出账户消失、没有任何入账**，且接口报"成功" ⇒ 直接造成账面资金不平。
+     *   故：金额必须「有限且 > 0」；两个账户都必须真实存在且未停用；转出 ≠ 转入。 */
+    const amt = Number(amount);
+    if (!Number.isFinite(amt) || amt <= 0) {
+        return res.status(400).json({ ok: false, code: 'TRANSFER_BAD_AMOUNT', error: '转账金额必须是大于 0 的数字' });
+    }
+    const fromId = Number(from_account_id), toId = Number(to_account_id);
+    if (!Number.isInteger(fromId) || fromId <= 0 || !Number.isInteger(toId) || toId <= 0) {
+        return res.status(400).json({ ok: false, code: 'TRANSFER_BAD_ACCOUNT', error: '转出/转入账户必须都是合法的账户 id' });
+    }
+    if (fromId === toId) {
+        return res.status(400).json({ ok: false, code: 'TRANSFER_SAME_ACCOUNT', error: '转出与转入账户不能是同一个' });
+    }
+    const pair = (await safeExec("SELECT id FROM accounts WHERE id IN (?, ?) AND COALESCE(status,1) = 1", [fromId, toId])).values || [];
+    const found = new Set(pair.map((r) => Number(r[0])));
+    const missing = [fromId, toId].filter((x) => !found.has(x));
+    if (missing.length) {
+        return res.status(400).json({ ok: false, code: 'TRANSFER_BAD_ACCOUNT', error: `账户不存在或已停用：#${missing.join(', #')}` });
+    }
     // 转账单号 DBD：一次转账产生两条流水（转出/转入），共用同一单号便于成对核对
     const transferNumber = await generateOrderNumber('transfer');
-    await run("INSERT INTO transactions (type, account_id, amount, description, operator_id, operator_name, order_number) VALUES ('transfer', ?, ?, ?, ?, ?, ?)", [from_account_id, amount, description, req.user.id, req.user.real_name, transferNumber]);
-    await run("UPDATE accounts SET balance = balance - ? WHERE id = ?", [amount, from_account_id]);
-    await run("INSERT INTO transactions (type, account_id, amount, description, operator_id, operator_name, order_number) VALUES ('transfer_in', ?, ?, ?, ?, ?, ?)", [to_account_id, amount, description, req.user.id, req.user.real_name, transferNumber]);
-    await run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [amount, to_account_id]);
+    /* ★ 2026-10-11 P5-2 事务化：4 条语句（2 记流水 + 2 改余额）必须同生共死。
+     *   修复前逐条 run() ⇒ 中途失败会留下"只扣不加"的半截转账（与上方的账户校验合并后，
+     *   这类残局此前只能靠人工对账发现）。 */
+    try {
+        await withTx(async (tx) => {
+            /* ★★ 2026-10-11 P5-3（B0-3）确定性加锁，消除反向并发死锁。
+             * 【缺陷实证】隔离库 hongrui_ws48：10 笔 A→B 与 10 笔 B→A 并发 ⇒ **19/20 失败**，
+             *   服务端 detail = "检测到死锁"，请求耗时呈 1s/2s/…/10s 阶梯（PG deadlock_timeout 1s 逐个级联）。
+             *   根因：下方 4 条语句是「转出账户 → 转入账户」，**加锁顺序随方向反转** ⇒
+             *     A→B 持 A 等 B、B→A 持 B 等 A ⇒ 循环等待成立。
+             *   （这是 P5-2 把转账事务化后**暴露**出来的：此前逐条 autocommit 不跨语句持锁、不会死锁，
+             *    代价却是"只扣不加"的半截转账 —— 两者都不对，故必须根治而不是回退事务。）
+             * 【修法】先用**单条语句 + ORDER BY id** 把两端账户按同一顺序锁住 ⇒ 两侧同序，
+             *   循环等待不可能成立。之后 4 条语句照旧执行（金额改动一字未变）。 */
+            await tx.q("SELECT id FROM accounts WHERE id IN (?, ?) ORDER BY id FOR UPDATE", [fromId, toId]);
+            await tx.run("INSERT INTO transactions (type, account_id, amount, description, operator_id, operator_name, order_number) VALUES ('transfer', ?, ?, ?, ?, ?, ?)", [fromId, amt, description, req.user.id, req.user.real_name, transferNumber]);
+            await tx.run("UPDATE accounts SET balance = balance - ? WHERE id = ?", [amt, fromId]);
+            await tx.run("INSERT INTO transactions (type, account_id, amount, description, operator_id, operator_name, order_number) VALUES ('transfer_in', ?, ?, ?, ?, ?, ?)", [toId, amt, description, req.user.id, req.user.real_name, transferNumber]);
+            await tx.run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [amt, toId]);
+        });
+    }
+    catch (e) {
+        console.error('[FIN-TRANSFER] 转账失败，已整体回滚:', e.message);
+        return res.status(500).json({
+            ok: false, code: 'TRANSFER_WRITE_FAILED',
+            error: '转账失败，本次操作未生效（已整体回滚）',
+            detail: String(e.message).slice(0, 200),
+        });
+    }
     saveDB();
     saveDB();
     res.json({ ok: true, order_number: transferNumber });
@@ -1896,6 +2813,13 @@ async function writeReversal(t, user, note) {
             user.id, user.real_name, t.order_number || null, t.id]
     );
     const revId = rev.values?.[0]?.[0] ?? null;
+    /* ★★ 2026-10-11 P5-4（P3-08）：冲销必须**幂等**。
+     *   【缺陷实证】修复前「先查是否已冲销」与「写冲销行」分属两次调用 ⇒ TOCTOU。
+     *     实测两个并发 DELETE 同一笔：**冲销行 2 条、余额多回滚 200**（钱凭空多出来）。
+     *   【修法】靠唯一索引 `uq_transactions_reverse_of`（reverse_of 非空时唯一）做互斥：
+     *     抢不到位的那一次拿不到 revId ⇒ **直接跳过余额回滚**并向上声明「已被冲销」。
+     *     不再依赖任何先读后写的检查。 */
+    if (revId === null) return { reversalId: null, delta: 0, dup: true };
     await run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [delta, t.account_id]);
     // PG 的 BIGINT 经驱动回来是**字符串** ⇒ 回执里统一成数字，避免前端 `id === 10031` 恒为 false
     return { reversalId: revId == null ? null : Number(revId), delta };
@@ -1921,6 +2845,9 @@ app.delete('/api/finance/transactions/:id', authMiddleware, adminOnly, async (re
     const reversals = [];
     for (const x of targets) {
         const r = await writeReversal(x, req.user, '(删除)');
+        /* ★★ P5-4（P3-08）：并发下抢不到冲销位的那一次，不能当成功。
+         *   已完成的冲销不可回滚：若此前已有一欔落账，本次必须整体告知「已被冲销」而不是报成功。 */
+        if (r.dup) return res.status(409).json({ ok: false, code: 'TX_ALREADY_REVERSED', rejected: true, error: `流水 #${x.id} 已被（并发的）另一次操作冲销过，本次未重复回滚余额。请刷新后查看当前状态。` });
         rolledBack = Math.round((rolledBack + Math.abs(x.amount)) * 100) / 100;
         reversals.push({ of: x.id, reversal_id: r.reversalId, account_id: Number(x.account_id), amount: -x.amount, balance_delta: r.delta });
     }
@@ -1956,6 +2883,8 @@ app.put('/api/finance/transactions/:id', authMiddleware, adminOnly, async (req, 
     const sign = TX_NET_SIGN[t.type];
     // ① 冲销原行
     const rv = await writeReversal(t, req.user, '(编辑重记)');
+    /* ★ P5-4（P3-08）：同 DELETE 路径，抢不到冲销位则不得继续记新行（否则余额会只加不减）。 */
+    if (rv.dup) return res.status(409).json({ ok: false, code: 'TX_ALREADY_REVERSED', rejected: true, error: `流水 #${t.id} 已被（并发的）另一次操作冲销过，本次编辑未生效。` });
     // ② 按新值记一条新行，原单号沿用（对账时同一单号可见完整改前/改后链）
     const ins = await safeExec(
         "INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, order_number, party_type, party_id, party_name, revised_from) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
@@ -1975,8 +2904,10 @@ app.put('/api/finance/transactions/:id', authMiddleware, adminOnly, async (req, 
 });
 app.get('/api/finance/overview', authMiddleware, hasPerm('finance_view'), async (_req, res) => {
     await initDB();
-    const today = new Date().toISOString().slice(0, 10);
-    const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10);
+    // P4（2026-10-11 时区统一）：原 `toISOString()` 取 UTC 日 / `new Date(y,m,1).toISOString()` 在 GMT+8 下
+    // 会退到上月最后一天（实测 2026-09-30 ≠ 10-01）⇒ 改走北京口径唯一真源。
+    const today = bjToday();
+    const monthStart = bjMonthStart(0);
     // ★ 性能（2026-10-04）：原 4 次聚合 + 1 次账户列表 = 5 次顺序往返 ⇒ 合并为 1 次
     const S = await scalars([
         { key: 'today_income', sql: `SELECT COALESCE(SUM(amount),0) FROM transactions WHERE type='income' AND date(created_at) = '${today}'` },
@@ -2041,8 +2972,9 @@ app.get('/api/finance/reconciliation', authMiddleware, hasPerm('reconciliation')
 // ==================== ANALYSIS ====================
 app.get('/api/analysis/dashboard', authMiddleware, async (req, res) => {
     await initDB();
-    const today = new Date().toISOString().slice(0, 10);
-    const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10);
+    // P4（2026-10-11 时区统一）：改走北京口径唯一真源（详见 BJ-TIME 块注释）。
+    const today = bjToday();
+    const monthStart = bjMonthStart(0);
     // 数据权限：所有账号统计全店数据（对齐智慧记云端默认，管理员开单成员也可查看）
     const scopeSql = '';
     // 排除作废单（对齐智慧记：作废单不计入统计）
@@ -2054,16 +2986,21 @@ app.get('/api/analysis/dashboard', authMiddleware, async (req, res) => {
     const S = await scalars([
         { key: 'todaySales', sql: `SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE substr(COALESCE(bill_date, created_at),1,10)='${today}'${scopeSql}${VOID}` },
         { key: 'todayExpense', sql: `SELECT COALESCE(SUM(amount),0) FROM transactions WHERE type='expense' AND date(created_at)='${today}'${scopeSql}` },
-        { key: 'todayCost', sql: `SELECT COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id=so.id JOIN products p ON oi.product_id=p.id WHERE substr(COALESCE(so.bill_date, so.created_at),1,10)='${today}'${scopeSql}${VOID_SO}` },
+        { key: 'todayCost', sql: `SELECT COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * ${COST_UNIT_SQL}),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id=so.id JOIN products p ON oi.product_id=p.id WHERE substr(COALESCE(so.bill_date, so.created_at),1,10)='${today}'${scopeSql}${VOID_SO}` },
         { key: 'todayOrders', sql: `SELECT COUNT(*) FROM sales_orders WHERE substr(COALESCE(bill_date, created_at),1,10)='${today}'${scopeSql}${VOID}` },
         { key: 'warningCount', sql: `SELECT COUNT(*) FROM products WHERE stock_quantity <= warning_quantity AND status=1` },
         { key: 'monthSales', sql: `SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE substr(COALESCE(bill_date, created_at),1,10) >= '${monthStart}'${scopeSql}${VOID}` },
-        { key: 'monthCost', sql: `SELECT COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id=so.id JOIN products p ON oi.product_id=p.id WHERE substr(COALESCE(so.bill_date, so.created_at),1,10) >= '${monthStart}'${scopeSql}${VOID_SO}` },
+        { key: 'monthCost', sql: `SELECT COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * ${COST_UNIT_SQL}),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id=so.id JOIN products p ON oi.product_id=p.id WHERE substr(COALESCE(so.bill_date, so.created_at),1,10) >= '${monthStart}'${scopeSql}${VOID_SO}` },
         /* ★ 原 arSum/arCnt/apSum/apCnt 四个标量已【移除】（2026-10-08）。
          *   它们算的是 `SUM(owe_amount)`＝「未结清单据合计」，不是应收：
          *     · 旧结果 ¥2,107,243.20（1103 单） vs 对账页 ¥487,404.60（186 家）
          *     · 智慧记自身旁证：单据 owe 合计 ¥1,961,049 vs 客户 cur_amt 合计 ¥460,668
          *   ⇒ 应收/应付的唯一真源改为下面的 computeArap()（与 /finance/arap 同一函数）。 */
+        /* ★ P2（2026-10-11）成本完整性：逐明细行问「这一行有没有成本价」。
+         *   与上面 todayCost/monthCost 同一次往返（合并进同一条 SQL），零额外 RTT。 */
+        ...costIntegritySql(`substr(COALESCE(so.bill_date, so.created_at),1,10)='${today}'`, `${scopeSql}${VOID_SO}`),
+        ...costIntegritySql(`substr(COALESCE(so.bill_date, so.created_at),1,10) >= '${monthStart}'`, `${scopeSql}${VOID_SO}`)
+            .map((x) => ({ ...x, key: 'm_' + x.key })),
     ]);
     const N = (v) => Number(v || 0);
     const todaySales = N(S.todaySales), todayCost = N(S.todayCost), monthSales = N(S.monthSales), monthCost = N(S.monthCost);
@@ -2072,10 +3009,40 @@ app.get('/api/analysis/dashboard', authMiddleware, async (req, res) => {
      *   属于「看似真值的错」，比不返回更坏。顺带省掉一次 computeArap() 全表往返。 */
     const canDebt = parsePerms(req.user).includes('debt_view');
     const arap = canDebt ? await computeArap() : null;
+    /* P2（2026-10-11）成本完整性：今日窗 + 本月窗，原样暴露给前端。
+     * ★ 只加字段、不改任何旧字段（todayProfit 等一律保持原值），前端可独立发布。 */
+    const ciToday = costIntegrityOut(S, N);
+    const ciMonth = costIntegrityOut({
+        costTotalRows: S.m_costTotalRows, costItemRows: S.m_costItemRows, costFallbackRows: S.m_costFallbackRows,
+        costMissingRows: S.m_costMissingRows, costMissingQty: S.m_costMissingQty,
+        costMissingAmount: S.m_costMissingAmount,
+    }, N);
     res.json({
         todaySales, todayExpense: N(S.todayExpense), todayCost, todayProfit: todaySales - todayCost,
         todayOrders: N(S.todayOrders), warningCount: N(S.warningCount), monthSales,
         monthCost, monthProfit: monthSales - monthCost,
+        /* —— 成本完整性（只加字段）——
+         * costBasis: 'historical' 全部用开单当时进价（最可信）
+         *            | 'mixed' 部分行回退档案价 | 'all_fallback' 历史价全不可用
+         *            | 'current'/'current_partial' 旧口径（行级列尚未迁移）
+         *            | 'none' 窗口内无成本明细行
+         * 前端判据用 costMissingRows（**逐明细行**判定），
+         * ★ 不要再用 `!todayCost`（无销售时误报）或 `todaySales>0`（部分缺失时漏报）。 */
+        costBasis: ciToday.basis,
+        costComplete: ciToday.complete,
+        costPartitioned: ciToday.partitioned,
+        costTotalRows: ciToday.total_rows,
+        costHistoricRows: ciToday.historic_rows,
+        costItemRows: ciToday.historic_rows,
+        costFallbackRows: ciToday.fallback_rows,
+        costMissingRows: ciToday.missing_rows,
+        costMissingQty: ciToday.missing_qty,
+        costMissingAmount: ciToday.missing_amount,
+        monthCostBasis: ciMonth.basis,
+        monthCostComplete: ciMonth.complete,
+        monthCostMissingRows: ciMonth.missing_rows,
+        monthCostMissingAmount: ciMonth.missing_amount,
+        monthCostFallbackRows: ciMonth.fallback_rows,
         ...(canDebt ? {
             receivable: arap.summary.total_receivable,
             unpaidCount: arap.summary.receivable_parties,   // 语义修正：家数（原为"未结清单数"）
@@ -2132,7 +3099,7 @@ app.get('/api/analysis/sales', authMiddleware, hasPerm('sales_stats'), async (re
         condIt.push(`${BDS} <= '${String(end_date).replace(/'/g, "''")}'`);
     const costRows = (await safeExec(`
     SELECT ${P_IT} as period,
-           COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price),0) as cost,
+           COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * ${COST_UNIT_SQL}),0) as cost,
            COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity),0) as qty
     FROM sales_order_items oi
     JOIN sales_orders so ON oi.order_id = so.id
@@ -2202,9 +3169,10 @@ app.get('/api/analysis/sales/top-products', authMiddleware, hasPerm('sales_stats
     await initDB();
     const days = Math.min(Math.max(Number(req.query.days) || 30, 1), 3650);
     const limit = Math.min(Math.max(Number(req.query.limit) || 10, 1), 200);
+    // P4：近 N 天起始日改走北京口径（原 UTC ⇒ 早 8 点前窗口整体前移一天）
     const startDate = req.query.start_date
         ? String(req.query.start_date)
-        : new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+        : bjDaysAgo(days);
     const endDate = req.query.end_date ? String(req.query.end_date) : '';
     const cond = [
         "COALESCE(so.bill_date, substr(so.created_at,1,10)) >= '" + startDate.replace(/'/g, "''") + "'",
@@ -2216,7 +3184,7 @@ app.get('/api/analysis/sales/top-products', authMiddleware, hasPerm('sales_stats
     SELECT p.name, p.sku,
            SUM(${COST_SIGN_SQL} * oi.quantity) as total_qty,
            SUM(${COST_SIGN_SQL} * oi.amount)   as total_amount,
-           SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price) as total_cost,
+           SUM(${COST_SIGN_SQL} * oi.quantity * ${COST_UNIT_SQL}) as total_cost,
            COUNT(DISTINCT so.id) as order_count
     FROM sales_order_items oi
     JOIN sales_orders so ON oi.order_id = so.id
@@ -2380,8 +3348,9 @@ app.get('/api/analysis/inventory', authMiddleware, hasPerm('sales_stats'), async
 });
 app.get('/api/analysis/profit', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
     await initDB();
-    const today = new Date().toISOString().slice(0, 10);
-    const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10);
+    // P4（2026-10-11 时区统一）：改走北京口径唯一真源（详见 BJ-TIME 块注释）。
+    const today = bjToday();
+    const monthStart = bjMonthStart(0);
     // 数据权限：员工只统计自己的销售单（管理员/店长看全店）
     const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
     const scopeSql = ''; // 全店可见
@@ -2393,13 +3362,17 @@ app.get('/api/analysis/profit', authMiddleware, hasPerm('sales_stats'), async (r
     const S = await scalars([
         { key: 'todaySales', sql: `SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE substr(COALESCE(bill_date, created_at),1,10)='${today}'${scopeSql}${VOID}` },
         // 成本口径修正：退货单（biz_type='sale_return'）收入为负、成本必须同步取负，否则成本率会被虚增
-        { key: 'todayCost', sql: `SELECT COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE substr(COALESCE(so.bill_date, so.created_at),1,10)='${today}'${scopeSql}${VOID_SO}` },
+        { key: 'todayCost', sql: `SELECT COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * ${COST_UNIT_SQL}),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE substr(COALESCE(so.bill_date, so.created_at),1,10)='${today}'${scopeSql}${VOID_SO}` },
         { key: 'monthSales', sql: `SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE substr(COALESCE(bill_date, created_at),1,10) >= '${monthStart}'${scopeSql}${VOID}` },
-        { key: 'monthCost', sql: `SELECT COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE substr(COALESCE(so.bill_date, so.created_at),1,10) >= '${monthStart}'${scopeSql}${VOID_SO}` },
+        { key: 'monthCost', sql: `SELECT COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * ${COST_UNIT_SQL}),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE substr(COALESCE(so.bill_date, so.created_at),1,10) >= '${monthStart}'${scopeSql}${VOID_SO}` },
         { key: 'todayOtherIncome', sql: other('income', `='${today}'`) },
         { key: 'todayOtherExpense', sql: other('expense', `='${today}'`) },
         { key: 'monthOtherIncome', sql: other('income', `>= '${monthStart}'`) },
         { key: 'monthOtherExpense', sql: other('expense', `>= '${monthStart}'`) },
+        // ★ P2（2026-10-11）成本完整性（今日窗 + 本月窗），零额外往返
+        ...costIntegritySql(`substr(COALESCE(so.bill_date, so.created_at),1,10)='${today}'`, `${scopeSql}${VOID_SO}`),
+        ...costIntegritySql(`substr(COALESCE(so.bill_date, so.created_at),1,10) >= '${monthStart}'`, `${scopeSql}${VOID_SO}`)
+            .map((x) => ({ ...x, key: 'm_' + x.key })),
     ]);
     const todaySales = Number(S.todaySales || 0), todayCost = Number(S.todayCost || 0);
     const monthSales = Number(S.monthSales || 0), monthCost = Number(S.monthCost || 0);
@@ -2409,12 +3382,11 @@ app.get('/api/analysis/profit', authMiddleware, hasPerm('sales_stats'), async (r
     // (1) 近 12 个月序列：销售额 / 成本 / 毛利 / 其他收支 / 净利润
     const BD = "substr(COALESCE(bill_date, created_at),1,7)";
     const BDS = "substr(COALESCE(so.bill_date, so.created_at),1,7)";
-    const m12 = new Date(new Date().getFullYear(), new Date().getMonth() - 11, 1);
-    const start12 = `${m12.getFullYear()}-${String(m12.getMonth() + 1).padStart(2, '0')}`;
+    // P4：近 12 个月序列改走北京口径（原用本机 getFullYear/getMonth ⇒ UTC 主机上跨月会错位一个月）
+    const start12 = bjMonthStart(-11).slice(0, 7);
     const months12 = [];
     for (let i = 11; i >= 0; i--) {
-        const d = new Date(new Date().getFullYear(), new Date().getMonth() - i, 1);
-        months12.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
+        months12.push(bjMonthStart(-i).slice(0, 7));
     }
     // ★ 性能（2026-10-04）：三条 GROUP BY 互不依赖 ⇒ 并发（wall 从 3×RTT 降到 1×RTT）
     const [saleRes, costRes, otherRes] = await Promise.all([
@@ -2426,7 +3398,7 @@ app.get('/api/analysis/profit', authMiddleware, hasPerm('sales_stats'), async (r
       WHERE COALESCE(payment_status,'') <> '作废' AND ${BD} >= '${start12}'
       GROUP BY ym`),
         safeExec(`
-      SELECT ${BDS} ym, COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price),0) cost
+      SELECT ${BDS} ym, COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * ${COST_UNIT_SQL}),0) cost
       FROM sales_order_items oi
       JOIN sales_orders so ON oi.order_id = so.id
       JOIN products p ON oi.product_id = p.id
@@ -2479,14 +3451,14 @@ app.get('/api/analysis/profit', authMiddleware, hasPerm('sales_stats'), async (r
     SELECT p.name, p.sku,
            SUM(${COST_SIGN_SQL} * oi.quantity) as qty,
            SUM(${COST_SIGN_SQL} * oi.amount) as amount,
-           SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price) as cost,
-           SUM(${COST_SIGN_SQL} * oi.amount) - SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price) as profit
+           SUM(${COST_SIGN_SQL} * oi.quantity * ${COST_UNIT_SQL}) as cost,
+           SUM(${COST_SIGN_SQL} * oi.amount) - SUM(${COST_SIGN_SQL} * oi.quantity * ${COST_UNIT_SQL}) as profit
     FROM sales_order_items oi
     JOIN sales_orders so ON oi.order_id = so.id
     JOIN products p ON oi.product_id = p.id
     WHERE ${lpCond.join(' AND ')}
     GROUP BY p.id, p.name, p.sku
-    HAVING SUM(${COST_SIGN_SQL} * oi.amount) - SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price) < 0
+    HAVING SUM(${COST_SIGN_SQL} * oi.amount) - SUM(${COST_SIGN_SQL} * oi.quantity * ${COST_UNIT_SQL}) < 0
     ORDER BY profit ASC LIMIT 20`)).values || []).map((r) => {
         const amount = R2(r[3]), cost = R2(r[4]), profit = R2(r[5]);
         return {
@@ -2504,7 +3476,7 @@ app.get('/api/analysis/profit', authMiddleware, hasPerm('sales_stats'), async (r
         const BDd = "substr(COALESCE(bill_date, created_at),1,10)";
         const BDSd = "substr(COALESCE(so.bill_date, so.created_at),1,10)";
         const rSale = Number((await safeExec(`SELECT COALESCE(SUM(final_amount),0) FROM sales_orders WHERE COALESCE(payment_status,'') <> '作废' AND ${BDd} >= '${sd}' AND ${BDd} <= '${ed}'`)).values?.[0]?.[0] || 0);
-        const rCost = Number((await safeExec(`SELECT COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE COALESCE(so.payment_status,'') <> '作废' AND ${BDSd} >= '${sd}' AND ${BDSd} <= '${ed}'`)).values?.[0]?.[0] || 0);
+        const rCost = Number((await safeExec(`SELECT COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * ${COST_UNIT_SQL}),0) FROM sales_order_items oi JOIN sales_orders so ON oi.order_id = so.id JOIN products p ON oi.product_id = p.id WHERE COALESCE(so.payment_status,'') <> '作废' AND ${BDSd} >= '${sd}' AND ${BDSd} <= '${ed}'`)).values?.[0]?.[0] || 0);
         const rOther = (await safeExec(`SELECT type, COALESCE(SUM(amount),0) FROM transactions WHERE (category LIKE '其他%' OR category LIKE '%其他%') AND date(created_at) >= '${sd}' AND date(created_at) <= '${ed}' GROUP BY type`)).values || [];
         let rOi = 0, rOe = 0;
         for (const x of rOther) {
@@ -2521,6 +3493,12 @@ app.get('/api/analysis/profit', authMiddleware, hasPerm('sales_stats'), async (r
             gross_margin: rSale > 0 ? Math.round(((rSale - rCost) / rSale) * 10000) / 100 : 0,
         };
     }
+    const ciTodayP = costIntegrityOut(S, Number);
+    const ciMonthP = costIntegrityOut({
+        costTotalRows: S.m_costTotalRows, costItemRows: S.m_costItemRows, costFallbackRows: S.m_costFallbackRows,
+        costMissingRows: S.m_costMissingRows, costMissingQty: S.m_costMissingQty,
+        costMissingAmount: S.m_costMissingAmount,
+    }, Number);
     res.json({
         today_sales: todaySales, today_cost: todayCost, today_profit: todaySales - todayCost,
         today_other_income: todayOtherIncome, today_other_expense: todayOtherExpense,
@@ -2533,6 +3511,22 @@ app.get('/api/analysis/profit', authMiddleware, hasPerm('sales_stats'), async (r
         month_income: monthSales, month_expense: monthCost,
         today_gross_margin: todaySales > 0 ? Math.round(((todaySales - todayCost) / todaySales) * 10000) / 100 : 0,
         month_gross_margin: monthSales > 0 ? Math.round(((monthSales - monthCost) / monthSales) * 10000) / 100 : 0,
+        /* ★ P2（2026-10-11）成本完整性 —— 只加字段，不改任何既有金额/毛利率字段。
+         * 前端提示必须用 cost_missing_rows（逐明细行），不要用 today_sales>0 之类近似判据。 */
+        cost_basis: ciTodayP.basis,
+        cost_complete: ciTodayP.complete,
+        cost_partitioned: ciTodayP.partitioned,
+        cost_total_rows: ciTodayP.total_rows,
+        cost_historic_rows: ciTodayP.historic_rows,
+        cost_fallback_rows: ciTodayP.fallback_rows,
+        cost_missing_rows: ciTodayP.missing_rows,
+        cost_missing_qty: ciTodayP.missing_qty,
+        cost_missing_amount: ciTodayP.missing_amount,
+        month_cost_basis: ciMonthP.basis,
+        month_cost_complete: ciMonthP.complete,
+        month_cost_missing_rows: ciMonthP.missing_rows,
+        month_cost_missing_amount: ciMonthP.missing_amount,
+        month_cost_fallback_rows: ciMonthP.fallback_rows,
         monthly,
         loss_products,
         range,
@@ -2556,11 +3550,10 @@ app.get('/api/analysis/performance', authMiddleware, hasPerm('performance'), asy
     await initDB();
     const isAdmin = req.user && req.user.role !== 'employee';
     const { start_date, end_date } = req.query;
-    const now = new Date();
-    const ym = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-    const monthStart = `${ym(now)}-01`;
+    // P4：默认窗口改走北京口径（本月首日 + 北京今天）
+    const monthStart = bjMonthStart(0);
     const defStart = start_date ? String(start_date) : monthStart;
-    const defEnd = end_date ? String(end_date) : now.toISOString().slice(0, 10);
+    const defEnd = end_date ? String(end_date) : bjToday();
     const END = defEnd + ' 23:59:59';
     const R2 = (n) => Math.round(Number(n || 0) * 100) / 100;
     // 归属键（名称优先、ID 兜底）—— 三处查询必须用完全相同的表达式，否则分组对不上
@@ -2616,7 +3609,7 @@ app.get('/api/analysis/performance', authMiddleware, hasPerm('performance'), asy
         safeExec(`
     SELECT ${NAME_KEY} as op_name,
            COALESCE(SUM(oi.quantity),0) as qty,
-           COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * p.cost_price),0) as cost
+           COALESCE(SUM(${COST_SIGN_SQL} * oi.quantity * ${COST_UNIT_SQL}),0) as cost
     FROM sales_order_items oi
     JOIN sales_orders so ON oi.order_id = so.id
     LEFT JOIN users u ON u.id = so.operator_id
@@ -2725,15 +3718,14 @@ app.get('/api/analysis/performance', authMiddleware, hasPerm('performance'), asy
 // ==================== 生产需求分析（按厂/客户的需求情况与月度经营建议） ====================
 app.get('/api/analysis/demand', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
     await initDB();
-    const now = new Date();
     // 数据权限：员工只看自己的销售单（管理员/店长看全店）
     const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
     const scopeSql = ''; // 全店可见
-    // 本地时间 YYYY-MM（不能用 toISOString，UTC 会偏移月份）
-    const ymOf = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-    const curYM = ymOf(now); // 当月 YYYY-MM
+    // P4（2026-10-11 时区统一）：原用本机 getFullYear/getMonth（在 UTC 主机上跨月会错位一个月）
+    // ⇒ 改走北京口径唯一真源。
+    const curYM = bjMonthStart(0).slice(0, 7); // 当月 YYYY-MM（北京）
     // 历史起点：11 个月前的第一天（共12个月窗口）
-    const startDate = `${new Date(now.getFullYear(), now.getMonth() - 11, 1).getFullYear()}-${String(new Date(now.getFullYear(), now.getMonth() - 11, 1).getMonth() + 1).padStart(2, '0')}-01`;
+    const startDate = bjMonthStart(-11);
     // ---- 1) 客户需求：按 客户×月份 聚合近12个月正金额销售 ----
     const custRows = (await safeExec(`
     SELECT customer_name, substr(COALESCE(bill_date, created_at),1,7) as ym, COUNT(*) as cnt, SUM(final_amount) as amt
@@ -2749,10 +3741,10 @@ app.get('/api/analysis/demand', authMiddleware, hasPerm('sales_stats'), async (r
             byCust[name] = {};
         byCust[name][ym] = { cnt: Number(r[2] || 0), amt: Number(r[3] || 0) };
     }
-    // 生成近12个月的月份列表（升序）
+    // 生成近12个月的月份列表（升序）· P4：改走北京口径
     const months = [];
     for (let i = 11; i >= 0; i--) {
-        months.push(ymOf(new Date(now.getFullYear(), now.getMonth() - i, 1)));
+        months.push(bjMonthStart(-i).slice(0, 7));
     }
     const customers = Object.keys(byCust)
         .map((name) => {
@@ -2831,8 +3823,10 @@ app.get('/api/analysis/demand', authMiddleware, hasPerm('sales_stats'), async (r
     const lastMonth = trend[trend.length - 1].amount;
     const prevMonth = trend.length > 1 ? trend[trend.length - 2].amount : lastMonth;
     // 当月可能还没过完：按已过天数折算为全月预估，避免"半月比全月"的假性下跌
-    const curMonthFull = trend[trend.length - 1].month === curYM ? new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate() : 1;
-    const curDay = now.getDate();
+    // P4：原引用 `new Date(now.getFullYear(), now.getMonth()+1, 0).getDate()` / `now.getDate()`
+    // ⇒ 改走北京口径（顺带修掉 now 未声明的问题）。
+    const curMonthFull = trend[trend.length - 1].month === curYM ? Number(bjMonthEnd(0).slice(8, 10)) : 1;
+    const curDay = Number(bjToday().slice(8, 10));
     const curMonthEst = curMonthFull > 0 ? Math.round((lastMonth / curDay) * curMonthFull * 100) / 100 : lastMonth;
     const monthTrendPct = prevMonth > 0 ? Math.round(((curMonthEst - prevMonth) / prevMonth) * 100) : 0;
     // 建议文案
@@ -2900,15 +3894,21 @@ app.get('/api/store/roles', authMiddleware, hasPerm('employees'), async (_req, r
     const result = await safeExec("SELECT * FROM roles ORDER BY id");
     res.json(result.values || []);
 });
-app.get('/api/store/suppliers', authMiddleware, hasPerm('suppliers'), async (_req, res) => {
+app.get('/api/store/suppliers', authMiddleware, hasPerm('suppliers'), async (req, res) => {
     await initDB();
-    const result = await safeExec("SELECT * FROM suppliers ORDER BY id");
+    /* ★ 2026-10-11（P3）：同 customers。注：本路由改动前**既不返回 status 也不做状态过滤**
+       ⇒ 软删除（status=0）的供应商一直混在在用列表里。此处一并对齐：
+       默认只出 status=1，include_stopped=1 时全出并带 status 供前端标注。
+       实测「+6 户」全部是 status=1（含 5 个双角色实体）⇒ 默认分支结果与改动前一致。 */
+    const includeStopped = String(req.query.include_stopped) === '1';
+    const result = await safeExec("SELECT * FROM suppliers" + (includeStopped ? "" : " WHERE status=1") + " ORDER BY id");
     const list = (result.values || []).map((s) => ({
-        id: Number(s[0]), name: s[1], contact: s[2], phone: s[3], address: s[4], remark: s[5]
+        id: Number(s[0]), name: s[1], contact: s[2], phone: s[3], address: s[4], remark: s[5],
+        status: Number(s[6]) || 0
     }));
     res.json(list);
 });
-app.post('/api/store/suppliers', authMiddleware, hasPerm('suppliers'), async (req, res) => {
+app.post('/api/store/suppliers', authMiddleware, hasPerm('suppliers'), idem('suppliers'), async (req, res) => {
     await initDB();
     const { name, contact, phone, address, remark } = req.body;
     await run("INSERT INTO suppliers (name, contact, phone, address, remark) VALUES (?, ?, ?, ?, ?)", [name, contact, phone, address, remark]);
@@ -2926,6 +3926,22 @@ app.put('/api/store/suppliers/:id', authMiddleware, hasPerm('suppliers'), async 
     saveDB();
     res.json({ ok: true });
 });
+// 供应商 停用 / 启用（同客户，2026-10-11 P3）
+app.put('/api/store/suppliers/:id/status', authMiddleware, hasPerm('suppliers'), async (req, res) => {
+    await initDB();
+    const { id } = req.params;
+    const next = Number((req.body || {}).status);
+    if (![1, 2].includes(next)) {
+        return res.status(400).json({ error: 'status 只允许 1（在用）或 2（停用）' });
+    }
+    const row = (await safeExec("SELECT id FROM suppliers WHERE id = ?", [id])).values?.[0];
+    if (!row) {
+        return res.status(404).json({ error: '供应商不存在' });
+    }
+    await run("UPDATE suppliers SET status = ? WHERE id = ?", [next, id]);
+    saveDB();
+    res.json({ ok: true, id: Number(id), status: next });
+});
 // 删除供应商（软删除：status=0，保留历史引用）
 app.delete('/api/store/suppliers/:id', authMiddleware, hasPerm('suppliers'), async (req, res) => {
     await initDB();
@@ -2938,15 +3954,22 @@ app.delete('/api/store/suppliers/:id', authMiddleware, hasPerm('suppliers'), asy
     saveDB();
     res.json({ ok: true });
 });
-app.get('/api/store/customers', authMiddleware, hasPerm('customers'), async (_req, res) => {
+app.get('/api/store/customers', authMiddleware, hasPerm('customers'), async (req, res) => {
     await initDB();
-    const result = await safeExec("SELECT * FROM customers WHERE status=1 ORDER BY id");
+    /* ★ 2026-10-11（P3）：与智慧记同口径 —— 默认隐藏「已停用」（status=2），
+       显式 include_stopped=1 时全部返回，由前端标注「已停用」并给「启用」入口。
+       照 /api/inventory/products（:1067-1071）的既有范式，**不改默认行为**：
+       迁移前全库 status 只有 1，因此默认分支的结果与改动前逐字一致。
+       ⚠ 必须与「导入器映射源 status」同批上线：只映射不加这个开关 ⇒ 44 户一进列表就消失。 */
+    const includeStopped = String(req.query.include_stopped) === '1';
+    const result = await safeExec("SELECT * FROM customers" + (includeStopped ? "" : " WHERE status=1") + " ORDER BY id");
     const list = (result.values || []).map((c) => ({
-        id: Number(c[0]), name: c[1], phone: c[2], address: c[3], contact: c[4], remark: c[5], status: c[6], created_at: c[7], price_level: c[8] || 'retail'
+        id: Number(c[0]), name: c[1], phone: c[2], address: c[3], contact: c[4], remark: c[5],
+        status: Number(c[6]) || 0, created_at: c[7], price_level: c[8] || 'retail'
     }));
     res.json(list);
 });
-app.post('/api/store/customers', authMiddleware, hasPerm('customers'), async (req, res) => {
+app.post('/api/store/customers', authMiddleware, hasPerm('customers'), idem('customers'), async (req, res) => {
     await initDB();
     const { name, phone, address, contact, remark, price_level } = req.body;
     await run("INSERT INTO customers (name, phone, address, contact, remark, price_level) VALUES (?, ?, ?, ?, ?, ?)", [name, phone, address, contact, remark, price_level || 'retail']);
@@ -2958,10 +3981,37 @@ app.put('/api/store/customers/:id', authMiddleware, hasPerm('customers'), async 
     await initDB();
     const { id } = req.params;
     const { name, phone, address, contact, remark, price_level, status } = req.body;
-    await run("UPDATE customers SET name=?, phone=?, address=?, contact=?, remark=?, price_level=?, status=? WHERE id=?", [name, phone, address, contact, remark, price_level || 'retail', status !== undefined ? status : 1, id]);
+    /* ★ 2026-10-11（P3）必须同批改：原实现 `status !== undefined ? status : 1`
+       ⇒ 调用方没传 status（编辑表单就是这种情况）就**把当前状态重置为 1**
+       ⇒ 引入 status=2（停用）后，「编辑一个停用客户」会**静默把它改回在用**。
+       改为：未传 status 时**不写该列**，保持库中现值（既不复活停用，也不复活软删除）。 */
+    if (status === undefined) {
+        await run("UPDATE customers SET name=?, phone=?, address=?, contact=?, remark=?, price_level=? WHERE id=?", [name, phone, address, contact, remark, price_level || 'retail', id]);
+    } else {
+        await run("UPDATE customers SET name=?, phone=?, address=?, contact=?, remark=?, price_level=?, status=? WHERE id=?", [name, phone, address, contact, remark, price_level || 'retail', status, id]);
+    }
     saveDB();
     saveDB();
     res.json({ ok: true });
+});
+// 客户 停用 / 启用（对齐智慧记「停用客户」语义，2026-10-11 P3）
+//   · 智慧记：status 1=在用 / 2=停用，其客户列表默认隐藏停用档
+//   · 宏瑞原「删除客户」实为软删除 status=0，且**没有任何界面能看到或恢复**
+//   · 本接口把「停用」变成可逆动作：1↔2；0 是历史软删除标记，不作为可写值对外暴露
+app.put('/api/store/customers/:id/status', authMiddleware, hasPerm('customers'), async (req, res) => {
+    await initDB();
+    const { id } = req.params;
+    const next = Number((req.body || {}).status);
+    if (![1, 2].includes(next)) {
+        return res.status(400).json({ error: 'status 只允许 1（在用）或 2（停用）' });
+    }
+    const row = (await safeExec("SELECT id FROM customers WHERE id = ?", [id])).values?.[0];
+    if (!row) {
+        return res.status(404).json({ error: '客户不存在' });
+    }
+    await run("UPDATE customers SET status = ? WHERE id = ?", [next, id]);
+    saveDB();
+    res.json({ ok: true, id: Number(id), status: next });
 });
 // 删除客户（软删除：status=0，保留历史订单引用）
 app.delete('/api/store/customers/:id', authMiddleware, hasPerm('customers'), async (req, res) => {
@@ -3140,7 +4190,7 @@ app.get('/api/store/purchase-orders/:id', authMiddleware, hasPerm('purchase'), a
     if (!o)
         return res.status(404).json({ error: '进货单不存在' });
     const items = ((await safeExec("SELECT * FROM purchase_order_items WHERE order_id = ?", [id])).values || []).map((i) => ({
-        id: i[0], product_id: i[2], product_name: i[3], quantity: Number(i[4]), unit_price: Number(i[5]), amount: Number(i[6])
+        id: Number(i[0]), product_id: Number(i[2]), product_name: i[3], quantity: Number(i[4]), unit_price: Number(i[5]), amount: Number(i[6])
     }));
     /* 联查商品表补充规格/单位/条形码/编号（打印用）
      * ★ 性能（2026-10-04）：原实现对**每个明细各发一次** SELECT（N+1）
@@ -3159,7 +4209,7 @@ app.get('/api/store/purchase-orders/:id', authMiddleware, hasPerm('purchase'), a
     });
     res.json({ ...mapPurchaseOrder(o), items: enriched });
 });
-app.post('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), async (req, res) => {
+app.post('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), idem('purchase-orders'), async (req, res) => {
     await initDB();
     let { supplier_id, supplier_name, items, discount, final_amount, remark, bill_date, paid_amount } = req.body;
     // 采购单必须含有效明细（与服务端销售单同口径兜底）
@@ -3210,7 +4260,11 @@ app.post('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), asyn
         }
     }
     saveDB();
-    res.json({ ok: true, order_number: orderNumber });
+    /* ★★ 2026-10-11 P5-4（P2-07）：补回新单 id，与销售单对称。
+     *   【缺陷实证】修复前响应只有 { ok, order_number }，调用方拿不到 id
+     *     ⇒ 实测连「立即软删刚建的这张单」都做不到（只能再贴一次按单号反查）。
+     *   【行为保持】只增不改：原有 ok / order_number 逐字保留。 */
+    res.json({ ok: true, id: orderId, order_number: orderNumber });
 });
 /* ==================== 进货单「修改 / 删除」（2026-10-09 补） ====================
  * 缺口（老板 2026-10-09 拍板第 2 项）：进货单此前只有 GET(列表/详情) + POST，
@@ -3230,7 +4284,10 @@ app.post('/api/store/purchase-orders', authMiddleware, hasPerm('purchase'), asyn
  *   ③ **删除必须回滚资金**：单号相同、类型为 expense 的「进货支出」流水（实测 109 张单有）
  *      逐条写负数冲销行 + 账户余额回滚 —— 与销售单作废同一范式（复用 writeReversal）。
  *      查不到流水但标记已付的情形**如实披露**，不假装回滚成功。
- *   ④ **修改按明细差量调库存**：以 product_id 聚合 old/new 数量，逐商品 `stock += (old - new)`。
+ *   ④ **修改按明细差量调库存**：以 product_id 聚合 old/new 数量，逐商品 `stock += (new - old)`。
+ *      （★ 2026-10-11 P5-4 / P2-08：原注释写成 `(old - new)`，与实际实现「新 − 旧」**方向相反**；
+ *       本轮已因该注释产生一次误判 ⇒ 必须改正，否则持续误导维护者。
+ *       → 实测行为**本就正确**（20 件改 5 件 ⇒ 库存 −15），故本处**只改注释、不动实现**。）
  *      不做「先整体回冲再整体重建」——中途失败会留下半张单的库存差。
  *   ⑤ **修改不允许把单改成倒欠**：newTotal < paid_amount ⇒ 409 指路，且**在任何写操作之前**校验。
  *   ⑥ 已删除的单、被采购退货单引用的单：一律 409，不做"题不对意"的事。
@@ -3533,7 +4590,7 @@ app.get('/api/store/sales-orders/:id', authMiddleware, hasPerm('sales'), async (
     if (!o)
         return res.status(404).json({ error: '订单不存在' });
     const items = ((await safeExec("SELECT * FROM sales_order_items WHERE order_id = ?", [id])).values || []).map((i) => ({
-        id: i[0], product_id: i[2], product_name: i[3], sku: i[4], quantity: Number(i[5]), unit_price: Number(i[6]), amount: Number(i[7])
+        id: Number(i[0]), product_id: Number(i[2]), product_name: i[3], sku: i[4], quantity: Number(i[5]), unit_price: Number(i[6]), amount: Number(i[7])
     }));
     /* 联查商品表补充规格/单位/条形码（打印用）
      * ★ 性能（2026-10-04）：同上，N+1 → 1 条 IN 查询（往返 N → 2） */
@@ -3549,7 +4606,7 @@ app.get('/api/store/sales-orders/:id', authMiddleware, hasPerm('sales'), async (
     });
     res.json({ ...mapSalesOrder(o), items: enriched });
 });
-app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req, res) => {
+app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), idem('sales-orders'), async (req, res) => {
     await initDB();
     let { order_number: customOrderNumber, customer_id, customer_name, items, payment_method, discount,
         payment_status, operator_id: targetOperatorId,
@@ -3579,6 +4636,19 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
             operatorName = emp[0] || req.user.real_name;
         }
     }
+    /* ★★ 2026-10-11 P5-4（P2-06）：自定义单号冲突必须**显式拒绝**，不能静默换号。
+     *   【缺陷实证】修复前一律直接用传入单号去 INSERT：唯一索引报错 ⇒ run() 吞掉
+     *     ⇒ 随后 `SELECT MAX(id) ... WHERE order_number = ?` 反查到**已存在那张单**，于是：
+     *       ① 实测 HTTP 500（写失败守卫拦截）
+     *       ② 实测**已存在那单的明细被挂上去**（1→2）
+     *       ③ 实测**库存多扣 3**（100→92，应 95）——货扣了、单没建。
+     *   【修法】在**任何写操作之前**先查单号是否已存在 ⇒ 409 + conflict_order_number。
+     *   【行为变更】由「静默/半截」变「显式失败」；仅当传入自定义单号时生效，自动单号路径不受影响。 */
+    if (customOrderNumber != null && String(customOrderNumber).trim() !== '') {
+        const no = String(customOrderNumber).trim();
+        const hit = (await safeExec("SELECT id FROM sales_orders WHERE order_number = ? LIMIT 1", [no])).values?.[0]?.[0];
+        if (hit) return res.status(409).json({ ok: false, code: 'ORDER_NUMBER_CONFLICT', conflict_order_number: no, existing_id: Number(hit), error: `单号 ${no} 已存在（销售单 #${hit}）⇒ 请换一个单号，本次开单未生效。` });
+    }
     const orderNumber = customOrderNumber || await generateOrderNumber('XS');
     const extra = (Number(express_amount) || 0) + (Number(tax_amount) || 0) - (Number(small_change_amount) || 0);
     let totalAmount = 0;
@@ -3604,17 +4674,19 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req
     const oweAmount = _money.owe_amount;
     const paymentStatus = _money.payment_status;
     const billDate = _money.bill_date;
-    await run("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, commission_amount, payment_status, bill_date, receivable_amount, received_amount, owe_amount, small_change_amount, express_amount, tax_amount, remark, biz_type, maker_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
+    /* ★ 2026-10-11 P5-4：主单 INSERT 与「取 id」合并为**同一条语句**（INSERT ... RETURNING id）。
+     *   原写法靠「再去 SELECT MAX(id) WHERE order_number=?」反查，
+     *   它在单号冲突时会**反查到另一张已存在的单**（P2-06 的伤害放大器）。
+     *   改为同语句取 id 后，不再依赖二次读，即使将来再出现重号也不会把明细挂错单。
+     *   （与 runLastId 定义处的纪律一致：插入与取 id 必须同一条语句、同一个连接。） */
+    const orderId = Number(await runLastId("INSERT INTO sales_orders (order_number, customer_id, customer_name, total_amount, discount, final_amount, payment_method, operator_id, operator_name, commission_amount, payment_status, bill_date, receivable_amount, received_amount, owe_amount, small_change_amount, express_amount, tax_amount, remark, biz_type, maker_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", [
         orderNumber, customer_id || null, customer_name || null, totalAmount, discount || 0, finalAmount,
         payment_method || null, operatorId, operatorName, commissionAmount, paymentStatus,
         billDate, _money.receivable_amount, receivedAmount, oweAmount,
         Number(small_change_amount) || 0, Number(express_amount) || 0, Number(tax_amount) || 0,
         remark || '', 'sale', req.user.real_name || null
-    ]);
+    ]) || 0);
     saveDB();
-    // Get the inserted order ID by finding the max id
-    const orderIdResult = await safeExec("SELECT MAX(id) FROM sales_orders WHERE order_number = ?", [orderNumber]);
-    const orderId = orderIdResult.values?.[0]?.[0] || 0;
     if (items && orderId > 0) {
         for (const item of items) {
             await run("INSERT INTO sales_order_items (order_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)", [orderId, item.product_id, item.product_name, item.sku || '', item.quantity, item.price ?? item.unit_price ?? 0, item.amount ?? item.quantity * (item.price ?? item.unit_price ?? 0)]);
@@ -3750,32 +4822,77 @@ app.put('/api/store/sales-orders/:id', authMiddleware, hasPerm('sales'), async (
     saveDB();
     res.json({ ok: true, id, order_number: old.order_number, final_amount: finalAmount, owe_amount: oweAmount, payment_status: paymentStatus, items: items.length });
 });
-app.post('/api/store/sales-orders/:id/receive', authMiddleware, hasPerm('sales'), async (req, res) => {
+app.post('/api/store/sales-orders/:id/receive', authMiddleware, hasPerm('sales'), idem('sales-orders-receive'), async (req, res) => {
     await initDB();
     const id = Number(req.params.id);
     const amount = Number(req.body.amount) || 0;
-    if (amount <= 0) return res.status(400).json({ error: '收款金额必须大于 0' });
-    const o = (await safeExec("SELECT " + SO_COLS + " FROM sales_orders WHERE id = ?", [id])).values?.[0];
-    if (!o) return res.status(404).json({ error: '订单不存在' });
-    const so = mapSalesOrder(o);
-    if (so.payment_status === '作废') return res.status(400).json({ error: '该单已作废，不能收款' });
-    const receivable = so.receivable_amount || so.final_amount;
-    const newReceived = Math.round((so.received_amount + amount) * 100) / 100;
-    const newOwe = Math.round((receivable - newReceived) * 100) / 100;
-    const newStatus = newOwe > 0.005 ? '未结清' : '已结清';
-    await run("UPDATE sales_orders SET received_amount = ?, owe_amount = ?, payment_status = ? WHERE id = ?", [newReceived, newOwe, newStatus, id]);
-    // 资金流水（可选账户）
+    if (amount <= 0) return res.status(400).json({ ok: false, code: 'RECEIVE_BAD_AMOUNT', error: '收款金额必须大于 0' });
+    /* ★★ 2026-10-11 P5-3（B0-3 / P1-01·P1-02）并发「丢失更新」根治 —— 销售单收款登记。
+     * 【缺陷实证】隔离库 hongrui_ws48，同一张单 5 笔并发收款各 ¥100
+     *   （装置：_diag/sprint/p5-b03-test.cjs，原始响应 out/p5b03-BEFORE-probes.json）：
+     *     · 单据 received_amount 只从 0 走到 **200**（应 500），owe 停在 **800**（应 500）；
+     *     · 而账户是 `balance = balance + ?` 原子累加 ⇒ **账户 +500**；
+     *   ⇒ 不变量「Σ账户余额增量 ≡ Σ单据已收增量」被打破，差额 **300**（
+     *     钱确实收了，单据却只核销一部分 ⇒ 客户被重复催收）。
+     *   · 回执同样是错的：OrderManagement.submitPay 的 toast 直接显示响应里的 owe_amount，
+     *     5 个并发的用户会看到同一个"剩余欠款"（实测 5 个回执只产生 2 个不同值）。
+     * 【根因】"读-算-写"跨语句无锁：`safeExec(读单据)` 与 `run(写单据)` 各自
+     *   getPool().connect()→release()，**落在不同连接**（池 max:20）⇒ 并发请求各自基于
+     *   同一快照计算，再把各自算出的**绝对值**覆盖写回去 ⇒ 后写者吃掉前写者。
+     * 【修法（最小增量，计算口径逐字不动）】
+     *   ① 整段进 withTx ⇒「单据 + 资金流水 + 账户余额」同生共死（顺带消灭半截账）；
+     *   ② 取单语句加**行级排他锁**（ORDER BY 之外的锁定读）⇒ 并发收款在数据库侧排队，
+     *      后到者读到的一定是前一笔提交后的值；
+     *   ③ receivable / newReceived / newOwe / newStatus 四个公式**原样保留**，只是把"读"挪进锁内；
+     *   ④ 锁内复查「作废」态：旧写法在事务外判断，与"作废"并发时会把钱收进已作废的单。
+     * 【加锁顺序】本路由为「先锁单据、后动账户」，与 /finance/transactions/income|expense
+     *   完全同序 ⇒ 三条资金路径交叉并发不成环、不死锁（转账死锁实证见 transfer 路由）。
+     * 【顺带】显式传入的 account_id 现在必须真实存在：旧写法若账户不存在，
+     *   `UPDATE ... WHERE id=?` 影响 0 行且不报错 ⇒ 流水记了、账户没动（与 P5-2 的 A3 同型）。 */
     const accountId = Number(req.body.account_id) || null;
     if (accountId) {
-        // 补单据号（2026-10-05）：这一处此前只写流水不写号，导致「收款记录」页里
-        // 手工收款有号、销售单自动收款没号，同一列表两种形态 ⇒ 对账时无法指认。
-        const incomeNo = await generateOrderNumber('income');
-        await run("INSERT INTO transactions (type, account_id, amount, category, description, party_type, party_id, party_name, operator_id, operator_name, order_number) VALUES ('income', ?, ?, '销售收款', ?, 'customer', ?, ?, ?, ?, ?)",
-            [accountId, amount, '销售单 ' + so.order_number + ' 收款', so.customer_id || null, so.customer_name || '', req.user.id, req.user.real_name, incomeNo]);
-        await run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [amount, accountId]);
+        const okAcc = (await safeExec("SELECT id FROM accounts WHERE id = ?", [accountId])).values?.[0]?.[0];
+        if (!okAcc) return res.status(400).json({ ok: false, code: 'RECEIVE_BAD_ACCOUNT', error: `账户 #${accountId} 不存在` });
+    }
+    /* 单号在事务外先取：① 不在持锁期间多耗一次数据库往返；② 避免"事务占着连接、取号再要连接"
+     *   在连接池见底时互相等待。取号走序列 nextval、本就不参与事务回滚 ⇒ 语义与旧实现完全一致
+     *   （旧实现也是"有 accountId 才取号"）。 */
+    const incomeNo = accountId ? await generateOrderNumber('income') : null;
+    let out;
+    try {
+        out = await withTx(async (tx) => {
+            // ① 先取锁：并发收款在此排队，读到的一定是前一笔提交后的值 —— 这是丢失更新的唯一根治点
+            const o = (await tx.q("SELECT " + SO_COLS + " FROM sales_orders WHERE id = ? FOR UPDATE", [id])).values?.[0];
+            if (!o) throw Object.assign(new Error('订单不存在'), { httpCode: 404, code: 'RECEIVE_NOT_FOUND', msg: '订单不存在' });
+            const so = mapSalesOrder(o);
+            if (so.payment_status === '作废') throw Object.assign(new Error('该单已作废'), { httpCode: 400, code: 'RECEIVE_VOIDED', msg: '该单已作废，不能收款' });
+            const receivable = so.receivable_amount || so.final_amount;
+            const newReceived = Math.round((so.received_amount + amount) * 100) / 100;
+            const newOwe = Math.round((receivable - newReceived) * 100) / 100;
+            const newStatus = newOwe > 0.005 ? '未结清' : '已结清';
+            await tx.run("UPDATE sales_orders SET received_amount = ?, owe_amount = ?, payment_status = ? WHERE id = ?", [newReceived, newOwe, newStatus, id]);
+            // 资金流水（可选账户）
+            if (accountId) {
+                // 补单据号（2026-10-05）：这一处此前只写流水不写号，导致「收款记录」页里
+                // 手工收款有号、销售单自动收款没号，同一列表两种形态 ⇒ 对账时无法指认。
+                await tx.run("INSERT INTO transactions (type, account_id, amount, category, description, party_type, party_id, party_name, operator_id, operator_name, order_number) VALUES ('income', ?, ?, '销售收款', ?, 'customer', ?, ?, ?, ?, ?)",
+                    [accountId, amount, '销售单 ' + so.order_number + ' 收款', so.customer_id || null, so.customer_name || '', req.user.id, req.user.real_name, incomeNo]);
+                await tx.run("UPDATE accounts SET balance = balance + ? WHERE id = ?", [amount, accountId]);
+            }
+            return { received_amount: newReceived, owe_amount: newOwe, payment_status: newStatus };
+        });
+    }
+    catch (e) {
+        if (e && e.httpCode) return res.status(e.httpCode).json({ ok: false, code: e.code, error: e.msg });
+        console.error('[SO-RECEIVE] 收款失败，已整体回滚:', e.message);
+        return res.status(500).json({
+            ok: false, code: 'RECEIVE_WRITE_FAILED',
+            error: '收款失败，本次操作未生效（已整体回滚）',
+            detail: String(e.message).slice(0, 200),
+        });
     }
     saveDB();
-    res.json({ ok: true, received_amount: newReceived, owe_amount: newOwe, payment_status: newStatus });
+    res.json({ ok: true, received_amount: out.received_amount, owe_amount: out.owe_amount, payment_status: out.payment_status });
 });
 /* 作废销售单（仅管理员）：标记作废 + 冲回库存 + **回滚已收资金**；
  * 保留记录与明细（对齐智慧记 invalid，不做物理删除）。
@@ -3851,45 +4968,100 @@ app.get('/api/store/sales-returns', authMiddleware, hasPerm('return'), async (re
     const pg = Math.max(1, Number(page) || 1);
     const ps = Math.min(1000, Math.max(1, Number(pageSize) || 100));
     // 关联原销售单，补充原单号/客户/业务日期（便于退货对账）
+    // ★ P5/B0-1：额外取 so.id 与 so.payment_status，用于判定该退货单**是否已折入应收**
+    //   （computeArap 只折入"原单存在且未作废"的退货；其余是孤立单，必须显式标记，
+    //    否则用户看到的是"退了货但欠款没变"，且**没有任何提示**）。
     const sql = `SELECT r.id, r.return_number, r.sales_order_id, r.total_amount, r.operator_id, r.operator_name,
                         r.reason, r.status, r.created_at,
-                        so.order_number, so.customer_name, COALESCE(so.bill_date, substr(so.created_at,1,10))
+                        so.order_number, so.customer_name, COALESCE(so.bill_date, substr(so.created_at,1,10)),
+                        so.id, COALESCE(so.payment_status,'')
                    FROM sales_returns r LEFT JOIN sales_orders so ON so.id = r.sales_order_id
                   ORDER BY r.id DESC LIMIT ? OFFSET ?`;
     const result = await safeExec(sql, [ps, (pg - 1) * ps]);
-    const returns = (result.values || []).map((r) => ({
-        id: r[0], return_number: r[1], sales_order_id: r[2], total_amount: Number(r[3]),
-        operator_id: r[4], operator_name: r[5], reason: r[6], status: r[7], created_at: r[8],
-        ref_order_number: r[9] || '', customer_name: r[10] || '', bill_date: r[11] || null
-    }));
+    const returns = (result.values || []).map((r) => {
+        const soExists = r[12] !== null && r[12] !== undefined;
+        const soVoid = String(r[13] || '') === '作废';
+        const attributed = soExists && !soVoid;
+        return {
+            id: r[0], return_number: r[1], sales_order_id: r[2], total_amount: Number(r[3]),
+            operator_id: r[4], operator_name: r[5], reason: r[6], status: r[7], created_at: r[8],
+            ref_order_number: r[9] || '', customer_name: r[10] || '', bill_date: r[11] || null,
+            /* ★ 是否已折入应收（computeArap 口径）。false ⇒ 这张退货**没有**减少任何客户欠款，
+             *   前端必须显式提示，不能让用户以为"退货成功 = 欠款已减"。 */
+            attributed,
+            unattributed_reason: attributed ? null : (soExists ? '原单已作废' : '原单不存在'),
+        };
+    });
     if (withTotal) {
         const totalRow = (await safeExec("SELECT COUNT(*) FROM sales_returns")).values?.[0]?.[0];
         return res.json({ rows: returns, total: Number(totalRow || 0), page: pg, pageSize: ps });
     }
     res.json(returns);
 });
-app.post('/api/store/sales-returns', authMiddleware, hasPerm('return'), async (req, res) => {
+app.post('/api/store/sales-returns', authMiddleware, hasPerm('return'), idem('sales-returns'), async (req, res) => {
     await initDB();
     const { sales_order_id, items, reason } = req.body;
+
+    /* ★ B0-1 入口硬校验（2026-10-11 · P5）。
+     * 【为什么必须挡在最前面】P1-06 的"静默假成功"之所以能发生，是因为后端把
+     * 「明细根本写不进去」当成了「没问题」：前端漏 product_id/unit_price ⇒ 后端算 ¥0
+     * ⇒ 明细 INSERT 违反 NOT NULL ⇒ 被 run() 的 catch 吞掉 ⇒ 路由照样 res.json({ok:true})。
+     * 结果：一张「看起来成功、实际零明细」的退货单，而客户欠款一分没减。
+     * ⇒ 上游拦死，这类错**不可能**再变成一张"看起来成功"的单据。 */
+    if (!Array.isArray(items) || items.length === 0)
+        return res.status(400).json({ error: '退货明细不能为空' });
+    for (let i = 0; i < items.length; i++) {
+        const it = items[i] || {};
+        if (!Number.isFinite(Number(it.product_id)) || Number(it.product_id) <= 0)
+            return res.status(400).json({ error: `第 ${i + 1} 行退货明细缺少有效的 product_id` });
+        if (!Number.isFinite(Number(it.quantity)) || Number(it.quantity) <= 0)
+            return res.status(400).json({ error: `第 ${i + 1} 行退货数量必须为正数` });
+        if (!Number.isFinite(Number(it.unit_price)) || Number(it.unit_price) < 0)
+            return res.status(400).json({ error: `第 ${i + 1} 行退货单价不能为负数（0 = 赠品退货，允许）` });
+    }
+
+    /* 原单必须存在且未作废 —— 退货的客户归属与"是否折入应收"都依赖它（见 computeArap）。
+     * 不做这一层校验，就会造出"查不到客户的孤立退货单"，那种单只能不折入任何客户，
+     * 于是用户看到的是"退了货但欠款没变"（= 又一个看不见的错）。 */
+    const soRow = (await safeExec(
+        "SELECT id, order_number, customer_id, customer_name, COALESCE(payment_status,'') FROM sales_orders WHERE id = ?",
+        [Number(sales_order_id)])).values?.[0];
+    if (!soRow)
+        return res.status(404).json({ error: '原销售单不存在，不能退货' });
+    if (String(soRow[4]) === '作废')
+        return res.status(400).json({ error: '原单已作废，不能退货' });
+
     const returnNumber = await generateOrderNumber('TH');
     let totalAmount = 0;
-    if (items) {
-        for (const item of items) {
-            totalAmount += (item.quantity || 0) * (item.unit_price || 0);
-        }
-    }
-    const returnId = await runLastId("INSERT INTO sales_returns (return_number, sales_order_id, total_amount, operator_id, operator_name, reason) VALUES (?, ?, ?, ?, ?, ?)", [returnNumber, sales_order_id, totalAmount, req.user.id, req.user.real_name, reason || '']);
-    if (items && returnId) {
-        for (const item of items) {
-            await run("INSERT INTO sales_return_items (return_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)", [returnId, item.product_id, item.product_name, item.sku, item.quantity, item.unit_price, item.quantity * item.unit_price]);
-            // Restore stock
-            if (item.product_id) {
-                await run("UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?", [item.quantity, item.product_id]);
+    for (const it of items) totalAmount += Number(it.quantity) * Number(it.unit_price);
+
+    /* ★ 全部写入收进**同一事务**：主单 + 明细 + 回补库存，要么全成、要么全不成。
+     *   失败**不吞**，转成明确错误码 —— 绝不返回 ok:true。 */
+    let returnId = null;
+    try {
+        returnId = await withTx(async (tx) => {
+            const id = await tx.lastId(
+                "INSERT INTO sales_returns (return_number, sales_order_id, total_amount, operator_id, operator_name, reason) VALUES (?, ?, ?, ?, ?, ?)",
+                [returnNumber, Number(sales_order_id), totalAmount, req.user.id, req.user.real_name, reason || '']);
+            if (!id) throw new Error('退货主单写入未返回 id');
+            for (const it of items) {
+                const qty = Number(it.quantity), price = Number(it.unit_price);
+                await tx.run(
+                    "INSERT INTO sales_return_items (return_id, product_id, product_name, sku, quantity, unit_price, amount) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [id, Number(it.product_id), it.product_name || '', it.sku || '', qty, price, qty * price]);
+                await tx.run("UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ?", [qty, Number(it.product_id)]);
             }
-        }
+            return id;
+        });
+    }
+    catch (e) {
+        console.error('销售退货写入失败（已整单回滚）:', e.message);
+        return res.status(500).json({ error: '退货单写入失败，已整单回滚，未产生任何数据', code: e.code || null });
     }
     saveDB();
-    res.json({ ok: true, return_number: returnNumber });
+    /* attributed:true —— 能走到这里说明原单存在且未作废 ⇒ computeArap 的 sr 子查询**会**把它折入应收。
+     * 显式回传该字段，让前端能断言"欠款确实减了"，而不是笼统提示"退货成功"。 */
+    res.json({ ok: true, id: returnId, return_number: returnNumber, total_amount: totalAmount, attributed: true });
 });
 // ==================== 回收单（旧件回收：回收入库 + 成本=回收价 + 记回收支出） ====================
 app.get('/api/store/recycles', authMiddleware, hasPerm('recycle'), async (_req, res) => {
@@ -3910,14 +5082,14 @@ app.get('/api/store/recycles/:id', authMiddleware, hasPerm('recycle'), async (re
     if (!r)
         return res.status(404).json({ error: '回收单不存在' });
     const items = ((await safeExec("SELECT * FROM recycle_items WHERE recycle_id = ?", [id])).values || []).map((i) => ({
-        id: i[0], product_id: i[2], product_name: i[3], sku: i[4], quantity: Number(i[5]), unit_price: Number(i[6]), amount: Number(i[7])
+        id: Number(i[0]), product_id: Number(i[2]), product_name: i[3], sku: i[4], quantity: Number(i[5]), unit_price: Number(i[6]), amount: Number(i[7])
     }));
     res.json({
         id: r[0], recycle_number: r[1], customer_id: r[2], customer_name: r[3],
         total_amount: Number(r[4]), operator_id: r[5], operator_name: r[6], remark: r[7], created_at: r[8], items
     });
 });
-app.post('/api/store/recycles', authMiddleware, hasPerm('recycle'), async (req, res) => {
+app.post('/api/store/recycles', authMiddleware, hasPerm('recycle'), idem('recycles'), async (req, res) => {
     await initDB();
     if (req.user && req.user.role === 'employee')
         return res.status(403).json({ error: '店员无权操作回收，请联系管理员' });
@@ -3963,8 +5135,14 @@ app.post('/api/store/recycles', authMiddleware, hasPerm('recycle'), async (req, 
          * 这样既满足「付款流水有号」，又保留了与回收单的关联线索。
          * （两条流水指向同一笔业务，但 order_number 有唯一约束，不能共用同一个号。） */
         const payNo = await generateOrderNumber('expense');
+        /* ★★ 2026-10-11 P5-4（P3-07）：回收是「付钱给客户」，既记了支出流水，就**必须**同步减账户余额。
+         *   【缺陷实证】修复前只写流水、不改余额 ⇒ 实测余额 10000 → 10000（纹丝不动），
+         *     而流水净额 −300 ⇒ **余额 ≢ Σ流水净额**，gap = +300（记账工具最不能犯的错）。
+         *   【同步修法】与 income / expense 两条路径同形：流水写入后紧跟一句原子累减。
+         *   【现状】隔离库 recycles 为 0 行 ⇒ 本改动**当前金额影响 ¥0.00**，但修复前只要录一笔就会破不变量。 */
         await run("INSERT INTO transactions (type, account_id, amount, category, description, operator_id, operator_name, created_at, order_number) VALUES ('expense', ?, ?, '回收支出', ?, ?, ?, datetime('now','localtime'), ?)",
             [accId, totalAmount, '回收单 ' + recycleNumber + '（' + (customer_name || '散客') + '，' + items.length + '项）', req.user.id, req.user.real_name, payNo]);
+        await run("UPDATE accounts SET balance = balance - ? WHERE id = ?", [totalAmount, accId]);
     }
     saveDB();
     res.json({ ok: true, recycle_number: recycleNumber, total_amount: totalAmount });
@@ -4000,6 +5178,10 @@ app.get('/api/store/settings', authMiddleware, hasPerm('settings'), async (_req,
 app.put('/api/store/settings', authMiddleware, hasPerm('settings'), async (req, res) => {
     await initDB();
     const { settings } = req.body;
+    /* ★ B0-5（P1-05）：入参硬校验。修复前缺 settings ⇒ `Object.entries(undefined)` 抛 TypeError
+     *   ⇒ 本路由无 try/catch ⇒ Express 默认错误页把完整调用栈 ＋ 绝对路径回给客户端。*/
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings))
+        return res.status(400).json({ ok: false, error: 'settings 必须为对象（键值对）' });
     for (const [key, value] of Object.entries(settings)) {
         await run("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=?", [key, value, value]);
     }
@@ -4203,7 +5385,8 @@ async function computeArap() {
         COALESCE(u.cnt,0) uc, COALESCE(u.amt,0) ua,
         COALESCE(pu.cnt,0) puc, COALESCE(pu.amt,0) pua,
         COALESCE(t.amt,0) ta,
-        COALESCE(adj.pref,0) pref, COALESCE(adj.trim,0) trim
+        COALESCE(adj.pref,0) pref, COALESCE(adj.trim,0) trim,
+        COALESCE(sr.cnt,0) srcnt, COALESCE(sr.amt,0) sramt
         FROM (
             SELECT ${CANON_C} nm,
                    COALESCE(MIN(c.id) FILTER (WHERE ${CANON_C} = ${FOLD_SQL('c.name')}), MIN(c.id)) pid,
@@ -4233,7 +5416,30 @@ async function computeArap() {
                           SUM(CASE WHEN adj_type='preferential' THEN amount ELSE 0 END) pref,
                           SUM(CASE WHEN adj_type='trim' THEN amount ELSE 0 END) trim
                    FROM party_adjustments WHERE party_type='customer'
-                   GROUP BY 1) adj ON adj.nm = cg.nm`)).values || [];
+                   GROUP BY 1) adj ON adj.nm = cg.nm
+        /* ★★★ 2026-10-11 P5 / B0-1（P1-07 修复）：把**系统退货**折入应收。
+         * 【为什么必须折】修复前 sales_returns 在全后端"只被写和列、从不被算"（孤岛表）⇒
+         *   客户退货后 sales_orders 不动 ⇒ **应收不减**，而前端显示"退货成功"。
+         *   这正是 P1-06 一修好就会立刻制造的"看不见的错"（看得见的错 → 看不见的错），
+         *   所以 B0-1 规定 P1-06 与 P1-07 **必须同批**，禁止分批。
+         * 【口径】unpaidAmt = Σ销售 − Σ采购 − Σ退货，与历史导入路径（biz_type=sale_return）
+         *   落在销售侧的算法**方向一致**（两条路径都让应收变小，不再不对称）。
+         * 【归属】sales_returns 表**没有 customer_id**（实测字段清单），只能经 sales_order_id
+         *   反查 sales_orders.customer_name。故用 INNER JOIN：
+         *     · 原单不存在 ⇒ **自然不折入任何客户**（宁可少折，不可错折；禁按名字模糊猜测）
+         *     · 原单已作废 ⇒ 本子查询排除（作废单本就不计应收，其退货也不该计）
+         *   这类"未折入"的孤立退货单，在 GET /store/sales-returns 列表里以 attributed:false 显式标记。
+         * 【现状】生产/隔离库 sales_returns 均为 0 行 ⇒ 本改动**当前金额影响 ¥0.00**，
+         *   即 ARAP 与已验收值（69 家/¥440,672.85 ＋ 4 家/¥214,754.60）必须**逐字不变**（零回归判据）。
+         * 【注意】本注释在 SQL 模板串内部，**禁用反引号**（会提前终止模板串）。 */
+        LEFT JOIN (SELECT ${canonSQL('so.customer_name')} nm,
+                          COUNT(*) cnt,
+                          SUM(sr.total_amount) amt
+                   FROM sales_returns sr
+                   JOIN sales_orders so ON so.id = sr.sales_order_id
+                   WHERE COALESCE(so.payment_status,'') <> '作废'
+                     AND so.customer_name IS NOT NULL AND ${FOLD_SQL('so.customer_name')} <> ''
+                   GROUP BY 1) sr ON sr.nm = cg.nm`)).values || [];
     const receivables = custRows.map((r) => {
         const initial = Number(r[2]) || 0;
         const saleAmt = Number(r[4]) || 0;      // Σ销售单
@@ -4241,12 +5447,20 @@ async function computeArap() {
         const received = Number(r[7]) || 0;     // 收支净额
         const preferential = Number(r[8]) || 0;
         const trim = Number(r[9]) || 0;
-        const unpaidAmt = Math.round((saleAmt - purchAmt) * 100) / 100; // ★ 双向净额
+        /* ★ 列序自证：SELECT 列表里是 `COALESCE(sr.cnt,0) srcnt, COALESCE(sr.amt,0) sramt`
+         *   ⇒ r[10] = **退货单数**，r[11] = **退货金额**。首版把两者写反，被装置 D1/D2 当场抓住
+         *   （现象：应收账款只减了"1"、return_amount 显示 1、return_count 显示 125）——
+         *   ⇒ 新增列一律紧贴其 SELECT 位置读，禁止按"业务上谁先谁后"想当然。 */
+        const returnCount = Number(r[10]) || 0;  // Σ系统退货单数（P5/B0-1 新增，见上方 sr 子查询）
+        const returnAmt = Number(r[11]) || 0;    // Σ系统退货金额
+        const unpaidAmt = Math.round((saleAmt - purchAmt - returnAmt) * 100) / 100; // ★ 双向净额 − 退货
         const balance = Math.round((initial + unpaidAmt - received - preferential + trim) * 100) / 100;
         return {
             party_id: Number(r[1]), name: String(r[0] || ''),
             initial_balance: Math.round(initial * 100) / 100,
             unpaid_orders: Number(r[3]) || 0, unpaid_amount: unpaidAmt,
+            return_amount: Math.round(returnAmt * 100) / 100,   // ★ 新增：本户已折入的退货合计
+            return_count: returnCount,                          // ★ 新增：本户已折入的退货单数
             received: Math.round(received * 100) / 100,
             preferential: Math.round(preferential * 100) / 100,
             trim: Math.round(trim * 100) / 100,
@@ -4280,7 +5494,12 @@ async function computeArap() {
         ) sg
         LEFT JOIN (SELECT ${canonSQL('supplier_name')} nm, COUNT(*) cnt, SUM(total_amount) amt
                    FROM purchase_orders
-                   WHERE COALESCE(payment_status,'') <> '作废'
+                   /* ★★ 2026-10-11 P5-4（P1-03）：补上 AND ${PO_ALIVE}，与客户侧 pu 子查询完全对齐。
+                    *   【缺陷实证】软删后的进货单仍计入供应商应付（隔离库实测：删单后 arap 仍为 100）。
+                    *   【为何是潜伏】当前库内 status IN ('cancelled','void') 为 0 张 ⇒ 金额影响 ¥0.00，
+                    *     但一旦历史上删过单就会看得见。
+                    *   【不改口径】只加一个过滤条件，宜家宜金额计算公式逐字未动。 */
+                   WHERE COALESCE(payment_status,'') <> '作废' AND ${PO_ALIVE}
                      AND supplier_name IS NOT NULL AND ${FOLD_SQL('supplier_name')} <> ''
                    GROUP BY 1) u ON u.nm = sg.nm
         LEFT JOIN (SELECT ${canonSQL('customer_name')} nm, COUNT(*) cnt, SUM(final_amount) amt
@@ -4481,7 +5700,7 @@ app.get('/api/store/reservations', authMiddleware, hasPerm('sales'), async (_req
     }));
     res.json(list);
 });
-app.post('/api/store/reservations', authMiddleware, hasPerm('sales'), async (req, res) => {
+app.post('/api/store/reservations', authMiddleware, hasPerm('sales'), idem('reservations'), async (req, res) => {
     await initDB();
     let { customer_id, customer_name, items, remark } = req.body;
     if (!customer_id && customer_name) {
@@ -4559,7 +5778,7 @@ app.get('/api/store/purchase-returns', authMiddleware, hasPerm('purchase'), asyn
     res.json(list);
 });
 // 进货退货：purchase_order_id 可选，直接按商品退，冲减库存
-app.post('/api/store/purchase-returns', authMiddleware, hasPerm('purchase'), async (req, res) => {
+app.post('/api/store/purchase-returns', authMiddleware, hasPerm('purchase'), idem('purchase-returns'), async (req, res) => {
     await initDB();
     const { purchase_order_id, supplier_id, supplier_name, items, reason } = req.body;
     if (!items || !items.length) return res.status(400).json({ error: '请添加退货商品' });
@@ -4590,7 +5809,7 @@ app.get('/api/store/quotes', authMiddleware, hasPerm('sales'), async (_req, res)
     }));
     res.json(list);
 });
-app.post('/api/store/quotes', authMiddleware, hasPerm('sales'), async (req, res) => {
+app.post('/api/store/quotes', authMiddleware, hasPerm('sales'), idem('quotes'), async (req, res) => {
     await initDB();
     let { customer_id, customer_name, items, remark } = req.body;
     if (!customer_id && customer_name) {
@@ -4691,7 +5910,8 @@ app.delete('/api/inventory/units/:id', authMiddleware, hasPerm('inventory_full')
 app.get('/api/finance/summary', authMiddleware, hasPerm('finance_view'), async (req, res) => {
     await initDB();
     const days = Number(req.query.days || 30);
-    const start = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+    // P4：近 N 天起始日改走北京口径
+    const start = bjDaysAgo(days);
     const rows = (await safeExec(`SELECT to_char(date(created_at), 'YYYY-MM-DD') d, type, COALESCE(SUM(amount),0) FROM transactions WHERE date(created_at) >= '${start}' AND type IN ('income','expense') GROUP BY date(created_at), type ORDER BY d`)).values || [];
     const byDate = {};
     for (const r of rows) {
@@ -4722,6 +5942,58 @@ app.use((_req, res) => {
         res.status(404).json({ error: 'Not Found', api: 'ok' });
     }
 });
+/* ==== GLOBAL-ERR-BEGIN（唯一真源 · 2026-10-11 48h 冲刺 P5-5 / P1-05）====
+ * 病灶（隔离后端实测，非推断）：**全 110 条路由**在「畸形 body」下都返回
+ *   `HTTP 400 + text/html` 的 Express 默认错误页，正文带**绝对路径 ＋ node_modules 路径
+ *   ＋ 完整调用栈**（示例：`at parse (D:\\创新工作区\\…\\body-parser\\lib\\types\\json.js:91:21)`）；
+ *   `PUT /auth/password` / `PUT /store/settings` 更进一步：入参缺失 ⇒ 路由内抛错 ⇒ 500 ＋ 同款 HTML。
+ *   ⇒ **未鉴权即可拿到内部路径与依赖结构**（连 `/api/health` 都能拿到）。
+ * 本中间件做三件事：
+ *   ① 错误响应一律 JSON，**不回显任何内部细节**（无 stack / 无路径 / 无 SQL / 无 err.message）；
+ *   ② **沿用错误自带的状态码**（400 仍是 400）⇒ 不把 body-parser 的 400 降级成 500；
+ *   ③ 真 500 在服务端日志里留唯一出口（带 stack，供运维定位）。
+ * ⚠️ 五条硬约束：
+ *   ① 必须注册在**所有路由与普通中间件之后**（本处紧邻 `async function start()`，即模块顶层末位）；
+ *   ② 必须**保留 4 个形参**，否则 Express 不把它当错误处理器；
+ *   ③ **禁止**回显 `err.message`：body-parser 的 `entity.parse.failed` 消息会**回显请求体片段**
+ *      （例如把 `{"password":"…"}` 回给客户端）⇒ 那是二次泄漏；
+ *   ④ `res.headersSent` 时必须 `next(err)` 交回默认处理器，否则会破坏已开始的响应/连接；
+ *   ⑤ 本中间件不参与启动链，与 `initDB()` / `start()` 的调用顺序无关。
+ * 回滚：删除本段即可（单文件、无 DB 改动、无契约变更）。
+ * ==================================================================== */
+const ERR_TEXT_BY_TYPE = {
+    'entity.parse.failed': '请求体不是合法 JSON',
+    'entity.too.large': '请求体过大',
+    'request.aborted': '请求被中断',
+    'request.size.invalid': '请求体长度不合法',
+    'encoding.unsupported': '不支持的字符集',
+};
+function errTextOf(status, err) {
+    const t = err && err.type;
+    if (t && ERR_TEXT_BY_TYPE[t]) return ERR_TEXT_BY_TYPE[t];
+    return ({
+        400: '请求无效', 401: '未授权', 403: '无权限', 404: '资源不存在',
+        405: '请求方法不被允许', 408: '请求超时', 409: '数据冲突',
+        413: '请求体过大', 415: '不支持的请求类型', 422: '请求参数无法处理',
+        429: '请求过于频繁',
+    })[status] || (status >= 500 ? '服务器内部错误' : '请求无效');
+}
+app.use((err, req, res, next) => {
+    const raw = Number((err && (err.httpCode || err.status || err.statusCode)) || 0);
+    const status = (raw >= 400 && raw <= 599) ? raw : 500;
+    /* 服务端留痕：stack **只进日志，绝不进响应体** */
+    console.error('[UNCAUGHT]', status, req.method, req.originalUrl, '-', (err && err.stack) || err);
+    if (res.headersSent) return next(err);
+    const body = { ok: false, error: errTextOf(status, err) };
+    /* 仅「我方显式抛出的域错误」（同时带 httpCode 与 code）才透传文案 —— 它们不含内部细节 */
+    if (err && err.httpCode && err.code) {
+        body.code = err.code;
+        if (typeof err.msg === 'string' && err.msg) body.error = err.msg;
+    }
+    res.status(status).json(body);
+});
+/* ==== GLOBAL-ERR-END ==== */
+
 async function start() {
     await initDB();
     /* 进程内 4 分钟自热身：保持数据库连接不被池回收，
@@ -4731,4 +6003,25 @@ async function start() {
         console.log(`HongruiBOSS Backend Server - http://localhost:${PORT}`);
     });
 }
-start().catch(console.error);
+/* ==================== 测试钩子（2026-10-11 P2） ====================
+ * 目的：让「成本完整性判据」这套逻辑能被单元测试**直接引用同一实现**，
+ *   而不是在测试脚本里另抄一份 SQL/判据（P1 学到的教训：测副本 = 什么都没测到）。
+ * 影响面：本文件是服务入口，生产环境**无人 import 它**；
+ *   这两个 export 对正常运行零影响；`HR_NO_LISTEN=1` 时不起监听，仅供测试。
+ * ==================================================================== */
+export { costIntegritySql, costIntegrityOut, COST_SIGN_SQL };
+export const __costTest = {
+    get unitSql() { return COST_UNIT_SQL; },
+    get isHistorical() { return COST_UNIT_IS_HISTORICAL; },
+    /** 测试用：强制切换成本口径（模拟「生产尚未迁移」与「已迁移」两种库） */
+    setMode(on) {
+        COST_UNIT_IS_HISTORICAL = !!on;
+        COST_UNIT_SQL = on ? `COALESCE(${COST_ITEM_EXPR}, p.cost_price)` : 'p.cost_price';
+    },
+    rowMissingSql: COST_ROW_MISSING_SQL,
+    rowFallbackSql: COST_ROW_FALLBACK_SQL,
+    rowHistoricSql: COST_ROW_HISTORIC_SQL,
+};
+if (process.env.HR_NO_LISTEN !== '1') {
+    start().catch(console.error);
+}
