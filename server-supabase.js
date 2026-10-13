@@ -4647,9 +4647,23 @@ app.get('/api/store/sales-orders', authMiddleware, hasPerm('sales'), async (req,
             { key: 'sum_owe', sql: "SELECT COALESCE(SUM(owe_amount),0) FROM sales_orders" + where },
             { key: 'sum_received', sql: "SELECT COALESCE(SUM(received_amount),0) FROM sales_orders" + where },
         ]);
+        /* ★★ 金额门（2026-10-13，老板真机反馈实拍）：这三个是**全店全量汇总**
+         *   （合计销售额 / 未结清欠款 / 已收合计），原先**无任何权限门** ⇒
+         *   子账号在订单管理页直接看到「共 4590 单　合计 ¥6,534,099.60 /
+         *   未结清欠款 ¥2,051,050.59 / 已收合计 ¥4,483,049.01」—— 属全店经营数据。
+         *
+         *   ★ 与「列表每行的金额」严格区分：每行金额是子账号**干活必需**的
+         *     （要知道这单收多少钱），**必须保留**；这里汇总的三项才是要挡的。
+         *   ★ `total`（单数）不属敏感信息（数量维度）⇒ 照常返回。
+         *   ★ 为什么在接口内做而不是交给全局脱敏器：AMOUNT_SCOPE 刻意**不含业务接口**
+         *     （否则开单/收款会看不到金额），所以这三个汇总只能在接口内定点处理。
+         *   前端同源判据：src/utils/perms.ts 的 canSeeAmount()。 */
+        const canAmount = isAdminUser(req.user.role);
         return res.json({
             rows: orders, total: Number(A.total || 0), page: pg, pageSize: ps,
-            sum_final: Number(A.sum_final || 0), sum_owe: Number(A.sum_owe || 0), sum_received: Number(A.sum_received || 0),
+            ...(canAmount ? {
+                sum_final: Number(A.sum_final || 0), sum_owe: Number(A.sum_owe || 0), sum_received: Number(A.sum_received || 0),
+            } : {}),
         });
     }
     res.json(orders);
