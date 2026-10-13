@@ -1034,8 +1034,13 @@ const ALL_PERMS = [
      *      客户详情里的「往来记录」不受此门限制（老板要求子账户能点开看详情）。 */
     'debt_view',
 ];
-// 新店员默认权限（开单必需的基础功能）
-const DEFAULT_EMPLOYEE_PERMS = ['sales', 'return', 'customers', 'income', 'expense', 'performance'];
+/* 新店员默认权限（开单必需的基础功能）
+ * ★ 2026-10-13 老板拍板：默认**加上 `inventory_view`** —— 原话「子账号需要能看到每个商品的库存」。
+ *   此前默认不含它，新建子账号进不了「库存查询」。**存量账号仍需补**（见交付说明里的补数据 SQL）。
+ * ★ 刻意**不含** `sales_stats`：老板要求「不能看到月销售额，只显示每个商品的销售数量」；
+ *   金额由 AMOUNT_SCOPE 金额门按角色统一挡掉，而"每个商品的库存量"本来就在库存查询里，
+ *   不需要打开分析模块。 */
+const DEFAULT_EMPLOYEE_PERMS = ['sales', 'return', 'customers', 'income', 'expense', 'performance', 'inventory_view'];
 function parsePerms(user) {
     if (!user) return [];
     if (user.role === 'admin' || user.role === 'manager') return ALL_PERMS;
@@ -1442,6 +1447,43 @@ function sensitiveFlags(user) {
     };
 }
 
+/* ==================== 金额可见性：子账号只看数量、不看金额（2026-10-13 老板拍板）====================
+ * 【老板需求】子账号：① 能看每个商品的**库存**；② 不能看**进货**信息；
+ *   ③ 不能看**月销售额**，只显示每个商品的**销售数量**；④ 能看**自己的业绩**（此条原本已满足）。
+ *
+ * 【为什么用「作用域收窄 + 键名脱敏」而不是全局正则】
+ *   全局把 `amount|sales` 一律置 null 会**误伤业务接口**：子账号开单、收款、看订单列表
+ *   都必须看到金额（看不到就没法干活）。所以作用域**只圈定分析/财务报表类接口**，
+ *   开单/订单/收款/付款等业务接口一律不碰。
+ *
+ * 【为什么键名正则里**不含** `qty|quantity|count`】
+ *   老板明确要「只显示每个商品的销售数量」⇒ `total_qty / total_quantity / order_count /
+ *   stock_quantity` 必须原样保留。反过来 `total_amount / final_amount / actual_sales /
+ *   avg_price` 一律置 null ⇒ 正好得到「有量无额」。
+ *
+ * 【为什么置 null 而不是删键】
+ *   与 scrubSensitive 同一理由：删键会让老前端渲染成 `undefined` / `NaN`，
+ *   置 null + 前端按权限隐藏，才既安全又不会显示成"看起来是真的 0"。
+ *   前端判据：src/utils/perms.ts 的 canSeeAmount()，两端必须同源。
+ */
+const AMOUNT_SCOPE = /^\/api\/(analysis\/(dashboard|sales|inventory|demand)|finance\/(summary|overview|supplier-reconciliation))/;
+const KEY_AMOUNT = /amount|sales|money|revenue|price/i;
+
+function scrubAmount(payload, seen) {
+    if (payload === null || payload === undefined) return payload;
+    if (typeof payload !== 'object') return payload;
+    if (payload instanceof Date) return payload;
+    if (seen.has(payload)) return payload;
+    seen.add(payload);
+    if (Array.isArray(payload)) return payload.map((v) => scrubAmount(v, seen));
+    const out = {};
+    for (const k of Object.keys(payload)) {
+        if (KEY_AMOUNT.test(k)) { out[k] = null; continue; }   // ★ 只抹金额，不动 qty/count
+        out[k] = scrubAmount(payload[k], seen);
+    }
+    return out;
+}
+
 function scrubSensitive(payload, flags, seen) {
     if (payload === null || payload === undefined) return payload;
     if (typeof payload !== 'object') return payload;
@@ -1471,13 +1513,27 @@ app.use((req, res, next) => {
                     ...(flags.cost ? [] : ['cost']),
                     ...(flags.profit ? [] : ['profit']),
                 ];
+                /* ★ 金额门（2026-10-13）：子账号在分析/报表类接口上看不到金额，只看数量。
+                 * 与 cost/profit **是两条独立的门**：
+                 *   · cost / profit —— 由 sensitive_permissions 逐项授予，**全接口生效**（防成本泄露）；
+                 *   · amount —— 只认角色（子账号一律无），且**只在 AMOUNT_SCOPE 圈定的路径生效**
+                 *     （开单/订单/收款等业务接口不碰，否则子账号没法干活）。
+                 * 两条门都不需要动时直接原样返回，省掉一次深拷贝（大响应体上有实测意义）。 */
+                const hideAmount = !isAdminUser(req.user.role) && AMOUNT_SCOPE.test(req.path);
+                if (!hideAmount && !hidden.length) {
+                    res.setHeader('X-Sensitive-Filtered', '');
+                    return orig(payload);
+                }
                 // 头只在"确实做了脱敏"时出现 → 前端语义：有头=已脱敏(隐藏)，无头=未脱敏(可见)
-                if (hidden.length) res.setHeader('X-Sensitive-Filtered', hidden.join(','));
-                else res.setHeader('X-Sensitive-Filtered', '');
-                if (hidden.length) {
-                    const out = scrubSensitive(payload, flags, new WeakSet());
+                const tags = hidden.length ? [...hidden] : [];
+                if (hideAmount) tags.push('amount');
+                res.setHeader('X-Sensitive-Filtered', tags.join(','));
+                {
+                    let out = payload;
+                    if (hidden.length) out = scrubSensitive(out, flags, new WeakSet());
+                    if (hideAmount) out = scrubAmount(out, new WeakSet());
                     if (out && typeof out === 'object' && !Array.isArray(out)) {
-                        out._sensitive_filtered = hidden;
+                        out._sensitive_filtered = tags;
                     }
                     return orig(out);
                 }
@@ -3232,12 +3288,15 @@ app.get('/api/analysis/sales/top-products', authMiddleware, hasPerm('sales_stats
     res.json(products);
 });
 /* 进货统计 —— 对齐智慧记「采购统计逐月归组」口径
+ * ★ 2026-10-13 老板拍板：**进货信息不对子账号开放** ⇒ hasPerm('sales_stats') → adminOnly。
+ *   原挂 sales_stats 是漏洞：给子账号开「销售统计」权限时会连带看到进货金额/供应商欠款，
+ *   而老板明确要求「不能看到进货信息」。前端路由 /analysis/purchase 同步加 '@admin' 门。
  * ★ 同 sales：不传 group_by → 旧形态裸数组 [{date,total,order_count}]；传 group_by → 信封。
  * ★ 口径（2026-10-09 修订）：原注释写「采购单表无作废状态字段，故不做状态过滤」**已过时** ——
  *   进货单删除走软删除 status='cancelled'（见 PO_ALIVE），故此处必须过滤，
  *   否则删掉的进货单还会被算进进货金额。今日 517 张全为 completed ⇒ 补过滤后数字逐分不变。
  */
-app.get('/api/analysis/purchase', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
+app.get('/api/analysis/purchase', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
     const { start_date, end_date } = req.query;
     const BD = "substr(COALESCE(bill_date, created_at),1,10)";
@@ -3366,7 +3425,7 @@ app.get('/api/analysis/inventory', authMiddleware, hasPerm('sales_stats'), async
         top_products,
     });
 });
-app.get('/api/analysis/profit', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
+app.get('/api/analysis/profit', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
     // P4（2026-10-11 时区统一）：改走北京口径唯一真源（详见 BJ-TIME 块注释）。
     const today = bjToday();
@@ -3736,7 +3795,14 @@ app.get('/api/analysis/performance', authMiddleware, hasPerm('performance'), asy
     });
 });
 // ==================== 生产需求分析（按厂/客户的需求情况与月度经营建议） ====================
-app.get('/api/analysis/demand', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
+/* 生产需求分析
+ * ★ 2026-10-13 老板拍板：hasPerm('sales_stats') → **adminOnly**。
+ *   原因（本轮子账号实测挖出的一处**真实泄漏**）：该接口除了金额字段，还会返回一段
+ *   后端拼好的「本月经营建议」**文本**，正文里直接写着「重点维护 零售散客（月均 ¥8,757.97）」
+ *   —— 键名脱敏（AMOUNT_SCOPE 按字段名抹 null）**管不到字符串内容**，
+ *   子账号照样能读到具体金额。既然该页通篇是金额与金额推导的结论，对店员本无用处，
+ *   直接收成 adminOnly 最干净：**不以"抹字段"的方式堵文本，而是不给整页**。 */
+app.get('/api/analysis/demand', authMiddleware, adminOnly, async (req, res) => {
     await initDB();
     // 数据权限：员工只看自己的销售单（管理员/店长看全店）
     const isAdminUser = req.user.role === 'admin' || req.user.role === 'manager';
