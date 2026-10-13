@@ -1513,8 +1513,28 @@ app.get('/api/auth/verify', async (_req, res) => {
 app.post('/api/auth/login', async (req, res) => {
     try {
         const { username, password } = req.body;
+        /* ★ 2026-10-13 P6-01 / P6-02 修复（老板授权「依次进行」后新增，最小增量）
+         *
+         * ① **入参硬校验**（P6-01）
+         *    原先畸形体（`{}` / 非字符串 / 空串）会一路走到下面的
+         *    `username.replace(...)` 抛 `TypeError` ⇒ 被本路由的 catch 兜成 **HTTP 500**。
+         *    但这是**客户端错误**，语义应为 **400**；且该路由**免鉴权**（登录前）
+         *    ⇒ 任何人都能刷出 500（日志噪音 / 告警疲劳 / 掩盖真实 5xx）。
+         *    ★ 实测（生产 `p6-prod-verify` B2/B3）：`POST {}`、`POST {username:{a:1}}`
+         *      都返回 500 且 Content-Type 为 JSON（**不泄漏堆栈**——错误出口修复仍生效）。
+         *
+         * ② **字符串拼接 SQL → 参数化查询**（P6-02）
+         *    原写法 `'${username.replace(/'/g, "''")}'` 手动转义单引号：
+         *    **实测转义正确、无实际注入**，但属危险模式（漏一处转义即注入，
+         *    且审查时无法一眼判断安全性）。本文件 `safeExec(sql, params)` 原生支持传参 ⇒ 改用它。
+         *
+         * ★ 反向对照（判据有牙齿）：修复前 `POST /api/auth/login {}` ⇒ 500；
+         *   修复后必须 **400 且 code=LOGIN_BAD_INPUT**。由 `p6-prod-verify.cjs` 持续覆盖。 */
+        if (typeof username !== 'string' || typeof password !== 'string' || username === '' || password === '') {
+            return res.status(400).json({ ok: false, code: 'LOGIN_BAD_INPUT', error: '请输入用户名与密码' });
+        }
         await initDB();
-        const result = await safeExec(`SELECT * FROM users WHERE username = '${username.replace(/'/g, "''")}'`);
+        const result = await safeExec('SELECT * FROM users WHERE username = ?', [username]);
         const user = result.values?.[0];
         if (!user)
             return res.status(401).json({ error: '用户名或密码错误' });
