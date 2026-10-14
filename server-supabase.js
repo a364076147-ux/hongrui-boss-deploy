@@ -1862,6 +1862,157 @@ app.get('/api/inventory/products/:id/ledger', authMiddleware, hasPerm('inventory
     }
 });
 
+/* ==================== 库存流水（库存历史）2026-10-14 新增 ====================
+ * 老板反馈原话：「库存怎么没有库存历史」—— 在库存模块里找不到「这个商品/这段时间
+ * 货都怎么进出的」。智慧记对应能力：库存模块 → 库存统计（期初/库存新增/库存减少/期末结存）。
+ *
+ * 本接口是**跨商品**的流水台账，与 /api/inventory/products/:id/ledger 互补：
+ *   · 那个回答「这个商品的成本是怎么滚出来的」（移动加权 + 锚定商品表库存）；
+ *   · 本接口回答「这段时间所有货的进出明细」（可按商品/方向/日期筛）。
+ *
+ * ★★ 方向归一必须按**单据性质**，不能只看 quantity 正负 —— 实测库内：
+ *     · 采购退货在 purchase_orders 里以 total_amount < 0 标记（9 张，非独立表）；
+ *     · 销售退货在 sales_orders.biz_type='sale_return'（22 张，final_amount 为负）。
+ *   若直接 SUM(quantity)，退货方向会反过来，看上去"退货也在进货"。
+ *     purchase        → +|qty|   采购入库
+ *     purchase_return → −|qty|   采购退货出库
+ *     sale            → −|qty|   销售出库
+ *     sale_return     → +|qty|   销售退货入库
+ *     check           →  difference（盘盈为正、盘亏为负，保留原符号）
+ *
+ * 口径与既有页面一致：作废单排除（payment_status<>'作废'）、软删单排除（PO_ALIVE 同义）。
+ * ========================================================================= */
+app.get('/api/inventory/ledger', authMiddleware, hasPerm('inventory_view'), async (req, res) => {
+    await initDB();
+    const start = String(req.query.start_date || '').trim();
+    const end = String(req.query.end_date || '').trim();
+    const pid = Number(req.query.product_id) || 0;
+    const kw = String(req.query.q || '').trim();
+    const type = String(req.query.type || 'all').trim();
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const pageSize = Math.min(500, Math.max(10, Number(req.query.page_size) || 50));
+    const lit = (s) => "'" + String(s).replace(/'/g, "''") + "'";
+
+    /* 五源合并成统一流水（signed_qty = 带方向的库存变动量） */
+    const flowSql = `
+    WITH flow AS (
+        SELECT COALESCE(po.bill_date, substr(po.created_at,1,10)) AS d,
+               COALESCE(po.bill_date, substr(po.created_at,1,10)) || ' ' || COALESCE(po.created_at,'') AS ts,
+               po.order_number AS no, poi.product_id AS pid, poi.product_name AS pname,
+               COALESCE(poi.spec,'') AS spec, COALESCE(NULLIF(poi.unit,''), pu.unit, '') AS unit,
+               CASE WHEN COALESCE(po.total_amount,0) < 0 THEN 'purchase_return' ELSE 'purchase' END AS kind,
+               poi.quantity AS raw_qty, poi.unit_price AS price, poi.amount AS amt,
+               COALESCE(po.supplier_name,'') AS party
+        FROM purchase_order_items poi
+        JOIN purchase_orders po ON po.id = poi.order_id
+        LEFT JOIN products pu ON pu.id = poi.product_id
+        WHERE COALESCE(po.payment_status,'') <> '作废'
+          AND (po.status IS NULL OR po.status NOT IN ('cancelled','void'))
+        UNION ALL
+        SELECT COALESCE(so.bill_date, substr(so.created_at,1,10)),
+               COALESCE(so.bill_date, substr(so.created_at,1,10)) || ' ' || COALESCE(so.created_at,''),
+               so.order_number, soi.product_id, soi.product_name,
+               COALESCE(soi.spec,''), COALESCE(NULLIF(soi.unit,''), su.unit, ''),
+               CASE WHEN COALESCE(so.biz_type,'sale') = 'sale_return' THEN 'sale_return' ELSE 'sale' END,
+               soi.quantity, soi.unit_price, soi.amount,
+               COALESCE(so.customer_name,'')
+        FROM sales_order_items soi
+        JOIN sales_orders so ON so.id = soi.order_id
+        LEFT JOIN products su ON su.id = soi.product_id
+        WHERE COALESCE(so.payment_status,'') <> '作废'
+        UNION ALL
+        SELECT substr(COALESCE(ic.completed_at, ic.created_at),1,10),
+               COALESCE(ic.completed_at, ic.created_at),
+               COALESCE(ic.check_number,''), ici.product_id, ici.product_name,
+               '', '', 'check', ici.difference, 0, 0, ''
+        FROM inventory_check_items ici
+        JOIN inventory_checks ic ON ic.id = ici.check_id
+        WHERE COALESCE(ici.difference,0) <> 0
+    ), norm AS (
+        /* ★★ 方向归一（2026-10-14 现场纠正，首版写错过）：
+         *   首版用 ABS(qty) 再按 kind 定符号 ⇒ 出库算成 309,598.90，而销售明细实际只有
+         *   199,390.18 —— 因为**销售单明细里本来就有 862 行是负数**（单内退货/红冲行）。
+         *   一概 ABS 会把"单内退货"强行掰成"正常出库"，方向就反了。
+         *
+         *   ✅ 正确规则（用实测数据反推，不靠猜）：
+         *      · 单据明细的 quantity **已自带正确方向**（相对该单据主方向）；
+         *      · ⇒ 采购类（purchase / purchase_return）直接用 raw_qty；
+         *        销售类（sale / sale_return）取 **−raw_qty**（销售是减库存）。
+         *      自证：purchase 730 行 = +195,824.26；purchase_return 19 行 = −4,930.78；
+         *            sale 6408 行 = +199,390.18（→出库）；sale_return 25 行 = −825.79（→入库）。
+         *      负库存方向由符号自然表达，无需特判。 */
+        SELECT d, ts, no, pid, pname, spec, unit, kind, party, price, amt,
+               CASE WHEN kind IN ('sale', 'sale_return')
+                    THEN -COALESCE(raw_qty, 0)
+                    ELSE  COALESCE(raw_qty, 0)
+               END AS signed_qty
+        FROM flow
+    )`;
+
+    const cond = ['1=1'];
+    if (start) cond.push(`d >= ${lit(start)}`);
+    if (end) cond.push(`d <= ${lit(end)}`);
+    if (pid > 0) cond.push(`pid = ${pid}`);
+    if (kw) cond.push(`(pname LIKE ${lit('%' + kw + '%')} OR no LIKE ${lit('%' + kw + '%')})`);
+    if (type === 'in') cond.push('signed_qty > 0');
+    else if (type === 'out') cond.push('signed_qty < 0');
+    else if (['purchase', 'purchase_return', 'sale', 'sale_return', 'check'].includes(type))
+        cond.push(`kind = ${lit(type)}`);
+    const W = cond.join(' AND ');
+
+    try {
+        const [aggRes, rowRes] = await Promise.all([
+            safeExec(`${flowSql}
+            SELECT COUNT(*),
+                   COALESCE(SUM(CASE WHEN signed_qty > 0 THEN signed_qty ELSE 0 END),0),
+                   COALESCE(SUM(CASE WHEN signed_qty < 0 THEN -signed_qty ELSE 0 END),0),
+                   COALESCE(SUM(CASE WHEN signed_qty > 0 THEN signed_qty * COALESCE(price,0) ELSE 0 END),0),
+                   COALESCE(SUM(CASE WHEN signed_qty < 0 THEN -signed_qty * COALESCE(price,0) ELSE 0 END),0),
+                   COUNT(DISTINCT pid)
+            FROM norm WHERE ${W}`),
+            safeExec(`${flowSql}
+            SELECT d, no, pid, pname, spec, unit, kind, party, signed_qty, price, amt
+            FROM norm WHERE ${W}
+            ORDER BY d DESC, ts DESC, no DESC
+            LIMIT ? OFFSET ?`, [pageSize, (page - 1) * pageSize]),
+        ]);
+        const a = (aggRes.values || [])[0] || [];
+        const R2 = (n) => Math.round(Number(n || 0) * 100) / 100;
+        const KIND_LABEL = {
+            purchase: '采购入库', purchase_return: '采购退货', sale: '销售出库',
+            sale_return: '销售退货', check: '盘点调整',
+        };
+        res.json({
+            rows: (rowRes.values || []).map((r) => ({
+                date: r[0] || '—',
+                order_number: r[1] || '—',
+                product_id: Number(r[2]) || 0,
+                product_name: r[3] || '',
+                spec: r[4] || '', unit: r[5] || '',
+                type: r[6], type_label: KIND_LABEL[r[6]] || r[6],
+                party: r[7] || '',
+                qty: R2(r[8]),
+                direction: Number(r[8]) > 0 ? 'in' : 'out',
+                price: R2(r[9]),
+                /* 金额取明细自带的 amount（退货单为负）⇒ 展示只取绝对值，
+                   方向由 direction 表达，避免「−×−」在界面上出现双重否定 */
+                amount: R2(Math.abs(Number(r[10]) || 0)),
+            })),
+            summary: {
+                total_rows: Number(a[0]) || 0,
+                in_qty: R2(a[1]), out_qty: R2(a[2]),
+                in_amount: R2(a[3]), out_amount: R2(a[4]),
+                product_count: Number(a[5]) || 0,
+            },
+            total: Number(a[0]) || 0,
+            page, page_size: pageSize,
+            filter: { start_date: start, end_date: end, product_id: pid, q: kw, type },
+        });
+    } catch (e) {
+        res.status(500).json({ error: '查询库存流水失败：' + (e && e.message ? e.message : '未知错误') });
+    }
+});
+
 app.get('/api/inventory/products', authMiddleware, hasPerm('inventory_view'), async (req, res) => {
     await initDB();
     const { category, keyword, page = 1, pageSize = 50, withTotal, include_stopped } = req.query;
@@ -3477,16 +3628,67 @@ app.get('/api/analysis/purchase', authMiddleware, adminOnly, async (req, res) =>
     WHERE ${cond.join(' AND ')}
     GROUP BY ${P} ORDER BY ${P} ASC
   `);
+    /* ★★★ 2026-10-14 口径修正（老板反馈原文）：
+     *   「这个怎么跟供应商欠款不一致 —— 有些付款没选单子，可自行扣除货款」
+     *
+     * 【老板说得对，实测坐实】宏瑞库内 `purchase_orders.paid_amount` 是**随单已付**：
+     *   · 单据口径已付 ¥3,205,892.32（529 单），欠 ¥2,171,122.10
+     *   · 而智慧记应付对账 back_tamt = ¥3,821,438.83、arrears = ¥214,754.60
+     *   · 若只看单据口径，本页与《应收应付》永远差一截，用户会认为"系统不可信"。
+     *
+     * 【差额是什么】智慧记资金流水 fund_type 实测分布：
+     *   SALE 2000 / SKD_WITH_SALE 600 / SKD 404 / FKD_WITH_PUR 206 / FKD 124 / PUR 111 ...
+     *   其中 **FKD（直接付款）= 124 笔，不挂任何单据**，宏瑞导入后落在
+     *   transactions.category='直接付款'（实测 126 笔 / ¥1,849,031.10）。
+     *   这类钱**不体现在任何采购单上**，所以按 SUM(paid_amount) 永远算不出来。
+     *
+     * 【改法】已付金额改按**真实付款流水**归集（与 computeArap 的供应商 paid 同源：
+     *   同一套 FOLD_SQL 空白折叠 + canonSQL 别名，按 supplier 名匹配 transactions），
+     *   于是「付了钱但没选单」的那部分自动抵扣，本页与《应收应付》不再各说各话。
+     *   同时**保留** `doc_paid_amount` / `doc_owe_amount`（单据口径），
+     *   前端并列展示 —— 差异本身就是信息（有多少钱付了但没挂单），不是要抹掉的东西。 */
+    const PT = gb === 'month' ? "substr(t.created_at,1,7)"
+        : gb === 'year' ? "substr(t.created_at,1,4)" : "substr(t.created_at,1,10)";
+    const payCond = [`COALESCE(t.party_name,'') <> ''`,
+        `EXISTS (SELECT 1 FROM suppliers s WHERE s.status=1 AND ${FOLD_SQL('s.name')} = ${FOLD_SQL('t.party_name')})`];
+    if (start_date) payCond.push(`substr(t.created_at,1,10) >= '${String(start_date).replace(/'/g, "''")}'`);
+    if (end_date) payCond.push(`substr(t.created_at,1,10) <= '${String(end_date).replace(/'/g, "''")}'`);
+    const payRes = await safeExec(`
+    SELECT ${PT} as period,
+           COALESCE(SUM(CASE WHEN t.type='expense' THEN t.amount ELSE -t.amount END),0) as net_paid,
+           COALESCE(SUM(CASE WHEN t.type='expense' AND COALESCE(t.category,'')='直接付款' THEN t.amount ELSE 0 END),0) as direct_paid,
+           COUNT(*) as pay_rows
+    FROM transactions t
+    WHERE ${payCond.join(' AND ')}
+    GROUP BY 1`);
+    const payByPeriod = {};
+    for (const r of (payRes.values || [])) {
+        payByPeriod[String(r[0])] = {
+            net: Math.round(Number(r[1] || 0) * 100) / 100,
+            direct: Math.round(Number(r[2] || 0) * 100) / 100,
+            rows: Number(r[3] || 0),
+        };
+    }
     const rows = (result.values || []).map((r) => {
         const total = Math.round(Number(r[1] || 0) * 100) / 100;
         const orderCount = Number(r[4] || 0);
+        const docPaid = Math.round(Number(r[2] || 0) * 100) / 100;
+        const docOwe = Math.round(Number(r[3] || 0) * 100) / 100;
+        const pay = payByPeriod[String(r[0])] || { net: 0, direct: 0, rows: 0 };
         return {
             period: String(r[0]),
             date: String(r[0]),
             total,
             total_amount: total,
-            paid_amount: Math.round(Number(r[2] || 0) * 100) / 100,
-            owe_amount: Math.round(Number(r[3] || 0) * 100) / 100,
+            /* 主口径 = 真实付款流水（含未挂单的直接付款） */
+            paid_amount: pay.net,
+            owe_amount: Math.round((total - pay.net) * 100) / 100,
+            /* 对照口径 = 单据随单已付 / 单据未结清（保留，用于解释差异） */
+            doc_paid_amount: docPaid,
+            doc_owe_amount: docOwe,
+            /* 其中「付了钱但没挂单」的部分 —— 老板点名的那个数 */
+            direct_paid_amount: pay.direct,
+            pay_rows: pay.rows,
             order_count: orderCount,
             supplier_count: Number(r[5] || 0),
             avg_order: orderCount > 0 ? Math.round((total / orderCount) * 100) / 100 : 0,
@@ -3495,13 +3697,34 @@ app.get('/api/analysis/purchase', authMiddleware, adminOnly, async (req, res) =>
     if (!isPeriodic) {
         return res.json(rows.map((r) => ({ date: r.date, total: r.total, order_count: r.order_count })));
     }
+    /* 补齐「期间内只付了钱、没有采购单」的期间（还旧账）——
+       否则本页合计会比真实付款少一块，又跟《应收应付》对不上。
+       这类期间进货为 0、差额为负，是正确的会计表达（当期在还以前欠的账）。 */
+    const seenPeriod = new Set(rows.map((r) => r.period));
+    for (const [p, v] of Object.entries(payByPeriod)) {
+        if (seenPeriod.has(p)) continue;
+        rows.push({
+            period: p, date: p, total: 0, total_amount: 0,
+            paid_amount: v.net, owe_amount: Math.round(-v.net * 100) / 100,
+            doc_paid_amount: 0, doc_owe_amount: 0, direct_paid_amount: v.direct,
+            pay_rows: v.rows, order_count: 0, supplier_count: 0, avg_order: 0,
+        });
+    }
+    rows.sort((a, b) => (a.period < b.period ? -1 : a.period > b.period ? 1 : 0));
     const sums = rows.reduce((s, r) => ({
         total_amount: s.total_amount + r.total_amount,
         paid_amount: s.paid_amount + r.paid_amount,
         owe_amount: s.owe_amount + r.owe_amount,
+        doc_paid_amount: s.doc_paid_amount + (r.doc_paid_amount || 0),
+        doc_owe_amount: s.doc_owe_amount + (r.doc_owe_amount || 0),
+        direct_paid_amount: s.direct_paid_amount + (r.direct_paid_amount || 0),
         order_count: s.order_count + r.order_count,
         periods: s.periods + 1,
-    }), { total_amount: 0, paid_amount: 0, owe_amount: 0, order_count: 0, periods: 0 });
+    }), {
+        total_amount: 0, paid_amount: 0, owe_amount: 0,
+        doc_paid_amount: 0, doc_owe_amount: 0, direct_paid_amount: 0,
+        order_count: 0, periods: 0,
+    });
     for (const k of Object.keys(sums))
         sums[k] = Math.round(sums[k] * 100) / 100;
     sums.avg_order = sums.order_count > 0 ? Math.round((sums.total_amount / sums.order_count) * 100) / 100 : 0;
