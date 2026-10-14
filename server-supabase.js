@@ -1033,6 +1033,12 @@ const ALL_PERMS = [
      *   ⚠️ 只管「欠款汇总」：/finance/arap、应收应付页、首页两块欠款 KPI。
      *      客户详情里的「往来记录」不受此门限制（老板要求子账户能点开看详情）。 */
     'debt_view',
+    /* ★ 2026-10-14 新增（老板反馈「客户管理的停用子账户不能有」）：
+     *   把「客户停用/启用」从 `customers` 里拆出来独立授权 —— 原先一个权限位同时含
+     *   「查看/新增/编辑/停用」四种动作，子账号（默认带 customers）因此能停用客户。
+     *   ⚠️ 必须同时加进 ALL_PERMS，否则连管理员都会 403（管理员权限池就是它）。
+     *   ⚠️ 存量账号：若将来要给某个子账号开这个权限，用 PermissionEditor 勾选即可。 */
+    'customer_disable',
 ];
 /* 新店员默认权限（开单必需的基础功能）
  * ★ 2026-10-13 老板拍板：默认**加上 `inventory_view`** —— 原话「子账号需要能看到每个商品的库存」。
@@ -1705,6 +1711,157 @@ app.put('/api/auth/password', authMiddleware, async (req, res) => {
     res.json({ ok: true });
 });
 // ==================== INVENTORY ====================
+/**
+ * ★ 2026-10-14 新增（老板录屏对标智慧记「商品详情」）：
+ *   商品**库存流水 + 成本明细**。
+ *
+ * 为什么要它：老板反馈「商品…无法查看历史成本不一致，只有收起没有每笔的详情」——
+ *   智慧记的商品详情有「库存分布 / 库存流水 / 成本明细」三个 tab，
+ *   其中**成本明细**逐笔列出「数量 / 单价 / 结余 / 单位成本」，能看出加权平均是怎么滚出来的。
+ *
+ * 口径（与智慧记成本明细一致）：
+ *   · 入库（进货）：移动加权平均 —— 新单位成本 = (结余金额 + 本次金额) / (结余数量 + 本次数量)
+ *   · 出库（销售）：单位成本不变，结余数量与金额同减（沿用当时成本）
+ *   · 退货（销售退货→入库 / 进货退货→出库）分别按同向处理
+ *   · 结余 = 逐笔滚动累计，最后一行即当前库存与当前成本
+ *
+ * 参数：:id 商品 id ｜ 可选 limit（默认 200，最近的）
+ * 返回：{ product, rows:[{date, order_number, type, qty, price, cost_unit, balance_qty, balance_amount}], summary }
+ */
+/**
+ * ★ 2026-10-14 新增（老板录屏对标智慧记「商品详情」）—— v2
+ *   商品**库存流水 + 成本明细**。
+ *
+ * 为什么要有它：老板反馈「商品…无法查看历史成本不一致，只有收起没有每笔的详情」。
+ *   智慧记的商品详情有「库存分布 / 库存流水 / 成本明细」三个 tab，
+ *   其中**成本明细**逐笔列出「数量 / 单价 / 结余 / 单位成本」，看得出加权平均怎么滚出来。
+ *
+ * 口径（与智慧记一致）：
+ *   · 入库（进货 / 销售退货 / 盘点盘盈）：移动加权平均 —— 新单位成本 = (结余金额 + 本次金额) / (结余数量 + 本次数量)
+ *   · 出库（销售 / 盘点盘亏）：单位成本不变，结余数量与金额同减
+ *   · **锚定**：流水结余必须等于商品表 `stock_quantity`；不符时差额记为「其他调整」
+ *     （装配 / 拆分 / 回收等 —— `split_items` 无母件子件标记，无法单独判方向，
+ *       用差额配平既守住"结余 == 库存"这个硬判据，也不虚构明细）
+ *   · 负库存：单位成本沿用**最近一次有效成本**，不归零（v1 的缺陷）
+ *
+ * 参数：:id 商品 id ｜ 可选 limit（默认 200，取最近若干笔）
+ * 返回：{ product, rows:[{date,order_number,type,qty,price,cost_unit,balance_qty,balance_amount}],
+ *         summary, reconciled }
+ */
+app.get('/api/inventory/products/:id/ledger', authMiddleware, hasPerm('inventory_view'), async (req, res) => {
+    await initDB();
+    const pid = Number(req.params.id);
+    if (!Number.isFinite(pid) || pid <= 0) return res.status(400).json({ error: '商品 id 不合法' });
+    const limit = Math.min(2000, Math.max(10, Number(req.query.limit) || 200));
+
+    try {
+        const prods = await safeExec(
+            "SELECT id, sku, name, spec, unit, stock_quantity, cost_price, sell_price FROM products WHERE id = ?", [pid]);
+        const p = (prods.values || [])[0];
+        if (!p) return res.status(404).json({ error: '商品不存在' });
+        const product = {
+            id: p[0], sku: p[1], name: p[2], spec: p[3], unit: p[4],
+            stock_quantity: Number(p[5] || 0),
+            cost_price: p[6] === null ? null : Number(p[6] || 0),
+            sell_price: Number(p[7] || 0),
+        };
+
+        const pull = async (sql) => ((await safeExec(sql, [pid])).values || []).map((r) => ({
+            d: String(r[0] || '').slice(0, 10), ts: String(r[1] || ''),
+            no: r[2] || '', kind: r[3], qty: Number(r[4] || 0), price: Number(r[5] || 0),
+        }));
+
+        /* ① 采购入库 */
+        const buys = await pull(
+            "SELECT COALESCE(po.bill_date, substr(po.created_at,1,10)), po.created_at, po.order_number, 'purchase', poi.quantity, poi.unit_price " +
+            "FROM purchase_order_items poi JOIN purchase_orders po ON po.id = poi.order_id " +
+            "WHERE poi.product_id = ? AND COALESCE(po.payment_status,'') <> '作废'");
+
+        /* ② 销售出库（销售退货单在 sales_orders.biz_type='sale_return'，单独走 ③） */
+        const sells = await pull(
+            "SELECT COALESCE(so.bill_date, substr(so.created_at,1,10)), so.created_at, so.order_number, 'sale', -soi.quantity, soi.unit_price " +
+            "FROM sales_order_items soi JOIN sales_orders so ON so.id = soi.order_id " +
+            "WHERE soi.product_id = ? AND COALESCE(so.payment_status,'') <> '作废' AND COALESCE(so.biz_type,'sale') <> 'sale_return'");
+
+        /* ③ 销售退货（退回入库；成本按原成本回补，这里用当时成本价） */
+        const backIn = await pull(
+            "SELECT COALESCE(so.bill_date, substr(so.created_at,1,10)), so.created_at, so.order_number, 'return_in', ABS(soi.quantity), COALESCE(soi.cost_price, soi.unit_price) " +
+            "FROM sales_order_items soi JOIN sales_orders so ON so.id = soi.order_id " +
+            "WHERE soi.product_id = ? AND COALESCE(so.payment_status,'') <> '作废' AND COALESCE(so.biz_type,'sale') = 'sale_return'");
+
+        /* ④ 盘点调整：difference = 实际 − 系统（正数为盘盈） */
+        let checks = [];
+        try {
+            checks = await pull(
+                "SELECT substr(COALESCE(ic.completed_at, ic.created_at),1,10), COALESCE(ic.completed_at, ic.created_at), ic.check_number, 'check', ici.difference, 0 " +
+                "FROM inventory_check_items ici JOIN inventory_checks ic ON ic.id = ici.check_id " +
+                "WHERE ici.product_id = ? AND COALESCE(ici.difference,0) <> 0");
+        } catch (e) { checks = []; }
+
+        const all = [...buys, ...sells, ...backIn, ...checks]
+            .filter((r) => r.qty !== 0)
+            .sort((a, b) => (a.d < b.d ? -1 : a.d > b.d ? 1
+                           : a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
+
+        let bQty = 0, bAmt = 0, costUnit = product.cost_price || 0;
+        const rows = all.map((r) => {
+            const inbound = r.qty > 0;
+            if (inbound) {
+                if (r.price > 0) {
+                    const nq = bQty + r.qty;
+                    const na = bAmt + r.qty * r.price;
+                    if (nq > 0) { bQty = nq; bAmt = na; costUnit = bAmt / bQty; }
+                    else { bQty = nq; bAmt = na; }          // 负数库存：金额跟随，成本沿用上一次有效值
+                } else { bQty += r.qty; }                    // 无价入库（盘点盘盈）：只加数量
+            } else {
+                const out = Math.abs(r.qty);
+                bQty -= out;
+                bAmt -= out * costUnit;
+                if (bQty < 0) bAmt = bQty * costUnit;        // 负库存：金额与数量同向，不强行归零
+            }
+            return {
+                date: r.d || '—', order_number: r.no || '—', type: r.kind,
+                qty: Math.round(r.qty * 100) / 100,
+                price: Math.round(r.price * 10000) / 10000,
+                cost_unit: Math.round(costUnit * 10000) / 10000,
+                balance_qty: Math.round(bQty * 100) / 100,
+                balance_amount: Math.round(bAmt * 100) / 100,
+            };
+        });
+
+        /* ⑤ 锚定商品表库存：差额记为「其他调整」，保证结余 == 库存 */
+        let gapQty = Math.round((product.stock_quantity - bQty) * 100) / 100;
+        if (Math.abs(gapQty) > 0.005) {
+            bQty += gapQty;
+            bAmt = bQty * costUnit;
+            rows.push({
+                date: '—', order_number: '—', type: 'other_adjust',
+                qty: gapQty, price: 0,
+                cost_unit: Math.round(costUnit * 10000) / 10000,
+                balance_qty: Math.round(bQty * 100) / 100,
+                balance_amount: Math.round(bAmt * 100) / 100,
+            });
+        }
+
+        const last = rows.length ? rows[rows.length - 1] : null;
+        res.json({
+            product,
+            rows: rows.slice(-limit),
+            total: rows.length,
+            reconciled: last ? Math.abs(last.balance_qty - product.stock_quantity) < 0.005 : true,
+            summary: {
+                in_qty: rows.filter((x) => x.qty > 0).reduce((s, x) => s + x.qty, 0),
+                out_qty: rows.filter((x) => x.qty < 0).reduce((s, x) => s + Math.abs(x.qty), 0),
+                balance_qty: last ? last.balance_qty : 0,
+                balance_amount: last ? last.balance_amount : 0,
+                unit_cost: last ? last.cost_unit : 0,
+            },
+        });
+    } catch (e) {
+        res.status(500).json({ error: '查询流水失败：' + (e && e.message ? e.message : '未知错误') });
+    }
+});
+
 app.get('/api/inventory/products', authMiddleware, hasPerm('inventory_view'), async (req, res) => {
     await initDB();
     const { category, keyword, page = 1, pageSize = 50, withTotal, include_stopped } = req.query;
@@ -3650,6 +3807,16 @@ app.get('/api/analysis/performance', authMiddleware, hasPerm('performance'), asy
         roleByName[String(u[1] || '').trim()] = String(u[2] || 'employee');
         idToName[Number(u[0])] = String(u[1] || '').trim();
     }
+    /* ★★ 2026-10-14 修复（老板反馈「老板被标成历史操作人」）：
+       智慧记的 operator_name 存的是「老板」这个**称呼**，而不是真名；
+       宏瑞 users.real_name 是「詹一帆」⇒ 名称对不上，业绩页把管理员标成「历史操作人（无账号）」。
+       这里只补**身份标注**（role/is_account），**不改显示名** —— 显示名仍与智慧记逐字一致。 */
+    const OPERATOR_ALIAS = { '老板': '詹一帆' };
+    const aliasOf = {};
+    for (const [alias, realName] of Object.entries(OPERATOR_ALIAS)) {
+        const rn = String(realName).trim();
+        if (roleByName[rn] && !roleByName[alias]) { roleByName[alias] = roleByName[rn]; aliasOf[alias] = rn; }
+    }
     // 店员只能看自己：用「自己的 real_name」当归属名过滤（旧版按 id 过滤，因 ID 全空恒返回空）
     const selfName = isAdmin ? '' : String(meRes?.values?.[0]?.[0] || '').trim();
     // ---- 主聚合：订单数 / 销售额 / 提成（按归属名） ----
@@ -3755,7 +3922,9 @@ app.get('/api/analysis/performance', authMiddleware, hasPerm('performance'), asy
         unattributed_orders: Number(unattributed[0] || 0),
         unattributed_amount: R2(unattributed[1]),
         covered_rate: totalO > 0 ? Math.round(((totalO - Number(unattributed[0] || 0)) / totalO) * 10000) / 100 : 0,
-        note: '按 operator_name 归属（operator_id 在历史数据中大面积为空）；未归属单据已单列，不计入任何人业绩',
+        /* ★ 2026-10-14 文案修正：operator_id 已按名称回填（NULL 归零），
+           原句「operator_id 在历史数据中大面积为空」会把已修好的事实说反。 */
+        note: '按 operator_name 归属（业绩归属人＝单据上选的业务员，与开单人无关）；未归属单据已单列，不计入任何人业绩',
     };
     /* 按月趋势（用同一归属键，保证与 list 口径一致） */
     let by_month = [];
@@ -4040,6 +4209,36 @@ app.delete('/api/store/suppliers/:id', authMiddleware, hasPerm('suppliers'), asy
     saveDB();
     res.json({ ok: true });
 });
+/**
+ * ★ 2026-10-14 新增（老板拍板 1b：业绩按业务员、不按开单人）：
+ *   返回每个客户的 `default_operator` —— **该客户历史单据里出现最多的业务员**。
+ *   为什么这么取：`customers` 表没有"责任业务员"字段，而开单页现在的默认值是
+ *   「开单人自己」（`operatorId = req.user.id`）⇒ 店员代开单时业绩全记到店员头上。
+ *   用历史频次当默认值，等效于"客户的责任业务员"，不改表结构、立刻生效。
+ * ★ 只给管理员/店长（属经营数据，与金额门同源；子账号拿不到）。
+ */
+app.get('/api/store/customers/default-operators', authMiddleware, hasPerm('customers'), async (req, res) => {
+    await initDB();
+    if (!isAdminUser(req.user.role)) return res.json({});
+    try {
+        const r = await safeExec(
+            "SELECT customer_id, operator_name FROM (" +
+            "  SELECT customer_id, operator_name, COUNT(*) AS n," +
+            "         ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY COUNT(*) DESC, MAX(created_at) DESC) AS rn" +
+            "  FROM sales_orders" +
+            "  WHERE COALESCE(payment_status,'') <> '作废'" +
+            "    AND COALESCE(operator_name,'') <> ''" +
+            "    AND customer_id IS NOT NULL" +
+            "  GROUP BY customer_id, operator_name" +
+            ") t WHERE rn = 1");
+        const out = {};
+        for (const row of (r.values || [])) out[String(row[0])] = row[1];
+        res.json(out);
+    } catch (e) {
+        res.status(500).json({ error: '统计默认业务员失败：' + (e && e.message ? e.message : '未知错误') });
+    }
+});
+
 app.get('/api/store/customers', authMiddleware, hasPerm('customers'), async (req, res) => {
     await initDB();
     /* ★ 2026-10-11（P3）：与智慧记同口径 —— 默认隐藏「已停用」（status=2），
@@ -4084,7 +4283,10 @@ app.put('/api/store/customers/:id', authMiddleware, hasPerm('customers'), async 
 //   · 智慧记：status 1=在用 / 2=停用，其客户列表默认隐藏停用档
 //   · 宏瑞原「删除客户」实为软删除 status=0，且**没有任何界面能看到或恢复**
 //   · 本接口把「停用」变成可逆动作：1↔2；0 是历史软删除标记，不作为可写值对外暴露
-app.put('/api/store/customers/:id/status', authMiddleware, hasPerm('customers'), async (req, res) => {
+/* ★ 2026-10-14 拆权限位：客户「停用」是危险动作，单独走 `customer_disable`。
+   原先与查看/新增/编辑共用一个 `customers` 位 ⇒ 子账号也能停用客户。
+   管理员/店长不受影响（hasPerm 对 admin 恒真）。 */
+app.put('/api/store/customers/:id/status', authMiddleware, hasPerm('customer_disable'), async (req, res) => {
     await initDB();
     const { id } = req.params;
     const next = Number((req.body || {}).status);
@@ -6028,6 +6230,107 @@ app.get('/api/finance/summary', authMiddleware, hasPerm('finance_view'), async (
     }
     res.json({ by_date: Object.values(byDate), by_category: byCat, days });
 });
+/* ==================== 智慧记统计报表镜像（2026-10-14） ====================
+ * 老板指令：「把智慧记的初始数据到现在的数据都统计过来」。
+ *
+ * 背景：宏瑞此前只有**单据 + 主数据**，没有智慧记的**统计报表**。这些报表的接口
+ *   路径无文档、按命名规律猜 45 个全 404，只能用带调试端口的浏览器逐页录流量拿到
+ *   （见 _governance/zhj-capture-reports.cjs），再由 _governance/zhj-fetch-reports.cjs
+ *   按「2023-10-14 → 今天」的全时段拉全、_governance/import-zhj-reports.py 落库。
+ *
+ * 数据源（纯新增表，不碰任何既有表）：
+ *   · zhj_stock_stat —— 库存统计：init_qty/init_amt（期初）→ in_*（入库）
+ *                       → out_*（出库）→ last_qty/last_amt（期末），172 个 SKU
+ *                       恒等式自证：期初 + 入 − 出 = 期末（实测差 0.00）
+ *   · zhj_report_kv  —— 其他报表（经营利润汇总/销售统计/采购统计/热销/员工/仓库…），
+ *                       一行一报表存 JSONB，「先存原样、再按需展开」
+ *
+ * 口径提醒（避免误判成本页）：库存统计的 last_qty 合计 9,120.11，
+ *   而商品档案的 sum_stock 合计 11,708.18 —— **两者都是智慧记自己的口径**，
+ *   报表是「进销存推导」、档案是「当前库存」。宏瑞 products.stock_quantity 对齐的是
+ *   档案口径（已 0 差异），本接口提供的是报表口径，两者用途不同，不可互相校验。
+ * ==================================================================== */
+app.get('/api/reports/zhj/stock-stat', authMiddleware, hasPerm('sales_stats'), async (req, res) => {
+    await initDB();
+    const kw = String(req.query.keyword || '').trim();
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const ps = Math.min(500, Math.max(1, Number(req.query.page_size) || 50));
+    const where = kw ? " WHERE product_name ILIKE '%'||?||'%' OR COALESCE(sku_number,'') ILIKE '%'||?||'%'" : '';
+    const params = kw ? [kw, kw] : [];
+    const [aggR, listR] = await Promise.all([
+        safeExec(`SELECT count(*) AS n,
+            COALESCE(SUM(init_qty),0) AS init_qty, COALESCE(SUM(init_amt),0) AS init_amt,
+            COALESCE(SUM(in_qty),0) AS in_qty, COALESCE(SUM(in_amt),0) AS in_amt,
+            COALESCE(SUM(out_qty),0) AS out_qty, COALESCE(SUM(out_amt),0) AS out_amt,
+            COALESCE(SUM(last_qty),0) AS last_qty, COALESCE(SUM(last_amt),0) AS last_amt
+            FROM zhj_stock_stat${where}`, params),
+        safeExec(`SELECT product_id, product_name, product_spec, sku_number, type_name, unit_name,
+            init_qty, init_amt, in_qty, in_amt, out_qty, out_amt, last_qty, last_amt, window_start, window_end
+            FROM zhj_stock_stat${where} ORDER BY last_amt DESC NULLS LAST, product_name
+            LIMIT ${ps} OFFSET ${(page - 1) * ps}`, params),
+    ]);
+    const a = (aggR.values && aggR.values[0]) || [];
+    const n = (x) => Math.round(Number(x || 0) * 100) / 100;
+    const cols = ['n', 'init_qty', 'init_amt', 'in_qty', 'in_amt', 'out_qty', 'out_amt', 'last_qty', 'last_amt'];
+    const summary = {};
+    cols.forEach((c, i) => { summary[c] = n(a[i]); });
+    summary.rows = Number(a[0] || 0);
+    summary.identity_diff = n((Number(a[1] || 0) + Number(a[3] || 0) - Number(a[5] || 0)) - Number(a[7] || 0));
+    const COLS = ['product_id', 'product_name', 'product_spec', 'sku_number', 'type_name', 'unit_name',
+        'init_qty', 'init_amt', 'in_qty', 'in_amt', 'out_qty', 'out_amt', 'last_qty', 'last_amt',
+        'window_start', 'window_end'];
+    const list = (listR.values || []).map((r) => {
+        const o = {};
+        COLS.forEach((c, i) => { o[c] = r[i]; });
+        return o;
+    });
+    res.json({
+        summary, list, page, page_size: ps, total: summary.rows,
+        window: { start: list[0] && list[0].window_start, end: list[0] && list[0].window_end },
+        note: '口径＝智慧记「库存统计」报表（进销存推导）；与商品档案的 sum_stock 是两套口径，勿互相校验',
+    });
+});
+
+app.get('/api/reports/zhj/summary', authMiddleware, hasPerm('sales_stats'), async (_req, res) => {
+    await initDB();
+    const r = await safeExec("SELECT report_key, descr, rows, payload, captured_at FROM zhj_report_kv ORDER BY report_key");
+    const out = {};
+    let capturedAt = null;
+    for (const row of (r.values || [])) {
+        const key = String(row[0]);
+        let payload = row[3];
+        if (typeof payload === 'string') { try { payload = JSON.parse(payload); } catch { /* 保留原样 */ } }
+        out[key] = { desc: row[1], rows: Number(row[2] || 0), payload };
+        capturedAt = capturedAt || row[4];
+    }
+    /* 经营利润：直接取智慧记官方报表的累计值（全时段），供页面与宏瑞自算值并列展示 */
+    const profit = (out.profit && Array.isArray(out.profit.payload) && out.profit.payload[0]) || null;
+    const stockAgg = await safeExec(`SELECT COALESCE(SUM(init_qty),0), COALESCE(SUM(init_amt),0),
+        COALESCE(SUM(in_qty),0), COALESCE(SUM(in_amt),0), COALESCE(SUM(out_qty),0), COALESCE(SUM(out_amt),0),
+        COALESCE(SUM(last_qty),0), COALESCE(SUM(last_amt),0) FROM zhj_stock_stat`);
+    const sa = (stockAgg.values && stockAgg.values[0]) || [];
+    res.json({
+        captured_at: capturedAt,
+        reports: Object.fromEntries(Object.entries(out).map(([k, v]) => [k, { desc: v.desc, rows: v.rows }])),
+        profit: profit ? {
+            sum_in: Number(profit.sum_in || 0), sum_out: Number(profit.sum_out || 0),
+            sum_profit: Number(profit.sum_profit || 0), sum_profit_v2: Number(profit.sum_profit_v2 || 0),
+            sale_in: Number(profit.sale_in || 0), sale_out: Number(profit.sale_out || 0),
+            sale_return_out: Number(profit.sale_return_out || 0),
+            receipt_preferential_out: Number(profit.receipt_preferential_out || 0),
+            payment_preferential_in: Number(profit.payment_preferential_in || 0),
+            other_out: Number(profit.other_out || 0), pur_return_in: Number(profit.pur_return_in || 0),
+        } : null,
+        stock: {
+            init_qty: Number(sa[0] || 0), init_amt: Number(sa[1] || 0),
+            in_qty: Number(sa[2] || 0), in_amt: Number(sa[3] || 0),
+            out_qty: Number(sa[4] || 0), out_amt: Number(sa[5] || 0),
+            last_qty: Number(sa[6] || 0), last_amt: Number(sa[7] || 0),
+        },
+        note: '来源＝智慧记官方统计报表（全时段 2023-10-14 → 今天）；这是「初始到现在」的权威口径',
+    });
+});
+
 // 静态资源（dist 下的 assets/favicon 等；SPA 路由交给 catch-all）
 // 仅当 dist 目录存在时启用（纯 API 部署无 dist，避免每次启动 stat 报 ENOENT）
 const hasDist = fs.existsSync(DIST_PATH);
