@@ -5135,7 +5135,9 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), idem('sale
     await initDB();
     let { order_number: customOrderNumber, customer_id, customer_name, items, payment_method, discount,
         payment_status, operator_id: targetOperatorId,
-        received_amount, small_change_amount, express_amount, tax_amount, remark, bill_date } = req.body;
+        received_amount, small_change_amount, express_amount, tax_amount, remark, bill_date,
+        maker_id: targetMakerId
+    } = req.body;
     /* 开单必须含有效明细：空单/零数量单无业务意义，且会污染欠款统计与利润报表
      * （实测：不校验时可建出 final_amount=0 的空单）。前端已有 cart.length 守卫，此处为服务端兜底。 */
     if (!Array.isArray(items) || items.length === 0) {
@@ -5160,6 +5162,13 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), idem('sale
             operatorId = tid;
             operatorName = emp[0] || req.user.real_name;
         }
+    }
+    // 开单人：所有开单人均可指定任意在职员工为「实际填单人」；未传则记当前登录人
+    let makerName = req.user.real_name;
+    if (targetMakerId && Number(targetMakerId) > 0) {
+        const mid = Number(targetMakerId);
+        const maker = (await safeExec("SELECT real_name FROM users WHERE id = ? AND status = 1", [mid])).values?.[0];
+        if (maker) makerName = maker[0] || req.user.real_name;
     }
     /* ★★ 2026-10-11 P5-4（P2-06）：自定义单号冲突必须**显式拒绝**，不能静默换号。
      *   【缺陷实证】修复前一律直接用传入单号去 INSERT：唯一索引报错 ⇒ run() 吞掉
@@ -5209,7 +5218,7 @@ app.post('/api/store/sales-orders', authMiddleware, hasPerm('sales'), idem('sale
         payment_method || null, operatorId, operatorName, commissionAmount, paymentStatus,
         billDate, _money.receivable_amount, receivedAmount, oweAmount,
         Number(small_change_amount) || 0, Number(express_amount) || 0, Number(tax_amount) || 0,
-        remark || '', 'sale', req.user.real_name || null
+        remark || '', 'sale', makerName
     ]) || 0);
     saveDB();
     if (items && orderId > 0) {
